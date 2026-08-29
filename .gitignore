@@ -1,0 +1,31 @@
+# Rust build output
+/target/
+
+# OAuth credentials and local secrets
+.env
+.env.*
+!.env.example
+google-oauth*.json
+client_secret*.json
+credentials*.json
+accounts.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local mail/account data
+mail.db*
+*.sqlite
+*.sqlite3
+ui.json
+
+# Editor, OS, logs, and crash artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log
+.DS_Store
+core
+core.*

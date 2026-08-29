@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Postbird
+Comment=Read and send Gmail from your Linux desktop
+Exec=postbird
+Icon=io.github.postbird.Mail
+Terminal=false
+Type=Application
+Categories=Network;Email;
+Keywords=Gmail;Email;Mail;
+StartupNotify=true
+StartupWMClass=io.github.postbird.Mail
+
