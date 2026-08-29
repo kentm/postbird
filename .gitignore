@@ -29,3 +29,6 @@ ui.json
 .DS_Store
 core
 core.*
+
+# Unpublished website and policy drafts
+/docs/

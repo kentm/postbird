@@ -30,6 +30,7 @@ struct Widgets {
     conversation_scroll: gtk::ScrolledWindow,
     conversation_body: gtk::Box,
     message_content: gtk::Box,
+    detail_stack: gtk::Stack,
     archive: gtk::Button,
     star: gtk::Button,
     trash: gtk::Button,
@@ -162,6 +163,7 @@ pub fn build(app: &adw::Application) {
         conversation_scroll: conversation_scroll.clone(),
         conversation_body,
         message_content,
+        detail_stack: detail_stack.clone(),
         archive,
         star,
         trash,
@@ -287,7 +289,7 @@ fn mailbox_sidebar(widgets: &Widgets, state: &Rc<RefCell<State>>) -> gtk::Widget
         let index = widgets_for_folder.account_picker.selected() as usize;
         let email = { state_for_folder.borrow().account_emails.get(index).cloned() };
         if let Some(email) = email {
-            load_inbox(&widgets_for_folder, &state_for_folder, email, None);
+            load_inbox(&widgets_for_folder, &state_for_folder, email, None, true);
         }
     });
     let folders_for_label = folders.clone();
@@ -309,7 +311,7 @@ fn mailbox_sidebar(widgets: &Widgets, state: &Rc<RefCell<State>>) -> gtk::Widget
         let index = widgets_for_label.account_picker.selected() as usize;
         let email = state_for_label.borrow().account_emails.get(index).cloned();
         if let Some(email) = email {
-            load_inbox(&widgets_for_label, &state_for_label, email, None);
+            load_inbox(&widgets_for_label, &state_for_label, email, None, true);
         }
     });
     let navigation = gtk::Box::new(Orientation::Vertical, 10);
@@ -437,7 +439,7 @@ fn connect_account_picker(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             let email = { state.borrow().account_emails.get(index).cloned() };
             if let Some(email) = email {
                 load_labels(&widgets, &state, email.clone());
-                load_inbox(&widgets, &state, email, None);
+                load_inbox(&widgets, &state, email, None, false);
             }
         });
 }
@@ -520,6 +522,7 @@ fn connect_search(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             &state,
             email,
             (!query.is_empty()).then_some(query),
+            true,
         );
     });
 }
@@ -599,7 +602,9 @@ fn connect_message_actions(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                 })
                 .await;
                 match result {
-                    Ok(Ok(())) => load_inbox(&widgets_async, &state_async, email_for_reload, None),
+                    Ok(Ok(())) => {
+                        load_inbox(&widgets_async, &state_async, email_for_reload, None, true)
+                    }
                     Ok(Err(error)) => show_error(&widgets_async, error),
                     Err(_) => {
                         show_message(&widgets_async, "The message action stopped unexpectedly")
@@ -994,7 +999,7 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         widgets.account_picker.set_selected(0);
         let email = state.borrow().account_emails[0].clone();
         load_labels(widgets, state, email.clone());
-        load_inbox(widgets, state, email, None);
+        load_inbox(widgets, state, email, None, false);
     } else {
         clear_list(&widgets.labels);
         state.borrow_mut().labels.clear();
@@ -1108,13 +1113,47 @@ fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let inbox_is_visible = state.borrow().current_label == "INBOX"
             && widgets.search.text().trim().is_empty()
             && state.borrow().account_emails.get(index) == Some(&email);
-        if inbox_is_visible && let Ok(Ok(messages)) = result {
+        if inbox_is_visible
+            && let Ok(Ok(messages)) = result
+            && mailbox_changed(&state, &messages)
+        {
             display_messages(&widgets, &state, messages);
         }
     });
 }
 
-fn load_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>, email: String, query: Option<String>) {
+fn mailbox_changed(state: &Rc<RefCell<State>>, messages: &[Message]) -> bool {
+    let mut visible = state
+        .borrow()
+        .conversations
+        .iter()
+        .flatten()
+        .map(message_snapshot)
+        .collect::<Vec<_>>();
+    let mut refreshed = messages.iter().map(message_snapshot).collect::<Vec<_>>();
+    visible.sort();
+    refreshed.sort();
+    visible != refreshed
+}
+
+fn message_snapshot(message: &Message) -> (String, String, String, Vec<String>, String) {
+    (
+        message.id.clone(),
+        message.thread_id.clone(),
+        message.internal_date.clone(),
+        message.label_ids.clone(),
+        message.snippet.clone(),
+    )
+}
+
+fn load_inbox(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    email: String,
+    query: Option<String>,
+    select_first: bool,
+) {
+    reset_reader(widgets, state);
     clear_list(&widgets.messages);
     add_status_row(
         &widgets.messages,
@@ -1142,6 +1181,11 @@ fn load_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>, email: String, quer
                 && !messages.is_empty()
             {
                 display_messages(&widgets, &state, messages);
+                if select_first {
+                    select_first_conversation(&widgets);
+                } else {
+                    clear_reader_view(&widgets, &state);
+                }
                 showing_cached_messages = true;
             }
         }
@@ -1163,7 +1207,19 @@ fn load_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>, email: String, quer
             return;
         }
         match result {
-            Ok(Ok(messages)) => display_messages(&widgets, &state, messages),
+            Ok(Ok(messages)) if mailbox_changed(&state, &messages) => {
+                display_messages(&widgets, &state, messages);
+                if select_first {
+                    select_first_conversation(&widgets);
+                } else {
+                    clear_reader_view(&widgets, &state);
+                }
+            }
+            Ok(Ok(_)) => {
+                if select_first && widgets.messages.selected_row().is_none() {
+                    select_first_conversation(&widgets);
+                }
+            }
             Ok(Err(error)) if showing_cached_messages => {
                 show_message(
                     &widgets,
@@ -1178,6 +1234,31 @@ fn load_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>, email: String, quer
             Err(_) => show_message(&widgets, "The inbox task stopped unexpectedly"),
         }
     });
+}
+
+fn reset_reader(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    state.borrow_mut().conversations.clear();
+    clear_reader_view(widgets, state);
+}
+
+fn clear_reader_view(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    widgets.messages.unselect_all();
+    {
+        let mut state = state.borrow_mut();
+        state.selected = None;
+        state.selected_conversation.clear();
+    }
+    while let Some(child) = widgets.conversation_body.first_child() {
+        widgets.conversation_body.remove(&child);
+    }
+    widgets.message_content.set_visible(false);
+    widgets.detail_stack.set_visible_child_name("status");
+}
+
+fn select_first_conversation(widgets: &Widgets) {
+    if let Some(row) = widgets.messages.row_at_index(0) {
+        widgets.messages.select_row(Some(&row));
+    }
 }
 
 fn fetch_threads_parallel(
@@ -1576,5 +1657,18 @@ mod tests {
             (Local::now() - chrono::Duration::days(1)).timestamp_millis(),
         );
         assert_eq!(relative_message_date(&yesterday), "Yesterday");
+    }
+
+    #[test]
+    fn background_snapshot_ignores_order_but_detects_mail_changes() {
+        let first = message("one", "thread-one", 10);
+        let second = message("two", "thread-two", 20);
+        let state = Rc::new(RefCell::new(State::default()));
+        state.borrow_mut().conversations = vec![vec![second.clone()], vec![first.clone()]];
+        assert!(!mailbox_changed(&state, &[first.clone(), second.clone()]));
+
+        let mut changed = second;
+        changed.label_ids.push("STARRED".to_owned());
+        assert!(mailbox_changed(&state, &[first, changed]));
     }
 }

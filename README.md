@@ -4,6 +4,14 @@ Postbird is a native Linux Gmail client built with Rust, GTK 4, and libadwaita.
 It talks directly to Google's Gmail API; there is no Postbird server and Gmail
 data remains on your computer apart from API requests to Google.
 
+> **OAuth approval status:** Postbird is currently awaiting Google OAuth
+> verification. Until approval is complete, Google may display an
+> "unverified app" warning during sign-in and access may be limited to Google
+> accounts registered as test users in the app's Cloud project. Do not proceed
+> past the warning unless you trust the Postbird build and the OAuth client
+> credentials being used. This notice will be updated when verification is
+> complete.
+
 ## Features
 
 - Multiple Google accounts with instant account switching
@@ -31,8 +39,9 @@ account signs in through the system browser. The browser returns authorization
 to a temporary listener bound only to `127.0.0.1`.
 
 The app requests `gmail.modify`, which Google classifies as a restricted scope.
-Personal/test use works with consent-screen test users. Public distribution
-requires completing Google's OAuth verification process.
+Personal/test use works with consent-screen test users. Postbird's public OAuth
+verification is pending, so the warning and test-user restrictions described
+above currently apply.
 
 ## Build and run
 
