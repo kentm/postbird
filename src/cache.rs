@@ -77,6 +77,16 @@ impl MailCache {
         }
         self.replace_inbox(account, &messages)
     }
+
+    pub fn remove_messages(&mut self, account: &str, message_ids: &[String]) -> Result<()> {
+        let ids = message_ids.iter().collect::<HashSet<_>>();
+        let messages = self
+            .messages(account)?
+            .into_iter()
+            .filter(|message| !ids.contains(&message.id))
+            .collect::<Vec<_>>();
+        self.replace_inbox(account, &messages)
+    }
 }
 
 #[cfg(test)]
@@ -103,5 +113,9 @@ mod tests {
             cache.messages("person@example.com").unwrap()[0].label_ids,
             vec!["INBOX"]
         );
+        cache
+            .remove_messages("person@example.com", &["one".to_owned()])
+            .unwrap();
+        assert!(cache.messages("person@example.com").unwrap().is_empty());
     }
 }

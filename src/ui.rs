@@ -568,17 +568,25 @@ fn connect_message_actions(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                 return;
             };
             let action = action.to_owned();
+            let action_for_request = action.clone();
+            let archived_thread_id = message.thread_id.clone();
             let widgets_async = widgets.clone();
             let state_async = state.clone();
             glib::MainContext::default().spawn_local(async move {
                 let email_for_reload = email.clone();
+                let message_ids = conversation
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<_>>();
                 let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
                     let mut client = GmailClient::for_account(AccountStore::open()?, &email)?;
-                    match action.as_str() {
+                    match action_for_request.as_str() {
                         "archive" => {
                             for item in &conversation {
                                 client.archive(&item.id)?;
                             }
+                            let _ = MailCache::open()
+                                .and_then(|mut cache| cache.remove_messages(&email, &message_ids));
                             Ok(())
                         }
                         "star" => client.set_starred(
@@ -603,7 +611,17 @@ fn connect_message_actions(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                 .await;
                 match result {
                     Ok(Ok(())) => {
-                        load_inbox(&widgets_async, &state_async, email_for_reload, None, true)
+                        let account_index = widgets_async.account_picker.selected() as usize;
+                        let same_account = state_async.borrow().account_emails.get(account_index)
+                            == Some(&email_for_reload);
+                        if action == "archive"
+                            && same_account
+                            && state_async.borrow().current_label == "INBOX"
+                        {
+                            remove_conversation(&widgets_async, &state_async, &archived_thread_id);
+                        } else {
+                            load_inbox(&widgets_async, &state_async, email_for_reload, None, true);
+                        }
                     }
                     Ok(Err(error)) => show_error(&widgets_async, error),
                     Err(_) => {
@@ -1258,6 +1276,39 @@ fn clear_reader_view(widgets: &Widgets, state: &Rc<RefCell<State>>) {
 fn select_first_conversation(widgets: &Widgets) {
     if let Some(row) = widgets.messages.row_at_index(0) {
         widgets.messages.select_row(Some(&row));
+    }
+}
+
+fn remove_conversation(widgets: &Widgets, state: &Rc<RefCell<State>>, thread_id: &str) {
+    let (row_index, was_selected) = {
+        let state = state.borrow();
+        let Some(row_index) = state.conversations.iter().position(|conversation| {
+            conversation
+                .first()
+                .is_some_and(|message| message.thread_id == thread_id)
+        }) else {
+            return;
+        };
+        let was_selected = state
+            .selected
+            .as_ref()
+            .is_some_and(|message| message.thread_id == thread_id);
+        (row_index, was_selected)
+    };
+
+    state.borrow_mut().conversations.remove(row_index);
+    if let Some(row) = widgets.messages.row_at_index(row_index as i32) {
+        widgets.messages.remove(&row);
+    }
+
+    if !was_selected {
+        return;
+    }
+    let next_index = row_index.saturating_sub(1) as i32;
+    if let Some(row) = widgets.messages.row_at_index(next_index) {
+        widgets.messages.select_row(Some(&row));
+    } else {
+        clear_reader_view(widgets, state);
     }
 }
 
