@@ -558,7 +558,7 @@ fn connect_message_actions(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     ] {
         let widgets = widgets.clone();
         let state = state.clone();
-        button.connect_clicked(move |_| {
+        button.connect_clicked(move |button| {
             let Some(message) = state.borrow().selected.clone() else {
                 return;
             };
@@ -567,6 +567,9 @@ fn connect_message_actions(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             let Some(email) = state.borrow().account_emails.get(index).cloned() else {
                 return;
             };
+            if action == "archive" {
+                set_archive_busy(button, true);
+            }
             let action = action.to_owned();
             let action_for_request = action.clone();
             let archived_thread_id = message.thread_id.clone();
@@ -609,6 +612,9 @@ fn connect_message_actions(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                     }
                 })
                 .await;
+                if action == "archive" {
+                    set_archive_busy(&widgets_async.archive, false);
+                }
                 match result {
                     Ok(Ok(())) => {
                         let account_index = widgets_async.account_picker.selected() as usize;
@@ -1653,6 +1659,18 @@ fn action_button(icon: &str, tooltip: &str) -> gtk::Button {
         .icon_name(icon)
         .tooltip_text(tooltip)
         .build()
+}
+fn set_archive_busy(button: &gtk::Button, busy: bool) {
+    button.set_sensitive(!busy);
+    if busy {
+        let spinner = gtk::Spinner::new();
+        spinner.start();
+        button.set_child(Some(&spinner));
+        button.set_tooltip_text(Some("Archiving…"));
+    } else {
+        button.set_icon_name("mail-archive-symbolic");
+        button.set_tooltip_text(Some("Archive"));
+    }
 }
 fn entry(placeholder: &str) -> gtk::Entry {
     gtk::Entry::builder().placeholder_text(placeholder).build()
