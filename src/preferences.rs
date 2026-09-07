@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct UiPreferences {
     pub mailbox_split: i32,
     pub message_split: i32,
+    pub load_remote_images: bool,
 }
 
 impl Default for UiPreferences {
@@ -16,6 +17,7 @@ impl Default for UiPreferences {
         Self {
             mailbox_split: 220,
             message_split: 390,
+            load_remote_images: false,
         }
     }
 }
@@ -52,5 +54,6 @@ mod tests {
         let preferences: UiPreferences = serde_json::from_str(r#"{"mailbox_split":300}"#).unwrap();
         assert_eq!(preferences.mailbox_split, 300);
         assert_eq!(preferences.message_split, 390);
+        assert!(!preferences.load_remote_images);
     }
 }

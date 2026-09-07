@@ -11,7 +11,8 @@ use lettre::message::{
 };
 use reqwest::{
     Method,
-    blocking::{Client, Response},
+    blocking::{Client, RequestBuilder, Response},
+    header::CONTENT_LENGTH,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -95,6 +96,8 @@ pub struct Message {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Payload {
+    #[serde(default)]
+    pub filename: String,
     #[serde(rename = "mimeType", default)]
     pub mime_type: String,
     #[serde(default)]
@@ -205,6 +208,22 @@ impl GmailClient {
 
     pub fn thread(&mut self, id: &str) -> Result<Thread> {
         self.get(&format!("/threads/{id}"), &[("format", "full")])
+    }
+
+    pub fn attachment(&mut self, message_id: &str, body: &Body) -> Result<Vec<u8>> {
+        let fetched;
+        let data = if let Some(data) = &body.data {
+            data
+        } else if let Some(id) = &body.attachment_id {
+            fetched = self.get::<Body>(&format!("/messages/{message_id}/attachments/{id}"), &[])?;
+            fetched
+                .data
+                .as_ref()
+                .context("attachment response has no data")?
+        } else {
+            anyhow::bail!("attachment has no data");
+        };
+        decode_attachment_data(data).context("attachment data is invalid")
     }
 
     pub fn archive(&mut self, id: &str) -> Result<()> {
@@ -357,14 +376,11 @@ impl GmailClient {
         body: Option<&B>,
     ) -> Result<T> {
         self.ensure_fresh_token()?;
-        let mut request = self
+        let request = self
             .http
             .request(method, format!("{API_ROOT}{path}"))
             .bearer_auth(&self.token.access_token);
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        decode_response(request.send()?)
+        decode_response(with_optional_json_body(request, body).send()?)
     }
 
     fn ensure_fresh_token(&mut self) -> Result<()> {
@@ -378,6 +394,16 @@ impl GmailClient {
             .context("this account has no refresh token; connect it again")?;
         self.token = self.credentials.refresh(refresh_token)?;
         self.store.save_token(&self.email, &self.token)
+    }
+}
+
+fn with_optional_json_body<B: Serialize + ?Sized>(
+    request: RequestBuilder,
+    body: Option<&B>,
+) -> RequestBuilder {
+    match body {
+        Some(body) => request.json(body),
+        None => request.header(CONTENT_LENGTH, 0),
     }
 }
 
@@ -395,6 +421,21 @@ fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T> {
 }
 
 impl Message {
+    pub fn attachments(&self) -> Vec<&Payload> {
+        fn collect<'a>(part: &'a Payload, found: &mut Vec<&'a Payload>) {
+            if is_attachment(part) {
+                found.push(part);
+            } else {
+                for child in &part.parts {
+                    collect(child, found);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        collect(&self.payload, &mut found);
+        found
+    }
+
     pub fn header(&self, name: &str) -> &str {
         self.payload
             .headers
@@ -461,10 +502,25 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn is_attachment(payload: &Payload) -> bool {
+    !payload.filename.is_empty()
+        || payload.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("Content-Disposition")
+                && header
+                    .value
+                    .split(';')
+                    .next()
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("attachment"))
+        })
+}
+
 fn find_body(payload: &Payload, wanted_type: &str) -> Option<String> {
+    if is_attachment(payload) {
+        return None;
+    }
     if payload.mime_type == wanted_type
         && let Some(data) = &payload.body.data
-        && let Ok(bytes) = decode_gmail_body(data)
+        && let Ok(bytes) = decode_attachment_data(data)
     {
         return Some(String::from_utf8_lossy(&bytes).into_owned());
     }
@@ -474,7 +530,7 @@ fn find_body(payload: &Payload, wanted_type: &str) -> Option<String> {
         .find_map(|part| find_body(part, wanted_type))
 }
 
-fn decode_gmail_body(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
+pub fn decode_attachment_data(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
     URL_SAFE
         .decode(data)
         .or_else(|_| URL_SAFE_NO_PAD.decode(data))
@@ -483,6 +539,51 @@ fn decode_gmail_body(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_nested_attachments_without_using_them_as_the_message_body() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "id": "1", "threadId": "t", "payload": {
+                "mimeType": "multipart/mixed", "parts": [
+                    {"mimeType": "text/plain", "filename": "notes.txt", "body": {"data": "ZmlsZQ=="}},
+                    {"mimeType": "multipart/alternative", "parts": [
+                        {"mimeType": "text/plain", "body": {"data": "SGVsbG8"}},
+                        {"mimeType": "application/pdf", "filename": "report.pdf", "body": {"attachmentId": "external"}},
+                        {"mimeType": "application/octet-stream", "headers": [{"name": "Content-Disposition", "value": "Attachment; filename=missing"}], "body": {"data": ""}}
+                    ]}
+                ]
+            }
+        })).unwrap();
+        assert_eq!(message.body_text(), "Hello");
+        let attachments = message.attachments();
+        assert_eq!(attachments.len(), 3);
+        assert_eq!(attachments[0].filename, "notes.txt");
+        assert_eq!(
+            attachments[1].body.attachment_id.as_deref(),
+            Some("external")
+        );
+        assert_eq!(
+            decode_attachment_data(attachments[0].body.data.as_ref().unwrap()).unwrap(),
+            b"file"
+        );
+        assert_eq!(decode_attachment_data("").unwrap(), b"");
+        assert!(decode_attachment_data("!").is_err());
+        let cached: Message =
+            serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        assert_eq!(cached.attachments()[1].filename, "report.pdf");
+    }
+
+    #[test]
+    fn bodyless_posts_send_an_explicit_zero_content_length() {
+        let request = with_optional_json_body(
+            Client::new().post("https://example.com/messages/id/trash"),
+            None::<&()>,
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(request.headers()[CONTENT_LENGTH], "0");
+    }
 
     #[test]
     fn extracts_nested_plain_body() {
@@ -529,9 +630,12 @@ mod tests {
 
     #[test]
     fn decodes_padded_and_unpadded_gmail_bodies() {
-        assert_eq!(decode_gmail_body("PGI-SGk8L2I-").unwrap(), b"<b>Hi</b>");
         assert_eq!(
-            decode_gmail_body("PGI-SGk8L2I-PC9wPg==").unwrap(),
+            decode_attachment_data("PGI-SGk8L2I-").unwrap(),
+            b"<b>Hi</b>"
+        );
+        assert_eq!(
+            decode_attachment_data("PGI-SGk8L2I-PC9wPg==").unwrap(),
             b"<b>Hi</b></p>"
         );
     }

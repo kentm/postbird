@@ -7,12 +7,13 @@ use std::{
 use adw::prelude::*;
 use chrono::{Datelike, Local};
 use gtk::{Align, Orientation, gio, glib};
+use lettre::message::{Mailbox, Mailboxes};
 use webkit6::prelude::*;
 
 use crate::{
     accounts::{Account, AccountStore},
     cache::MailCache,
-    gmail::{ComposeMessage, GmailClient, Message},
+    gmail::{ComposeMessage, GmailClient, Message, Payload},
     preferences::UiPreferences,
 };
 
@@ -36,7 +37,10 @@ struct Widgets {
     trash: gtk::Button,
     unread: gtk::Button,
     reply: gtk::Button,
+    reply_all: gtk::Button,
     search: gtk::SearchEntry,
+    preferences: Rc<RefCell<UiPreferences>>,
+    load_images: gtk::Button,
 }
 
 struct State {
@@ -131,12 +135,16 @@ pub fn build(app: &adw::Application) {
     let trash = action_button("user-trash-symbolic", "Move to Trash");
     let unread = action_button("mail-mark-unread-symbolic", "Mark Unread");
     let reply = action_button("mail-reply-sender-symbolic", "Reply");
+    let reply_all = action_button("mail-reply-all-symbolic", "Reply All");
+    let load_images = action_button("image-x-generic-symbolic", "Always load remote images");
     let detail_actions = gtk::Box::new(Orientation::Horizontal, 6);
     detail_actions.append(&archive);
     detail_actions.append(&star);
     detail_actions.append(&trash);
     detail_actions.append(&unread);
     detail_actions.prepend(&reply);
+    detail_actions.insert_child_after(&reply_all, Some(&reply));
+    detail_actions.append(&load_images);
     message_content.prepend(&detail_actions);
 
     let message_status = adw::StatusPage::builder()
@@ -169,8 +177,17 @@ pub fn build(app: &adw::Application) {
         trash,
         unread,
         reply,
+        reply_all,
         search,
+        preferences: preferences.clone(),
+        load_images,
     };
+    if preferences.borrow().load_remote_images {
+        widgets.load_images.set_sensitive(false);
+        widgets
+            .load_images
+            .set_tooltip_text(Some("Remote images enabled"));
+    }
 
     let message_split = gtk::Paned::new(Orientation::Horizontal);
     message_split.set_start_child(Some(&message_list_panel(&widgets)));
@@ -211,6 +228,7 @@ pub fn build(app: &adw::Application) {
     connect_search(&widgets, &state);
     connect_message_actions(&widgets, &state);
     connect_reply(&widgets, &state);
+    connect_remote_images(&widgets, &state);
     connect_compose(&widgets, &state, &compose);
     load_accounts(&widgets, &state);
     connect_background_sync(&widgets, &state);
@@ -383,16 +401,14 @@ fn connect_selection(widgets: &Widgets, state: &Rc<RefCell<State>>, stack: &gtk:
                 return;
             };
             widgets.message_title.set_text(message.header("Subject"));
-            widgets.message_sender.set_text(&format!(
-                "Latest from: {}  •  {} message{}",
-                message.header("From"),
-                conversation.len(),
-                if conversation.len() == 1 { "" } else { "s" }
-            ));
+            widgets
+                .message_sender
+                .set_text(&message_recipient_summary(&message, conversation.len()));
             display_conversation(
-                &widgets.conversation_scroll,
-                &widgets.conversation_body,
+                &widgets,
+                &state,
                 &conversation,
+                widgets.preferences.borrow().load_remote_images,
             );
             widgets.message_content.set_visible(true);
             stack.set_visible_child_name("message");
@@ -538,6 +554,19 @@ fn connect_remove_account(widgets: &Widgets, state: &Rc<RefCell<State>>, button:
         let widgets = widgets.clone();
         let state = state.clone();
         glib::MainContext::default().spawn_local(async move {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Remove this account?")
+                .body(format!(
+                    "Remove {email} and its stored sign-in token from Postbird? This does not delete the Google account or any Gmail messages."
+                ))
+                .close_response("cancel")
+                .default_response("cancel")
+                .build();
+            dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove Account")]);
+            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+            if dialog.choose_future(Some(&widgets.window)).await != "remove" {
+                return;
+            }
             let result =
                 gio::spawn_blocking(move || AccountStore::open()?.remove_account(&email)).await;
             match result {
@@ -647,14 +676,24 @@ fn connect_compose(widgets: &Widgets, state: &Rc<RefCell<State>>, button: &gtk::
         let Some(email) = state.borrow().account_emails.get(index).cloned() else {
             return show_message(&widgets, "Connect a Google account before composing");
         };
-        present_compose(&widgets, email, None);
+        present_compose(&widgets, email, None, None);
     });
 }
 
 fn connect_reply(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    connect_reply_button(widgets, state, &widgets.reply, false);
+    connect_reply_button(widgets, state, &widgets.reply_all, true);
+}
+
+fn connect_reply_button(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    button: &gtk::Button,
+    reply_all: bool,
+) {
     let widgets = widgets.clone();
     let state = state.clone();
-    widgets.reply.clone().connect_clicked(move |_| {
+    button.clone().connect_clicked(move |_| {
         let index = widgets.account_picker.selected() as usize;
         let Some(email) = state.borrow().account_emails.get(index).cloned() else {
             return;
@@ -663,9 +702,14 @@ fn connect_reply(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             return;
         };
         let subject = original.header("Subject");
+        let (to, cc) = if reply_all {
+            reply_all_recipients(&original, &email)
+        } else {
+            (reply_target(&original), String::new())
+        };
         let reply = ComposeMessage {
-            to: original.header("From").to_owned(),
-            cc: String::new(),
+            to,
+            cc,
             bcc: String::new(),
             subject: if subject.to_lowercase().starts_with("re:") {
                 subject.to_owned()
@@ -675,19 +719,96 @@ fn connect_reply(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             body: String::new(),
             html_body: None,
             in_reply_to: Some(original.header("Message-ID").to_owned()),
-            thread_id: Some(original.thread_id),
+            thread_id: Some(original.thread_id.clone()),
             attachments: Vec::new(),
         };
-        present_compose(&widgets, email, Some(reply));
+        present_compose(&widgets, email, Some(reply), Some(original));
     });
 }
 
-fn present_compose(widgets: &Widgets, account_email: String, initial: Option<ComposeMessage>) {
+fn connect_remote_images(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    let widgets = widgets.clone();
+    let state = state.clone();
+    widgets.load_images.clone().connect_clicked(move |button| {
+        let mut preferences = widgets.preferences.borrow_mut();
+        if !preferences.load_remote_images {
+            preferences.load_remote_images = true;
+            if let Err(error) = preferences.save() {
+                preferences.load_remote_images = false;
+                return show_error(&widgets, error);
+            }
+        }
+        drop(preferences);
+        button.set_sensitive(false);
+        button.set_tooltip_text(Some("Remote images enabled"));
+        let conversation = state.borrow().selected_conversation.clone();
+        if !conversation.is_empty() {
+            display_conversation(&widgets, &state, &conversation, true);
+        }
+    });
+}
+
+fn reply_target(message: &Message) -> String {
+    let reply_to = message.header("Reply-To").trim();
+    if reply_to.is_empty() {
+        message.header("From").to_owned()
+    } else {
+        reply_to.to_owned()
+    }
+}
+
+fn reply_all_recipients(message: &Message, account_email: &str) -> (String, String) {
+    let own_address = account_email.to_ascii_lowercase();
+    let mut seen = HashSet::new();
+    seen.insert(own_address);
+    let mut to = Vec::new();
+    let mut cc = Vec::new();
+
+    append_unique_mailboxes(&reply_target(message), &mut to, &mut seen);
+    append_unique_mailboxes(message.header("To"), &mut to, &mut seen);
+    append_unique_mailboxes(message.header("Cc"), &mut cc, &mut seen);
+
+    (format_mailboxes(&to), format_mailboxes(&cc))
+}
+
+fn append_unique_mailboxes(
+    header: &str,
+    recipients: &mut Vec<Mailbox>,
+    seen: &mut HashSet<String>,
+) {
+    let Ok(mailboxes) = header.parse::<Mailboxes>() else {
+        return;
+    };
+    for mailbox in mailboxes {
+        if seen.insert(mailbox.email.to_string().to_ascii_lowercase()) {
+            recipients.push(mailbox);
+        }
+    }
+}
+
+fn format_mailboxes(mailboxes: &[Mailbox]) -> String {
+    mailboxes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn present_compose(
+    widgets: &Widgets,
+    account_email: String,
+    initial: Option<ComposeMessage>,
+    replying_to: Option<Message>,
+) {
     let parent = widgets.window.clone();
     let dialog = adw::Dialog::builder()
-        .title("New message")
-        .content_width(680)
-        .content_height(560)
+        .title(if replying_to.is_some() {
+            "Reply"
+        } else {
+            "New message"
+        })
+        .content_width(900)
+        .content_height(720)
         .build();
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -769,6 +890,9 @@ fn present_compose(widgets: &Widgets, account_email: String, initial: Option<Com
     form.append(&attachment_label);
     form.append(&formatting);
     form.append(&body);
+    if let Some(message) = replying_to.as_ref() {
+        form.append(&reply_context(message));
+    }
     toolbar.set_content(Some(&form));
     dialog.set_child(Some(&toolbar));
 
@@ -880,6 +1004,52 @@ fn present_compose(widgets: &Widgets, account_email: String, initial: Option<Com
         });
     });
     dialog.present(Some(&parent));
+}
+
+fn reply_context(message: &Message) -> gtk::Expander {
+    let sender = sender_name(message.header("From"));
+    let subject = message.header("Subject");
+    let heading = if subject.trim().is_empty() {
+        format!("Replying to {sender}")
+    } else {
+        format!("Replying to {sender} — {subject}")
+    };
+    let details = gtk::Label::builder()
+        .label(format!(
+            "From: {}\nDate: {}",
+            message.header("From"),
+            message.header("Date")
+        ))
+        .halign(Align::Start)
+        .xalign(0.0)
+        .selectable(true)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    let preview = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(10)
+        .bottom_margin(10)
+        .left_margin(10)
+        .right_margin(10)
+        .build();
+    preview.buffer().set_text(&message.body_text());
+    preview.add_css_class("card");
+    let content = gtk::Box::new(Orientation::Vertical, 6);
+    content.append(&details);
+    content.append(
+        &gtk::ScrolledWindow::builder()
+            .height_request(160)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(&preview)
+            .build(),
+    );
+    gtk::Expander::builder()
+        .label(heading)
+        .expanded(true)
+        .child(&content)
+        .build()
 }
 
 const RICH_TAGS: [(&str, &str, &str); 4] = [
@@ -1121,14 +1291,14 @@ fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                 .iter()
                 .map(|message| message.thread_id.clone())
                 .collect::<HashSet<_>>();
-            let mut combined = MailCache::open()?.messages(&sync_email)?;
+            let mut combined = MailCache::open()?.messages(&sync_email, "INBOX")?;
             combined.retain(|message| {
                 current_thread_ids.contains(&message.thread_id)
                     && !refreshed_thread_ids.contains(&message.thread_id)
             });
             combined.extend(refreshed);
             combined.sort_by_key(|message| std::cmp::Reverse(message_timestamp(message)));
-            MailCache::open()?.replace_inbox(&sync_email, &combined)?;
+            MailCache::open()?.replace_mailbox(&sync_email, "INBOX", &combined)?;
             Ok(combined)
         })
         .await;
@@ -1166,7 +1336,7 @@ fn message_snapshot(message: &Message) -> (String, String, String, Vec<String>, 
         message.thread_id.clone(),
         message.internal_date.clone(),
         message.label_ids.clone(),
-        message.snippet.clone(),
+        format!("{}{:?}", message.snippet, message.attachments()),
     )
 }
 
@@ -1191,13 +1361,15 @@ fn load_inbox(
         state.load_generation += 1;
         (state.current_label.clone(), state.load_generation)
     };
-    let use_inbox_cache = query.is_none() && label == "INBOX";
+    let cached_mailbox =
+        (query.is_none() && matches!(label.as_str(), "INBOX" | "SENT")).then(|| label.clone());
     glib::MainContext::default().spawn_local(async move {
         let mut showing_cached_messages = false;
-        if use_inbox_cache {
+        if let Some(mailbox) = cached_mailbox.clone() {
             let cache_email = email.clone();
             let cached =
-                gio::spawn_blocking(move || MailCache::open()?.messages(&cache_email)).await;
+                gio::spawn_blocking(move || MailCache::open()?.messages(&cache_email, &mailbox))
+                    .await;
             if state.borrow().load_generation != generation {
                 return;
             }
@@ -1216,13 +1388,14 @@ fn load_inbox(
 
         let online_email = email.clone();
         let cache_email = email;
+        let mailbox_to_cache = cached_mailbox;
         let result = gio::spawn_blocking(move || -> anyhow::Result<Vec<Message>> {
             let mut client = GmailClient::for_account(AccountStore::open()?, &online_email)?;
             let label = (!label.is_empty()).then_some(label.as_str());
             let page = client.list_threads(label, query.as_deref(), None)?;
             let messages = fetch_threads_parallel(&online_email, page.threads)?;
-            if use_inbox_cache {
-                MailCache::open()?.replace_inbox(&cache_email, &messages)?;
+            if let Some(mailbox) = mailbox_to_cache {
+                MailCache::open()?.replace_mailbox(&cache_email, &mailbox, &messages)?;
             }
             Ok(messages)
         })
@@ -1231,7 +1404,12 @@ fn load_inbox(
             return;
         }
         match result {
-            Ok(Ok(messages)) if mailbox_changed(&state, &messages) => {
+            Ok(Ok(messages))
+                if should_display_loaded_messages(
+                    showing_cached_messages,
+                    mailbox_changed(&state, &messages),
+                ) =>
+            {
                 display_messages(&widgets, &state, messages);
                 if select_first {
                     select_first_conversation(&widgets);
@@ -1258,6 +1436,10 @@ fn load_inbox(
             Err(_) => show_message(&widgets, "The inbox task stopped unexpectedly"),
         }
     });
+}
+
+fn should_display_loaded_messages(showing_cached_messages: bool, mailbox_changed: bool) -> bool {
+    !showing_cached_messages || mailbox_changed
 }
 
 fn reset_reader(widgets: &Widgets, state: &Rc<RefCell<State>>) {
@@ -1302,15 +1484,27 @@ fn remove_conversation(widgets: &Widgets, state: &Rc<RefCell<State>>, thread_id:
         (row_index, was_selected)
     };
 
+    if was_selected {
+        clear_reader_view(widgets, state);
+    }
     state.borrow_mut().conversations.remove(row_index);
     if let Some(row) = widgets.messages.row_at_index(row_index as i32) {
         widgets.messages.remove(&row);
     }
 
+    if state.borrow().conversations.is_empty() {
+        clear_reader_view(widgets, state);
+        add_status_row(
+            &widgets.messages,
+            "Inbox is empty",
+            "No messages matched this view.",
+        );
+        return;
+    }
     if !was_selected {
         return;
     }
-    let next_index = row_index.saturating_sub(1) as i32;
+    let next_index = row_index.min(state.borrow().conversations.len() - 1) as i32;
     if let Some(row) = widgets.messages.row_at_index(next_index) {
         widgets.messages.select_row(Some(&row));
     } else {
@@ -1521,11 +1715,214 @@ fn message_timestamp(message: &Message) -> i64 {
     message.internal_date.parse().unwrap_or_default()
 }
 
-fn display_conversation(
-    scroll: &gtk::ScrolledWindow,
-    container: &gtk::Box,
-    conversation: &[Message],
+fn message_recipient_summary(message: &Message, count: usize) -> String {
+    let mut lines = vec![format!(
+        "Latest from: {}  •  {count} message{}",
+        message.header("From"),
+        if count == 1 { "" } else { "s" }
+    )];
+    append_address_line(&mut lines, "To", message.header("To"));
+    append_address_line(&mut lines, "Cc", message.header("Cc"));
+    append_address_line(&mut lines, "Bcc", message.header("Bcc"));
+    lines.join("\n")
+}
+
+fn append_address_line(lines: &mut Vec<String>, label: &str, value: &str) {
+    if !value.trim().is_empty() {
+        lines.push(format!("{label}: {value}"));
+    }
+}
+
+fn recipient_details(message: &Message) -> Option<gtk::Label> {
+    let mut lines = Vec::new();
+    append_address_line(&mut lines, "To", message.header("To"));
+    append_address_line(&mut lines, "Cc", message.header("Cc"));
+    append_address_line(&mut lines, "Bcc", message.header("Bcc"));
+    if lines.is_empty() {
+        return None;
+    }
+    Some(
+        gtk::Label::builder()
+            .label(lines.join("\n"))
+            .halign(Align::Start)
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .margin_top(8)
+            .margin_start(10)
+            .margin_end(10)
+            .css_classes(["caption", "dim-label"])
+            .build(),
+    )
+}
+
+fn attachment_filename(part: &Payload) -> String {
+    let name = part
+        .filename
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.trim().is_empty() && *name != "." && *name != "..")
+        .unwrap_or("attachment");
+    if std::path::Path::new(name).extension().is_none() {
+        let mime_type = part.mime_type.split(';').next().unwrap_or("").trim();
+        let extension = if mime_type.eq_ignore_ascii_case("message/rfc822") {
+            Some("eml")
+        } else if mime_type.eq_ignore_ascii_case("application/octet-stream") {
+            None
+        } else {
+            mime_guess::get_mime_extensions_str(mime_type)
+                .and_then(|extensions| extensions.first().copied())
+        };
+        if let Some(extension) = extension {
+            return format!("{name}.{extension}");
+        }
+    }
+    name.to_owned()
+}
+
+fn attachment_summary(attachments: &[&Payload]) -> String {
+    match attachments {
+        [] => String::new(),
+        [part] => attachment_filename(part).to_owned(),
+        [first, rest @ ..] => format!("{} (+{})", attachment_filename(first), rest.len()),
+    }
+}
+
+fn attachment_control(widgets: &Widgets, email: &str, message: &Message) -> Option<gtk::Widget> {
+    let attachments = message.attachments();
+    if attachments.is_empty() {
+        return None;
+    }
+    let popover = gtk::Popover::new();
+    let list = gtk::Box::new(Orientation::Vertical, 4);
+    for part in &attachments {
+        let button = gtk::Button::new();
+        let row = gtk::Box::new(Orientation::Horizontal, 6);
+        row.append(&gtk::Image::from_icon_name("mail-attachment-symbolic"));
+        let label = gtk::Label::builder()
+            .label(attachment_filename(part))
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(48)
+            .xalign(0.0)
+            .build();
+        row.append(&label);
+        button.set_child(Some(&row));
+        button.set_tooltip_text(Some(&format!("Save {}", attachment_filename(part))));
+        let widgets = widgets.clone();
+        let email = email.to_owned();
+        let message_id = message.id.clone();
+        let part = (*part).clone();
+        let popover = popover.downgrade();
+        button.connect_clicked(move |button| {
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
+            save_attachment(&widgets, &email, &message_id, &part, button);
+        });
+        if attachments.len() == 1 {
+            button.set_valign(Align::Center);
+            return Some(button.upcast());
+        }
+        list.append(&button);
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .max_content_height(320)
+        .propagate_natural_height(true)
+        .child(&list)
+        .build();
+    popover.set_child(Some(&scroll));
+    let summary = attachment_summary(&attachments);
+    let label = gtk::Label::builder()
+        .label(&summary)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .max_width_chars(36)
+        .xalign(0.0)
+        .build();
+    let tooltip = attachments
+        .iter()
+        .map(|part| attachment_filename(part))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(
+        gtk::MenuButton::builder()
+            .child(&label)
+            .always_show_arrow(true)
+            .tooltip_text(format!("Save an attachment\n{tooltip}"))
+            .popover(&popover)
+            .valign(Align::Center)
+            .build()
+            .upcast(),
+    )
+}
+
+fn save_attachment(
+    widgets: &Widgets,
+    email: &str,
+    message_id: &str,
+    part: &Payload,
+    button: &gtk::Button,
 ) {
+    let widgets = widgets.clone();
+    let email = email.to_owned();
+    let message_id = message_id.to_owned();
+    let part = part.clone();
+    let button = button.clone();
+    button.set_sensitive(false);
+    glib::MainContext::default().spawn_local(async move {
+        let picker = gtk::FileDialog::builder()
+            .title("Save attachment")
+            .initial_name(attachment_filename(&part))
+            .build();
+        let file = match picker.save_future(Some(&widgets.window)).await {
+            Ok(file) => file,
+            Err(error) => {
+                button.set_sensitive(true);
+                if !error.matches(gtk::DialogError::Dismissed) {
+                    show_message(&widgets, &format!("Could not save attachment: {error}"));
+                }
+                return;
+            }
+        };
+        show_message(&widgets, "Downloading attachment…");
+        let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
+            let bytes = if let Some(data) = &part.body.data {
+                crate::gmail::decode_attachment_data(data)?
+            } else {
+                GmailClient::for_account(AccountStore::open()?, &email)?
+                    .attachment(&message_id, &part.body)?
+            };
+            file.replace_contents(
+                &bytes,
+                None,
+                false,
+                gio::FileCreateFlags::PRIVATE,
+                gio::Cancellable::NONE,
+            )?;
+            Ok(())
+        })
+        .await;
+        button.set_sensitive(true);
+        match result {
+            Ok(Ok(())) => show_message(&widgets, "Attachment saved"),
+            Ok(Err(error)) => {
+                show_message(&widgets, &format!("Could not save attachment: {error}"))
+            }
+            Err(_) => show_message(&widgets, "The attachment download stopped unexpectedly"),
+        }
+    });
+}
+
+fn display_conversation(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    conversation: &[Message],
+    load_remote_images: bool,
+) {
+    let scroll = &widgets.conversation_scroll;
+    let container = &widgets.conversation_body;
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
@@ -1541,11 +1938,27 @@ fn display_conversation(
             .wrap(true)
             .css_classes(["caption"])
             .build();
-        let body = new_message_webview();
+        let heading_row = gtk::Box::new(Orientation::Horizontal, 12);
+        heading.set_hexpand(true);
+        heading_row.append(&heading);
+        if let Some(email) = state
+            .borrow()
+            .account_emails
+            .get(widgets.account_picker.selected() as usize)
+            && let Some(control) = attachment_control(widgets, email, message)
+        {
+            heading_row.append(&control);
+        }
+        let body = new_message_webview(load_remote_images);
         body.load_html(&message.rendered_body(), None);
+        let expanded_content = gtk::Box::new(Orientation::Vertical, 6);
+        if let Some(recipients) = recipient_details(message) {
+            expanded_content.append(&recipients);
+        }
+        expanded_content.append(&body);
         let expander = gtk::Expander::builder()
-            .label_widget(&heading)
-            .child(&body)
+            .label_widget(&heading_row)
+            .child(&expanded_content)
             .expanded(index == 0)
             .build();
         let scroll_for_expander = scroll.clone();
@@ -1581,27 +1994,36 @@ fn size_conversation_sections(scroll: &gtk::ScrolledWindow, container: &gtk::Box
         if expander.is_expanded()
             && let Some(view) = expander
                 .child()
+                .and_then(|child| child.downcast::<gtk::Box>().ok())
+                .and_then(|content| content.last_child())
                 .and_then(|child| child.downcast::<webkit6::WebView>().ok())
-            && view.height_request() != height
         {
-            view.set_height_request(height);
+            let body_height = (height - 64).max(256);
+            if view.height_request() != body_height {
+                view.set_height_request(body_height);
+            }
         }
     }
 }
 
-fn new_message_webview() -> webkit6::WebView {
+fn new_message_webview(load_remote_images: bool) -> webkit6::WebView {
     let settings = webkit6::Settings::new();
     settings.set_enable_javascript(false);
     settings.set_enable_javascript_markup(false);
     settings.set_enable_html5_database(false);
     settings.set_enable_html5_local_storage(false);
+    settings.set_auto_load_images(load_remote_images);
     let view = webkit6::WebView::builder()
         .settings(&settings)
         .network_session(&webkit6::NetworkSession::new_ephemeral())
         .hexpand(true)
         .build();
     view.connect_decide_policy(|_, decision, decision_type| {
-        if decision_type != webkit6::PolicyDecisionType::NavigationAction {
+        if !matches!(
+            decision_type,
+            webkit6::PolicyDecisionType::NavigationAction
+                | webkit6::PolicyDecisionType::NewWindowAction
+        ) {
             return false;
         }
         let Some(navigation) = decision.downcast_ref::<webkit6::NavigationPolicyDecision>() else {
@@ -1614,7 +2036,16 @@ fn new_message_webview() -> webkit6::WebView {
             return false;
         }
         if let Some(uri) = action.request().and_then(|request| request.uri()) {
-            let _ = open::that(uri.as_str());
+            gio::AppInfo::launch_default_for_uri_async(
+                uri.as_str(),
+                None::<&gio::AppLaunchContext>,
+                None::<&gio::Cancellable>,
+                move |result| {
+                    if let Err(error) = result {
+                        eprintln!("could not open link in the default application: {error}");
+                    }
+                },
+            );
         }
         decision.ignore();
         true
@@ -1655,10 +2086,18 @@ fn detail_label(text: &str, css_class: &str) -> gtk::Label {
         .build()
 }
 fn action_button(icon: &str, tooltip: &str) -> gtk::Button {
-    gtk::Button::builder()
-        .icon_name(icon)
+    let button = gtk::Button::builder()
         .tooltip_text(tooltip)
-        .build()
+        .width_request(42)
+        .height_request(42)
+        .build();
+    set_action_icon(&button, icon);
+    button
+}
+fn set_action_icon(button: &gtk::Button, icon: &str) {
+    let image = gtk::Image::from_icon_name(icon);
+    image.set_pixel_size(20);
+    button.set_child(Some(&image));
 }
 fn set_archive_busy(button: &gtk::Button, busy: bool) {
     button.set_sensitive(!busy);
@@ -1668,7 +2107,7 @@ fn set_archive_busy(button: &gtk::Button, busy: bool) {
         button.set_child(Some(&spinner));
         button.set_tooltip_text(Some("Archiving…"));
     } else {
-        button.set_icon_name("mail-archive-symbolic");
+        set_action_icon(button, "mail-archive-symbolic");
         button.set_tooltip_text(Some("Archive"));
     }
 }
@@ -1680,6 +2119,78 @@ fn entry(placeholder: &str) -> gtk::Entry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn attachment_extensions_use_the_file_type_only_when_missing() {
+        for (filename, mime_type, expected) in [
+            ("image", "image/png", "image.png"),
+            (
+                "Forwarded message",
+                "message/rfc822",
+                "Forwarded message.eml",
+            ),
+            ("photo.jpeg", "image/jpeg", "photo.jpeg"),
+            ("archive.tar.gz", "application/gzip", "archive.tar.gz"),
+            ("data", "application/octet-stream", "data"),
+            ("", "application/pdf", "attachment.pdf"),
+        ] {
+            let part = Payload {
+                filename: filename.to_owned(),
+                mime_type: mime_type.to_owned(),
+                ..Payload::default()
+            };
+            assert_eq!(attachment_filename(&part), expected);
+        }
+    }
+
+    #[test]
+    fn attachment_summary_preserves_the_actual_filename_and_extension() {
+        let first = Payload {
+            filename: "Quarterly report – September 2026.final.pdf".to_owned(),
+            ..Payload::default()
+        };
+        let second = Payload {
+            filename: "source.backup.tar.gz".to_owned(),
+            ..Payload::default()
+        };
+        assert_eq!(attachment_summary(&[&first]), first.filename);
+        assert_eq!(
+            attachment_summary(&[&first, &second]),
+            "Quarterly report – September 2026.final.pdf (+1)"
+        );
+        assert_eq!(attachment_filename(&second), "source.backup.tar.gz");
+    }
+
+    #[test]
+    fn attachment_names_are_safe_save_dialog_defaults() {
+        for (filename, expected) in [
+            ("../../report.pdf", "report.pdf"),
+            ("C:\\files\\notes.txt", "notes.txt"),
+            ("..", "attachment"),
+            ("", "attachment"),
+        ] {
+            let part = Payload {
+                filename: filename.to_owned(),
+                ..Payload::default()
+            };
+            assert_eq!(attachment_filename(&part), expected);
+        }
+    }
+
+    #[test]
+    fn refreshed_attachment_metadata_changes_the_mailbox_snapshot() {
+        let mut cached = message("one", "thread", 10);
+        let before = message_snapshot(&cached);
+        cached.payload.filename = "report.pdf".to_owned();
+        assert_ne!(before, message_snapshot(&cached));
+    }
+
+    #[test]
+    fn completed_initial_load_replaces_loading_row_even_when_empty() {
+        assert!(should_display_loaded_messages(false, false));
+        assert!(!should_display_loaded_messages(true, false));
+        assert!(should_display_loaded_messages(true, true));
+    }
 
     fn message(id: &str, thread: &str, timestamp: i64) -> Message {
         serde_json::from_value(json!({
@@ -1739,5 +2250,23 @@ mod tests {
         let mut changed = second;
         changed.label_ids.push("STARRED".to_owned());
         assert!(mailbox_changed(&state, &[first, changed]));
+    }
+
+    #[test]
+    fn reply_all_preserves_to_and_cc_and_excludes_the_account() {
+        let original: Message = serde_json::from_value(json!({
+            "id": "message",
+            "threadId": "thread",
+            "payload": { "headers": [
+                { "name": "From", "value": "Alice <alice@example.com>" },
+                { "name": "To", "value": "Kent <kent@example.com>, Bob <bob@example.com>" },
+                { "name": "Cc", "value": "Carol <carol@example.com>, Bob <bob@example.com>" }
+            ]}
+        }))
+        .unwrap();
+
+        let (to, cc) = reply_all_recipients(&original, "kent@example.com");
+        assert_eq!(to, "Alice <alice@example.com>, Bob <bob@example.com>");
+        assert_eq!(cc, "Carol <carol@example.com>");
     }
 }
