@@ -22,6 +22,16 @@ pub fn install_omarchy_integration() {
     let Some(display) = gdk::Display::default() else {
         return;
     };
+    let layout = gtk::CssProvider::new();
+    layout.load_from_string(
+        "expander-widget.message-section > box > title { padding: 12px 16px; }
+         expander-widget.message-section > box > title > expander { margin-right: 12px; }",
+    );
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &layout,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
     let Some(base_dirs) = BaseDirs::new() else {
         return;
     };

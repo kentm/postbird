@@ -3,6 +3,7 @@ mod cache;
 mod gmail;
 mod oauth;
 mod preferences;
+mod quota;
 mod theme;
 mod ui;
 
