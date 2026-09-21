@@ -1,6 +1,6 @@
 [package]
 name = "postbird"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -14,12 +14,7 @@ html2text = "0.16"
 keyring = { version = "3.6", features = ["linux-native-sync-persistent", "crypto-rust"] }
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
 mime_guess = "2.0"
-open = "5.3"
-rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
-url = "2.5"
 webkit6 = { version = "0.5", features = ["v2_50"] }

@@ -1,9 +1,8 @@
 mod accounts;
 mod cache;
 mod gmail;
-mod oauth;
+mod mail;
 mod preferences;
-mod quota;
 mod theme;
 mod ui;
 

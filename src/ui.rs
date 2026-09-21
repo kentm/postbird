@@ -15,9 +15,10 @@ use lettre::message::{Mailbox, Mailboxes};
 use webkit6::prelude::*;
 
 use crate::{
-    accounts::{Account, AccountStore},
+    accounts::{Account, AccountKind, AccountStore},
     cache::MailCache,
-    gmail::{ComposeMessage, ForwardedAttachment, GmailClient, Message, Payload},
+    gmail::{ComposeMessage, ForwardedAttachment, Message, Payload, ThreadRef},
+    mail::{ImapClient, MailClient},
     preferences::UiPreferences,
 };
 
@@ -28,7 +29,7 @@ struct Widgets {
     accounts: gtk::StringList,
     account_picker: gtk::DropDown,
     messages: gtk::ListBox,
-    labels: gtk::ListBox,
+    sidebar_navigation: gtk::Box,
     mailbox_title: gtk::Label,
     mailbox_spinner: gtk::Spinner,
     message_title: gtk::Label,
@@ -51,15 +52,21 @@ struct Widgets {
 
 struct State {
     account_emails: Vec<String>,
-    labels: Vec<(String, String)>,
+    account_names: Vec<String>,
+    account_labels: HashMap<String, Vec<(String, String)>>,
+    unread_counts: HashMap<(String, String), u32>,
+    unread_refresh_generation: HashMap<String, u64>,
+    collapsed_accounts: HashSet<String>,
     conversations: Vec<Vec<Message>>,
     selected: Option<Message>,
     selected_conversation: Vec<Message>,
+    history_expanded: bool,
     current_label: String,
     load_generation: u64,
     load_cancel: Arc<AtomicBool>,
     mailbox_loading: bool,
     inbox_sync_account: Option<String>,
+    inbox_sync_cancel: Option<Arc<AtomicBool>>,
     pending_archives: HashSet<(String, String)>,
     archived_messages: HashMap<(String, String), (HashSet<String>, std::time::Instant)>,
 }
@@ -68,15 +75,21 @@ impl Default for State {
     fn default() -> Self {
         Self {
             account_emails: Vec::new(),
-            labels: Vec::new(),
+            account_names: Vec::new(),
+            account_labels: HashMap::new(),
+            unread_counts: HashMap::new(),
+            unread_refresh_generation: HashMap::new(),
+            collapsed_accounts: HashSet::new(),
             conversations: Vec::new(),
             selected: None,
             selected_conversation: Vec::new(),
+            history_expanded: false,
             current_label: "INBOX".to_owned(),
             load_generation: 0,
             load_cancel: Arc::new(AtomicBool::new(false)),
             mailbox_loading: false,
             inbox_sync_account: None,
+            inbox_sync_cancel: None,
             pending_archives: HashSet::new(),
             archived_messages: HashMap::new(),
         }
@@ -84,12 +97,14 @@ impl Default for State {
 }
 
 pub fn build(app: &adw::Application) {
+    install_visual_style();
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Postbird")
         .default_width(1180)
         .default_height(760)
         .build();
+    window.add_css_class("postbird-window");
     let toast = adw::ToastOverlay::new();
     let state = Rc::new(RefCell::new(State::default()));
     let preferences = Rc::new(RefCell::new(UiPreferences::load()));
@@ -102,7 +117,7 @@ pub fn build(app: &adw::Application) {
         .build();
     let add_account = gtk::Button::builder()
         .icon_name("list-add-symbolic")
-        .tooltip_text("Add Google account")
+        .tooltip_text("Add mail account")
         .build();
     let remove_account = gtk::Button::builder()
         .icon_name("edit-delete-symbolic")
@@ -121,9 +136,7 @@ pub fn build(app: &adw::Application) {
     let messages = gtk::ListBox::new();
     messages.add_css_class("navigation-sidebar");
     messages.set_selection_mode(gtk::SelectionMode::Single);
-    let labels = gtk::ListBox::new();
-    labels.add_css_class("navigation-sidebar");
-    labels.set_selection_mode(gtk::SelectionMode::Single);
+    let sidebar_navigation = gtk::Box::new(Orientation::Vertical, 5);
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Search mail")
         .build();
@@ -135,18 +148,19 @@ pub fn build(app: &adw::Application) {
         .visible(false)
         .tooltip_text("Syncing this folder…")
         .build();
-    let message_title = detail_label("Select a message", "title-1");
+    let message_title = detail_label("Select a message", "postbird-message-title");
     let message_sender = detail_label("", "dim-label");
-    let conversation_body = gtk::Box::new(Orientation::Vertical, 8);
+    let conversation_body = gtk::Box::new(Orientation::Vertical, 4);
     let conversation_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&conversation_body)
         .build();
-    let message_content = gtk::Box::new(Orientation::Vertical, 8);
+    let message_content = gtk::Box::new(Orientation::Vertical, 4);
     message_content.set_visible(false);
-    message_content.set_margin_top(18);
-    message_content.set_margin_start(24);
-    message_content.set_margin_end(24);
+    message_content.set_margin_top(9);
+    message_content.set_margin_start(12);
+    message_content.set_margin_end(12);
     message_content.append(&message_title);
     message_content.append(&message_sender);
     message_content.append(&conversation_scroll);
@@ -160,13 +174,22 @@ pub fn build(app: &adw::Application) {
     let reply_all = action_button("mail-reply-all-symbolic", "Reply All");
     let load_images = action_button("image-x-generic-symbolic", "Always load remote images");
     let detail_actions = gtk::Box::new(Orientation::Horizontal, 6);
-    detail_actions.append(&archive);
-    detail_actions.append(&star);
-    detail_actions.append(&trash);
-    detail_actions.append(&unread);
-    detail_actions.prepend(&reply);
-    detail_actions.insert_child_after(&reply_all, Some(&reply));
-    detail_actions.insert_child_after(&forward, Some(&reply_all));
+    detail_actions.add_css_class("postbird-actions");
+    let organise_actions = gtk::Box::new(Orientation::Horizontal, 0);
+    organise_actions.add_css_class("postbird-action-group");
+    for button in [&archive, &trash, &unread, &star] {
+        button.add_css_class("flat");
+        organise_actions.append(button);
+    }
+    let reply_actions = gtk::Box::new(Orientation::Horizontal, 0);
+    reply_actions.add_css_class("postbird-action-group");
+    for button in [&reply, &reply_all, &forward] {
+        button.add_css_class("flat");
+        reply_actions.append(button);
+    }
+    load_images.add_css_class("flat");
+    detail_actions.append(&organise_actions);
+    detail_actions.append(&reply_actions);
     detail_actions.append(&load_images);
     message_content.prepend(&detail_actions);
 
@@ -177,6 +200,7 @@ pub fn build(app: &adw::Application) {
         .hexpand(true)
         .build();
     let detail_stack = gtk::Stack::new();
+    detail_stack.add_css_class("postbird-reader");
     detail_stack.add_named(&message_status, Some("status"));
     detail_stack.add_named(&message_content, Some("message"));
     detail_stack.set_visible_child_name("status");
@@ -187,7 +211,7 @@ pub fn build(app: &adw::Application) {
         accounts,
         account_picker,
         messages,
-        labels,
+        sidebar_navigation,
         mailbox_title,
         mailbox_spinner,
         message_title,
@@ -228,7 +252,7 @@ pub fn build(app: &adw::Application) {
     let mailbox_split = gtk::Paned::new(Orientation::Horizontal);
     mailbox_split.set_start_child(Some(&mailbox_sidebar(&widgets, &state)));
     mailbox_split.set_end_child(Some(&message_split));
-    mailbox_split.set_position(preferences.borrow().mailbox_split);
+    mailbox_split.set_position(preferences.borrow().mailbox_split.max(245));
     mailbox_split.set_wide_handle(true);
     mailbox_split.set_resize_start_child(false);
     mailbox_split.set_resize_end_child(true);
@@ -237,12 +261,6 @@ pub fn build(app: &adw::Application) {
     toolbar_view.set_content(Some(&mailbox_split));
     toast.set_child(Some(&toolbar_view));
     window.set_content(Some(&toast));
-
-    let conversation_for_resize = widgets.conversation_body.clone();
-    conversation_scroll.add_tick_callback(move |scroll, _| {
-        size_conversation_sections(scroll, &conversation_for_resize);
-        glib::ControlFlow::Continue
-    });
 
     connect_split_preferences(&mailbox_split, &message_split, &preferences);
 
@@ -261,11 +279,60 @@ pub fn build(app: &adw::Application) {
     window.present();
 }
 
+fn install_visual_style() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(
+        "window.postbird-window { font-size: 0.92em; }
+         .postbird-sidebar { background: #202633; color: #eff3fb; }
+         .postbird-sidebar label, .postbird-sidebar image { color: #eff3fb; }
+         .postbird-sidebar .dim-label, .postbird-sidebar-heading { color: #aeb8c9; }
+         .postbird-sidebar-heading { margin: 4px 4px 1px; letter-spacing: 0.08em; }
+         .postbird-sidebar separator { background: #485062; margin: 5px 2px; }
+         .postbird-sidebar expander { color: #eff3fb; }
+         .postbird-account { margin-top: 2px; }
+         .postbird-account-folders { margin: 2px 0 4px 8px; }
+         .postbird-folder { min-height: 28px; padding: 2px 4px; border-radius: 7px; }
+         .postbird-folder:hover { background: #39445a; }
+         .postbird-folder.active { background: #315c9e; }
+         .postbird-favorite { min-width: 24px; padding: 0; opacity: 0.72; }
+         .postbird-sidebar .postbird-unread-badge { background: #7daaff; color: #15243d;
+             border-radius: 99px; padding: 1px 6px; font-weight: bold; font-size: 0.85em; }
+         .postbird-list-panel { background: #25282e; color: #edf0f5; }
+         .postbird-list-panel label, .postbird-list-panel image { color: #edf0f5; }
+         .postbird-list-panel .dim-label { color: #afb4bd; }
+         .postbird-list-panel listbox, .postbird-list-panel row { background: transparent; }
+         .postbird-list-panel row:hover { background: #343b49; }
+         .postbird-list-panel row:selected { background: #185bb4; }
+         .postbird-reader, .postbird-reader scrolledwindow { background: #ffffff; color: #181b20; }
+         .postbird-reader label, .postbird-reader image { color: #181b20; }
+         .postbird-reader .dim-label { color: #717984; }
+         .postbird-reader .postbird-message-title { font-size: 18px; font-weight: 700; }
+         .postbird-reader .postbird-part-trigger { min-width: 24px; min-height: 24px; padding: 2px; }
+         .postbird-reader .message-section { background: #ffffff; color: #181b20;
+             border: 0; border-bottom: 1px solid #e3e7ed; border-radius: 0; box-shadow: none; }
+         .postbird-reader .postbird-history-toggle { background: #f0f4fa; border-radius: 12px;
+             margin: 3px 0; min-height: 32px; }
+         .postbird-reader .postbird-history-toggle label { color: #315c9e; }
+         .postbird-action-group { background: #f2f4f7; border-radius: 12px; padding: 2px; }
+         .postbird-action-group button { min-width: 34px; min-height: 30px; }
+         .postbird-actions { margin-bottom: 11px; }",
+    );
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 fn connect_background_sync(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     let widgets = widgets.clone();
     let state = state.clone();
     glib::timeout_add_seconds_local(60, move || {
         sync_recent_inbox(&widgets, &state);
+        refresh_favorite_counts(&widgets, &state);
         glib::ControlFlow::Continue
     });
 }
@@ -288,104 +355,429 @@ fn connect_split_preferences(
 }
 
 fn mailbox_sidebar(widgets: &Widgets, state: &Rc<RefCell<State>>) -> gtk::Widget {
-    let sidebar = gtk::Box::new(Orientation::Vertical, 12);
-    sidebar.set_size_request(160, -1);
-    sidebar.set_margin_top(12);
-    sidebar.set_margin_bottom(12);
-    sidebar.set_margin_start(12);
-    sidebar.set_margin_end(12);
-    sidebar.append(&widgets.account_picker);
-    let folders = gtk::ListBox::new();
-    folders.add_css_class("navigation-sidebar");
-    folders.set_selection_mode(gtk::SelectionMode::Single);
-    for (icon, name) in [
-        ("mail-unread-symbolic", "Inbox"),
-        ("starred-symbolic", "Starred"),
-        ("document-send-symbolic", "Sent"),
-        ("document-edit-symbolic", "Drafts"),
-        ("user-trash-symbolic", "Trash"),
-    ] {
-        let row = adw::ActionRow::builder()
-            .title(name)
-            .activatable(true)
-            .build();
-        row.add_prefix(&gtk::Image::from_icon_name(icon));
-        folders.append(&row);
-    }
-    if let Some(row) = folders.row_at_index(0) {
-        folders.select_row(Some(&row));
-    }
-    let labels_for_folder = widgets.labels.clone();
-    let widgets_for_folder = widgets.clone();
-    let state_for_folder = state.clone();
-    folders.connect_row_selected(move |_, row| {
-        let Some(row) = row else { return };
-        labels_for_folder.unselect_all();
-        let (label, title) = match row.index() {
-            1 => ("STARRED", "Starred"),
-            2 => ("SENT", "Sent"),
-            3 => ("DRAFT", "Drafts"),
-            4 => ("TRASH", "Trash"),
-            _ => ("INBOX", "Inbox"),
-        };
-        state_for_folder.borrow_mut().current_label = label.to_owned();
-        widgets_for_folder.mailbox_title.set_text(title);
-        let index = widgets_for_folder.account_picker.selected() as usize;
-        let email = { state_for_folder.borrow().account_emails.get(index).cloned() };
-        if let Some(email) = email {
-            load_inbox(&widgets_for_folder, &state_for_folder, email, None, true);
-        }
-    });
-    let folders_for_label = folders.clone();
-    let widgets_for_label = widgets.clone();
-    let state_for_label = state.clone();
-    widgets.labels.connect_row_selected(move |_, row| {
-        let Some(row) = row else { return };
-        folders_for_label.unselect_all();
-        let selected = state_for_label
-            .borrow()
-            .labels
-            .get(row.index() as usize)
-            .cloned();
-        let Some((label_id, label_name)) = selected else {
-            return;
-        };
-        state_for_label.borrow_mut().current_label = label_id;
-        widgets_for_label.mailbox_title.set_text(&label_name);
-        let index = widgets_for_label.account_picker.selected() as usize;
-        let email = state_for_label.borrow().account_emails.get(index).cloned();
-        if let Some(email) = email {
-            load_inbox(&widgets_for_label, &state_for_label, email, None, true);
-        }
-    });
-    let navigation = gtk::Box::new(Orientation::Vertical, 10);
-    navigation.append(&folders);
-    navigation.append(&gtk::Separator::new(Orientation::Horizontal));
-    let labels_heading = gtk::Label::builder()
-        .label("Labels")
-        .halign(Align::Start)
-        .css_classes(["heading"])
-        .build();
-    navigation.append(&labels_heading);
-    navigation.append(&widgets.labels);
+    let sidebar = gtk::Box::new(Orientation::Vertical, 0);
+    sidebar.add_css_class("postbird-sidebar");
+    sidebar.set_size_request(225, -1);
+    widgets.sidebar_navigation.set_margin_top(9);
+    widgets.sidebar_navigation.set_margin_bottom(9);
+    widgets.sidebar_navigation.set_margin_start(6);
+    widgets.sidebar_navigation.set_margin_end(6);
     sidebar.append(
         &gtk::ScrolledWindow::builder()
             .vexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .child(&navigation)
+            .child(&widgets.sidebar_navigation)
             .build(),
     );
+    rebuild_sidebar(widgets, state);
     sidebar.upcast()
 }
 
+fn sidebar_folders(state: &State, email: &str) -> Vec<(String, String, &'static str)> {
+    let mut folders = [
+        ("INBOX", "Inbox", "mail-unread-symbolic"),
+        ("STARRED", "Starred", "starred-symbolic"),
+        ("SENT", "Sent", "document-send-symbolic"),
+        ("DRAFT", "Drafts", "document-edit-symbolic"),
+        ("", "All Mail", "mail-archive-symbolic"),
+        ("TRASH", "Trash", "user-trash-symbolic"),
+    ]
+    .into_iter()
+    .map(|(id, title, icon)| (id.to_owned(), title.to_owned(), icon))
+    .collect::<Vec<_>>();
+    if let Some(labels) = state.account_labels.get(email) {
+        folders.extend(
+            labels
+                .iter()
+                .map(|(id, title)| (id.clone(), title.clone(), "tag-symbolic")),
+        );
+    }
+    folders
+}
+
+fn sidebar_heading(title: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(title)
+        .halign(Align::Start)
+        .css_classes(["caption", "heading", "postbird-sidebar-heading"])
+        .build()
+}
+
+fn sidebar_folder_row(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    email: &str,
+    label_id: &str,
+    title: &str,
+    icon: &str,
+    account_name: Option<&str>,
+) -> gtk::Box {
+    let row = gtk::Box::new(Orientation::Horizontal, 1);
+    let button = gtk::Button::new();
+    button.add_css_class("flat");
+    button.add_css_class("postbird-folder");
+    let selected = state
+        .borrow()
+        .account_emails
+        .get(widgets.account_picker.selected() as usize)
+        .is_some_and(|active_email| active_email == email)
+        && state.borrow().current_label == label_id;
+    if selected {
+        button.add_css_class("active");
+    }
+    button.set_hexpand(true);
+    let content = gtk::Box::new(Orientation::Horizontal, 5);
+    content.append(&gtk::Image::from_icon_name(icon));
+    let text = account_name.map_or_else(
+        || title.to_owned(),
+        |name| {
+            widgets
+                .preferences
+                .borrow()
+                .favorite_name(email, label_id)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{title} · {name}"))
+        },
+    );
+    content.append(
+        &gtk::Label::builder()
+            .label(&text)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build(),
+    );
+    if account_name.is_some()
+        && let Some(count) = state
+            .borrow()
+            .unread_counts
+            .get(&(email.to_owned(), label_id.to_owned()))
+            .copied()
+        && count > 0
+    {
+        content.append(
+            &gtk::Label::builder()
+                .label(if count > 999 {
+                    "999+".to_owned()
+                } else {
+                    count.to_string()
+                })
+                .tooltip_text(format!("{count} unread messages"))
+                .css_classes(["postbird-unread-badge"])
+                .build(),
+        );
+    }
+    button.set_child(Some(&content));
+    button.set_tooltip_text(Some(&format!("{title} — {email}")));
+    let widgets_for_select = widgets.clone();
+    let state_for_select = state.clone();
+    let selected_email = email.to_owned();
+    let selected_label = label_id.to_owned();
+    let selected_title = title.to_owned();
+    button.connect_clicked(move |_| {
+        select_mailbox(
+            &widgets_for_select,
+            &state_for_select,
+            &selected_email,
+            &selected_label,
+            &selected_title,
+        );
+    });
+    row.append(&button);
+
+    if account_name.is_some() {
+        let rename = gtk::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .tooltip_text("Rename favourite")
+            .css_classes(["flat", "postbird-favorite"])
+            .build();
+        let widgets_for_rename = widgets.clone();
+        let state_for_rename = state.clone();
+        let rename_email = email.to_owned();
+        let rename_label = label_id.to_owned();
+        let rename_title = title.to_owned();
+        rename.connect_clicked(move |_| {
+            let widgets = widgets_for_rename.clone();
+            let state = state_for_rename.clone();
+            let email = rename_email.clone();
+            let label_id = rename_label.clone();
+            let title = rename_title.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let name = gtk::Entry::builder()
+                    .placeholder_text("Work, Personal")
+                    .max_length(60)
+                    .build();
+                if let Some(current) = widgets.preferences.borrow().favorite_name(&email, &label_id) {
+                    name.set_text(current);
+                }
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Rename favourite")
+                    .body(format!("{title} in {email}. This changes only its name in Postbird; leave blank to use the original name."))
+                    .extra_child(&name)
+                    .close_response("cancel")
+                    .default_response("save")
+                    .build();
+                dialog.add_responses(&[("cancel", "Cancel"), ("save", "Save")]);
+                if dialog.choose_future(Some(&widgets.window)).await != "save" {
+                    return;
+                }
+                {
+                    let mut preferences = widgets.preferences.borrow_mut();
+                    preferences.set_favorite_name(&email, &label_id, name.text().as_str());
+                    if let Err(error) = preferences.save() {
+                        show_message(&widgets, &format!("Could not save favourite name: {error}"));
+                    }
+                }
+                rebuild_sidebar(&widgets, &state);
+            });
+        });
+        row.append(&rename);
+    }
+
+    let favorite = widgets.preferences.borrow().is_favorite(email, label_id);
+    let star = gtk::Button::builder()
+        .icon_name(if favorite {
+            "starred-symbolic"
+        } else {
+            "non-starred-symbolic"
+        })
+        .tooltip_text(if favorite {
+            "Remove from Favourites"
+        } else {
+            "Add to Favourites"
+        })
+        .css_classes(["flat", "postbird-favorite"])
+        .build();
+    let widgets_for_favorite = widgets.clone();
+    let state_for_favorite = state.clone();
+    let favorite_email = email.to_owned();
+    let favorite_label = label_id.to_owned();
+    star.connect_clicked(move |_| {
+        {
+            let mut preferences = widgets_for_favorite.preferences.borrow_mut();
+            preferences.toggle_favorite(&favorite_email, &favorite_label);
+            if let Err(error) = preferences.save() {
+                show_message(
+                    &widgets_for_favorite,
+                    &format!("Could not save Favourites: {error}"),
+                );
+            }
+        }
+        rebuild_sidebar(&widgets_for_favorite, &state_for_favorite);
+        refresh_favorite_counts_for_account(
+            &widgets_for_favorite,
+            &state_for_favorite,
+            &favorite_email,
+        );
+    });
+    row.append(&star);
+    row
+}
+
+fn rebuild_sidebar(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    let navigation = &widgets.sidebar_navigation;
+    while let Some(child) = navigation.first_child() {
+        navigation.remove(&child);
+    }
+    let accounts = {
+        let state = state.borrow();
+        state
+            .account_emails
+            .iter()
+            .enumerate()
+            .map(|(index, email)| {
+                (
+                    email.clone(),
+                    state
+                        .account_names
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| email.clone()),
+                    sidebar_folders(&state, email),
+                    state.collapsed_accounts.contains(email),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    navigation.append(&sidebar_heading("FAVOURITES"));
+    let mut any_favorites = false;
+    for (email, name, folders, _) in &accounts {
+        for (label_id, title, icon) in folders {
+            if widgets.preferences.borrow().is_favorite(email, label_id) {
+                any_favorites = true;
+                navigation.append(&sidebar_folder_row(
+                    widgets,
+                    state,
+                    email,
+                    label_id,
+                    title,
+                    icon,
+                    Some(name),
+                ));
+            }
+        }
+    }
+    if !any_favorites {
+        navigation.append(
+            &gtk::Label::builder()
+                .label("Star a folder to keep it here")
+                .xalign(0.0)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+    }
+    navigation.append(&gtk::Separator::new(Orientation::Horizontal));
+    navigation.append(&sidebar_heading("ACCOUNTS"));
+    for (email, name, folders, collapsed) in accounts {
+        let folder_list = gtk::Box::new(Orientation::Vertical, 2);
+        folder_list.add_css_class("postbird-account-folders");
+        for (label_id, title, icon) in folders {
+            folder_list.append(&sidebar_folder_row(
+                widgets, state, &email, &label_id, &title, icon, None,
+            ));
+        }
+        let account_label = gtk::Label::builder()
+            .label(&name)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["heading"])
+            .build();
+        let parent = gtk::Expander::builder()
+            .label_widget(&account_label)
+            .child(&folder_list)
+            .expanded(!collapsed)
+            .build();
+        parent.add_css_class("postbird-account");
+        let state_for_expand = state.clone();
+        parent.connect_expanded_notify(move |expander| {
+            let mut state = state_for_expand.borrow_mut();
+            if expander.is_expanded() {
+                state.collapsed_accounts.remove(&email);
+            } else {
+                state.collapsed_accounts.insert(email.clone());
+            }
+        });
+        navigation.append(&parent);
+    }
+}
+
+fn refresh_favorite_counts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    let emails = state.borrow().account_emails.clone();
+    for email in emails {
+        refresh_favorite_counts_for_account(widgets, state, &email);
+    }
+}
+
+fn refresh_favorite_counts_for_account(widgets: &Widgets, state: &Rc<RefCell<State>>, email: &str) {
+    let labels = {
+        let state = state.borrow();
+        if !state.account_emails.iter().any(|account| account == email) {
+            return;
+        }
+        sidebar_folders(&state, email)
+            .into_iter()
+            .filter(|(label, _, _)| widgets.preferences.borrow().is_favorite(email, label))
+            .map(|(label, _, _)| label)
+            .collect::<Vec<_>>()
+    };
+    if labels.is_empty() {
+        return;
+    }
+    let generation = {
+        let mut state = state.borrow_mut();
+        let generation = state
+            .unread_refresh_generation
+            .entry(email.to_owned())
+            .or_default();
+        *generation += 1;
+        *generation
+    };
+    let widgets = widgets.clone();
+    let state = state.clone();
+    let email = email.to_owned();
+    glib::MainContext::default().spawn_local(async move {
+        let request_email = email.clone();
+        let request_labels = labels.clone();
+        let result = gio::spawn_blocking(move || -> anyhow::Result<Vec<u32>> {
+            MailClient::for_account(AccountStore::open()?, &request_email)?
+                .unread_counts(&request_labels)
+        })
+        .await;
+        let Ok(Ok(counts)) = result else {
+            return;
+        };
+        if counts.len() != labels.len() {
+            return;
+        }
+        let fresh_counts = labels
+            .into_iter()
+            .zip(counts)
+            .filter(|(_, count)| *count > 0)
+            .collect::<HashMap<_, _>>();
+        {
+            let mut state = state.borrow_mut();
+            if state.unread_refresh_generation.get(&email) != Some(&generation)
+                || !state.account_emails.contains(&email)
+            {
+                return;
+            }
+            let current_counts = state
+                .unread_counts
+                .iter()
+                .filter(|((account, _), _)| account == &email)
+                .map(|((_, label), count)| (label.clone(), *count))
+                .collect::<HashMap<_, _>>();
+            if current_counts == fresh_counts {
+                return;
+            }
+            state
+                .unread_counts
+                .retain(|(account, _), _| account != &email);
+            for (label, count) in fresh_counts {
+                state.unread_counts.insert((email.clone(), label), count);
+            }
+        }
+        rebuild_sidebar(&widgets, &state);
+    });
+}
+
+fn select_mailbox(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    email: &str,
+    label_id: &str,
+    title: &str,
+) {
+    let Some(index) = state
+        .borrow()
+        .account_emails
+        .iter()
+        .position(|item| item == email)
+    else {
+        return;
+    };
+    state.borrow_mut().current_label = label_id.to_owned();
+    widgets
+        .mailbox_title
+        .set_text(&format!("{title} · {email}"));
+    widgets.search.set_text("");
+    if widgets.account_picker.selected() != index as u32 {
+        widgets.account_picker.set_selected(index as u32);
+    } else {
+        load_inbox(widgets, state, email.to_owned(), None, true);
+    }
+    rebuild_sidebar(widgets, state);
+}
+
 fn message_list_panel(widgets: &Widgets) -> gtk::Widget {
-    let panel = gtk::Box::new(Orientation::Vertical, 8);
-    panel.set_size_request(260, -1);
-    panel.set_margin_top(12);
-    panel.set_margin_bottom(12);
-    panel.set_margin_start(12);
-    panel.set_margin_end(12);
-    let title_row = gtk::Box::new(Orientation::Horizontal, 12);
+    let panel = gtk::Box::new(Orientation::Vertical, 5);
+    panel.add_css_class("postbird-list-panel");
+    panel.set_size_request(300, -1);
+    panel.set_margin_top(6);
+    panel.set_margin_bottom(6);
+    panel.set_margin_start(6);
+    panel.set_margin_end(6);
+    let title_row = gtk::Box::new(Orientation::Horizontal, 6);
     widgets.mailbox_title.set_hexpand(true);
     title_row.append(&widgets.mailbox_title);
     title_row.append(&widgets.mailbox_spinner);
@@ -430,10 +822,13 @@ fn connect_selection(widgets: &Widgets, state: &Rc<RefCell<State>>, stack: &gtk:
             let Some(message) = conversation.first().cloned() else {
                 return;
             };
+            state.borrow_mut().history_expanded = false;
             widgets.message_title.set_text(message.header("Subject"));
-            widgets
-                .message_sender
-                .set_text(&message_recipient_summary(&message, conversation.len()));
+            widgets.message_sender.set_text(&format!(
+                "{} message{} in this conversation",
+                conversation.len(),
+                if conversation.len() == 1 { "" } else { "s" }
+            ));
             display_conversation(
                 &widgets,
                 &state,
@@ -457,9 +852,11 @@ fn mark_read_in_background(
         return;
     };
     let widgets = widgets.clone();
+    let state = state.clone();
     glib::MainContext::default().spawn_local(async move {
+        let refresh_email = email.clone();
         let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
-            let mut client = GmailClient::for_account(AccountStore::open()?, &email)?;
+            let mut client = MailClient::for_account(AccountStore::open()?, &email)?;
             for id in &message_ids {
                 client.set_unread(id, false)?;
             }
@@ -467,7 +864,7 @@ fn mark_read_in_background(
         })
         .await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => refresh_favorite_counts_for_account(&widgets, &state, &refresh_email),
             Ok(Err(error)) => show_message(&widgets, &format!("Could not mark as read: {error}")),
             Err(_) => show_message(&widgets, "The mark-as-read task stopped unexpectedly"),
         }
@@ -484,8 +881,19 @@ fn connect_account_picker(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             let index = picker.selected() as usize;
             let email = { state.borrow().account_emails.get(index).cloned() };
             if let Some(email) = email {
-                load_labels(&widgets, &state, email.clone());
-                load_inbox(&widgets, &state, email, None, false);
+                let title = {
+                    let state = state.borrow();
+                    sidebar_folders(&state, &email)
+                        .into_iter()
+                        .find(|(id, _, _)| id == &state.current_label)
+                        .map(|(_, title, _)| title)
+                        .unwrap_or_else(|| "Mail".to_owned())
+                };
+                widgets
+                    .mailbox_title
+                    .set_text(&format!("{title} · {email}"));
+                load_inbox(&widgets, &state, email, None, true);
+                rebuild_sidebar(&widgets, &state);
             }
         });
 }
@@ -497,61 +905,152 @@ fn connect_add_account(widgets: &Widgets, state: &Rc<RefCell<State>>, button: &g
         let widgets = widgets.clone();
         let state = state.clone();
         glib::MainContext::default().spawn_local(async move {
-            let store = match AccountStore::open() {
-                Ok(store) => store,
-                Err(error) => return show_error(&widgets, error),
-            };
-            if !store.credentials_path().exists() {
-                let dialog = gtk::FileDialog::builder()
-                    .title("Choose Google Desktop OAuth credentials")
-                    .accept_label("Import")
-                    .build();
-                let file = match dialog.open_future(Some(&widgets.window)).await {
-                    Ok(file) => file,
-                    Err(error) if error.matches(gtk::DialogError::Dismissed) => return,
-                    Err(error) => return show_error(&widgets, error),
-                };
-                let Some(path) = file.path() else {
-                    return show_message(&widgets, "Please choose a local credentials JSON file");
-                };
-                if let Err(error) = store.import_credentials(&path) {
-                    return show_error(&widgets, error);
-                }
-            }
-            show_message(&widgets, "Finish signing in using your browser");
-            let result = gio::spawn_blocking(move || -> anyhow::Result<Account> {
-                let credentials = store.credentials()?;
-                let token = credentials.authorize()?;
-                let mut client =
-                    GmailClient::new(credentials, token.clone(), String::new(), store.clone())?;
-                let profile = client.profile()?;
-                let account = Account {
-                    display_name: profile.email_address.clone(),
-                    email: profile.email_address,
-                };
-                store.save_account(account.clone(), &token)?;
-                Ok(account)
-            })
-            .await;
-            match result {
-                Ok(Ok(account)) => {
-                    load_accounts(&widgets, &state);
-                    let index = {
-                        state
-                            .borrow()
-                            .account_emails
-                            .iter()
-                            .position(|email| email == &account.email)
-                    };
-                    if let Some(index) = index {
-                        widgets.account_picker.set_selected(index as u32);
-                    }
-                }
-                Ok(Err(error)) => show_error(&widgets, error),
-                Err(_) => show_message(&widgets, "The sign-in task stopped unexpectedly"),
+            let choice = adw::AlertDialog::builder()
+                .heading("Add an account")
+                .body("Choose how Postbird connects to Gmail.")
+                .close_response("cancel")
+                .default_response("app-password")
+                .build();
+            choice.add_responses(&[
+                ("cancel", "Cancel"),
+                ("app-password", "Gmail app password"),
+                ("goa", "GNOME Online Accounts"),
+            ]);
+            match choice.choose_future(Some(&widgets.window)).await.as_str() {
+                "app-password" => add_app_password_account(&widgets, &state).await,
+                "goa" => add_goa_account(&widgets, &state).await,
+                _ => {}
             }
         });
     });
+}
+
+async fn add_app_password_account(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    let address = gtk::Entry::builder()
+        .placeholder_text("you@gmail.com")
+        .input_purpose(gtk::InputPurpose::Email)
+        .build();
+    let password = gtk::PasswordEntry::builder()
+        .placeholder_text("16-character app password")
+        .show_peek_icon(true)
+        .build();
+    let form = gtk::Box::new(Orientation::Vertical, 12);
+    form.append(&gtk::Label::builder()
+        .label("Create an app password in your Google Account after enabling 2-Step Verification. Never enter your normal Google password.")
+        .wrap(true)
+        .xalign(0.0)
+        .build());
+    form.append(&address);
+    form.append(&password);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Gmail app password")
+        .extra_child(&form)
+        .close_response("cancel")
+        .default_response("connect")
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("connect", "Connect")]);
+    if dialog.choose_future(Some(&widgets.window)).await != "connect" {
+        return;
+    }
+    let email = address.text().trim().to_owned();
+    let secret = password.text().replace(' ', "");
+    password.set_text("");
+    if email.matches('@').count() != 1
+        || email.chars().any(char::is_whitespace)
+        || secret.is_empty()
+    {
+        return show_message(widgets, "Enter a full email address and app password");
+    }
+    show_message(widgets, "Checking Gmail IMAP and SMTP…");
+    let result = gio::spawn_blocking(move || -> anyhow::Result<Account> {
+        ImapClient::probe_credentials(&email, &secret)?;
+        let store = AccountStore::open()?;
+        let account = Account {
+            display_name: email.clone(),
+            email,
+            kind: AccountKind::GmailAppPassword,
+            goa_id: None,
+        };
+        store.save_app_password_account(account.clone(), &secret)?;
+        Ok(account)
+    })
+    .await;
+    match result {
+        Ok(Ok(account)) => {
+            load_accounts(widgets, state);
+            if let Some(index) = account_index(state, &account.email) {
+                widgets.account_picker.set_selected(index);
+            }
+        }
+        Ok(Err(error)) => show_error(widgets, error),
+        Err(_) => show_message(widgets, "The connection check stopped unexpectedly"),
+    }
+}
+
+async fn add_goa_account(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    let result = gio::spawn_blocking(ImapClient::goa_accounts).await;
+    let accounts = match result {
+        Ok(Ok(accounts)) if !accounts.is_empty() => accounts,
+        Ok(Ok(_)) => {
+            return show_message(
+                widgets,
+                "No Google Mail account is available in GNOME Online Accounts",
+            );
+        }
+        Ok(Err(error)) => return show_error(widgets, error),
+        Err(_) => return show_message(widgets, "The Online Accounts check stopped unexpectedly"),
+    };
+    let names = gtk::StringList::new(&[]);
+    for account in &accounts {
+        names.append(&account.email);
+    }
+    let picker = gtk::DropDown::builder().model(&names).build();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Use a GNOME Online Account")
+        .body("Choose a Google account with Mail enabled. Postbird will use GOA's sign-in and will not store its token.")
+        .extra_child(&picker)
+        .close_response("cancel")
+        .default_response("connect")
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("connect", "Connect")]);
+    if dialog.choose_future(Some(&widgets.window)).await != "connect" {
+        return;
+    }
+    let Some(selected) = accounts.get(picker.selected() as usize).cloned() else {
+        return show_message(widgets, "Choose an Online Account");
+    };
+    show_message(widgets, "Checking GOA Gmail IMAP and SMTP…");
+    let result = gio::spawn_blocking(move || -> anyhow::Result<Account> {
+        ImapClient::probe_goa(&selected.email, &selected.id)?;
+        let account = Account {
+            display_name: format!("{} (GOA)", selected.email),
+            email: selected.email,
+            kind: AccountKind::GnomeOnlineAccounts,
+            goa_id: Some(selected.id),
+        };
+        AccountStore::open()?.save_goa_account(account.clone())?;
+        Ok(account)
+    })
+    .await;
+    match result {
+        Ok(Ok(account)) => {
+            load_accounts(widgets, state);
+            if let Some(index) = account_index(state, &account.email) {
+                widgets.account_picker.set_selected(index);
+            }
+        }
+        Ok(Err(error)) => show_error(widgets, error),
+        Err(_) => show_message(widgets, "The Online Accounts check stopped unexpectedly"),
+    }
+}
+
+fn account_index(state: &Rc<RefCell<State>>, email: &str) -> Option<u32> {
+    state
+        .borrow()
+        .account_emails
+        .iter()
+        .position(|candidate| candidate == email)
+        .map(|index| index as u32)
 }
 
 fn connect_search(widgets: &Widgets, state: &Rc<RefCell<State>>) {
@@ -587,7 +1086,7 @@ fn connect_remove_account(widgets: &Widgets, state: &Rc<RefCell<State>>, button:
             let dialog = adw::AlertDialog::builder()
                 .heading("Remove this account?")
                 .body(format!(
-                    "Remove {email} and its stored sign-in token from Postbird? This does not delete the Google account or any Gmail messages."
+                    "Remove {email} and its cached mail from Postbird? Any Postbird-stored sign-in secret will be removed. This does not remove a GNOME Online Account or delete Gmail messages."
                 ))
                 .close_response("cancel")
                 .default_response("cancel")
@@ -597,10 +1096,32 @@ fn connect_remove_account(widgets: &Widgets, state: &Rc<RefCell<State>>, button:
             if dialog.choose_future(Some(&widgets.window)).await != "remove" {
                 return;
             }
-            let result =
-                gio::spawn_blocking(move || AccountStore::open()?.remove_account(&email)).await;
+            let removing_email = email.clone();
+            let result = gio::spawn_blocking(move || {
+                AccountStore::open()?.remove_account(&removing_email)
+            })
+            .await;
             match result {
-                Ok(Ok(())) => load_accounts(&widgets, &state),
+                Ok(Ok(())) => {
+                    {
+                        let mut state = state.borrow_mut();
+                        state.load_generation += 1;
+                        state.load_cancel.store(true, Ordering::Relaxed);
+                        state.pending_archives.retain(|(account, _)| account != &email);
+                        state.archived_messages.retain(|(account, _), _| account != &email);
+                        state.current_label = "INBOX".to_owned();
+                    }
+                    reset_reader(&widgets, &state);
+                    widgets.search.set_text("");
+                    {
+                        let mut preferences = widgets.preferences.borrow_mut();
+                        preferences.remove_account(&email);
+                        if let Err(error) = preferences.save() {
+                            show_message(&widgets, &format!("Could not save Favourites: {error}"));
+                        }
+                    }
+                    load_accounts(&widgets, &state);
+                }
                 Ok(Err(error)) => show_error(&widgets, error),
                 Err(_) => show_message(&widgets, "The account removal task stopped unexpectedly"),
             }
@@ -635,6 +1156,7 @@ fn connect_archive(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         if !state.borrow_mut().pending_archives.insert(key.clone()) {
             return;
         }
+        cancel_active_refresh(&widgets, &state);
         let query = widgets.search.text().to_string();
         remove_conversation(&widgets, &state, &thread_id);
         update_mailbox_spinner(&widgets, &state);
@@ -652,7 +1174,7 @@ fn connect_archive(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                 .collect::<Vec<_>>();
             let archived_ids = message_ids.iter().cloned().collect::<HashSet<_>>();
             let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
-                GmailClient::for_account(AccountStore::open()?, &request_email)?
+                MailClient::for_account(AccountStore::open()?, &request_email)?
                     .archive_thread(&request_thread)?;
                 // A cache failure must not roll back a successful Gmail archive.
                 if let Err(error) = MailCache::open()
@@ -664,7 +1186,8 @@ fn connect_archive(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             })
             .await;
             state.borrow_mut().pending_archives.remove(&key);
-            if matches!(result, Ok(Ok(()))) {
+            let succeeded = matches!(result, Ok(Ok(())));
+            if succeeded {
                 state
                     .borrow_mut()
                     .archived_messages
@@ -705,6 +1228,9 @@ fn connect_archive(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                 );
             }
             update_mailbox_spinner(&widgets, &state);
+            if succeeded {
+                refresh_favorite_counts_for_account(&widgets, &state, &email);
+            }
         });
     });
 }
@@ -767,40 +1293,116 @@ fn connect_message_actions(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             };
             let action = action.to_owned();
             let action_for_request = action.clone();
+            let message_id = message.id.clone();
+            let thread_id = message.thread_id.clone();
+            let message_ids = conversation
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            let starred = !message.label_ids.iter().any(|label| label == "STARRED");
+            let label = state.borrow().current_label.clone();
+            let query = widgets.search.text().to_string();
+            cancel_active_refresh(&widgets, &state);
             let widgets_async = widgets.clone();
             let state_async = state.clone();
             glib::MainContext::default().spawn_local(async move {
-                let email_for_reload = email.clone();
+                let request_email = email.clone();
+                let request_ids = message_ids.clone();
+                let request_id = message_id.clone();
                 let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
-                    let mut client = GmailClient::for_account(AccountStore::open()?, &email)?;
+                    let mut client =
+                        MailClient::for_account(AccountStore::open()?, &request_email)?;
                     match action_for_request.as_str() {
-                        "star" => client.set_starred(
-                            &message.id,
-                            !message.label_ids.iter().any(|l| l == "STARRED"),
-                        ),
+                        "star" => client.set_starred(&request_id, starred)?,
                         "trash" => {
-                            for item in &conversation {
-                                client.trash(&item.id)?;
+                            for id in &request_ids {
+                                client.trash(id)?;
                             }
-                            Ok(())
                         }
                         "unread" => {
-                            for item in &conversation {
-                                client.set_unread(&item.id, true)?;
+                            for id in &request_ids {
+                                client.set_unread(id, true)?;
                             }
-                            Ok(())
                         }
-                        _ => Ok(()),
+                        _ => {}
                     }
+                    let cache_result =
+                        MailCache::open().and_then(|mut cache| match action_for_request.as_str() {
+                            "star" => {
+                                cache.set_label(&request_email, &[request_id], "STARRED", starred)
+                            }
+                            "trash" => {
+                                cache.remove_messages_everywhere(&request_email, &request_ids)
+                            }
+                            "unread" => {
+                                cache.set_label(&request_email, &request_ids, "UNREAD", true)
+                            }
+                            _ => Ok(()),
+                        });
+                    if let Err(error) = cache_result {
+                        eprintln!("Could not update the message cache: {error}");
+                    }
+                    Ok(())
                 })
                 .await;
                 match result {
                     Ok(Ok(())) => {
+                        refresh_favorite_counts_for_account(&widgets_async, &state_async, &email);
                         let account_index = widgets_async.account_picker.selected() as usize;
-                        let same_account = state_async.borrow().account_emails.get(account_index)
-                            == Some(&email_for_reload);
-                        if same_account {
-                            load_inbox(&widgets_async, &state_async, email_for_reload, None, true);
+                        let same_account =
+                            state_async.borrow().account_emails.get(account_index) == Some(&email);
+                        let same_view = same_account
+                            && state_async.borrow().current_label == label
+                            && widgets_async.search.text().as_str() == query;
+                        if same_view {
+                            match action.as_str() {
+                                "star" => {
+                                    let ids = HashSet::from([message_id]);
+                                    update_visible_labels(&state_async, &ids, "STARRED", starred);
+                                    let no_longer_starred = label == "STARRED"
+                                        && state_async
+                                            .borrow()
+                                            .conversations
+                                            .iter()
+                                            .find(|conversation| {
+                                                conversation
+                                                    .first()
+                                                    .is_some_and(|item| item.thread_id == thread_id)
+                                            })
+                                            .is_some_and(|conversation| {
+                                                conversation.iter().all(|item| {
+                                                    !item.label_ids.contains(&"STARRED".to_owned())
+                                                })
+                                            });
+                                    if no_longer_starred {
+                                        remove_conversation(
+                                            &widgets_async,
+                                            &state_async,
+                                            &thread_id,
+                                        );
+                                    } else {
+                                        update_conversation_row(
+                                            &widgets_async,
+                                            &state_async,
+                                            &thread_id,
+                                        );
+                                    }
+                                }
+                                "trash" => {
+                                    remove_conversation(&widgets_async, &state_async, &thread_id);
+                                }
+                                "unread" => {
+                                    let ids = message_ids.into_iter().collect::<HashSet<_>>();
+                                    update_visible_labels(&state_async, &ids, "UNREAD", true);
+                                    update_conversation_row(
+                                        &widgets_async,
+                                        &state_async,
+                                        &thread_id,
+                                    );
+                                    clear_reader_view(&widgets_async, &state_async);
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     Ok(Err(error)) => show_error(&widgets_async, error),
@@ -819,7 +1421,7 @@ fn connect_compose(widgets: &Widgets, state: &Rc<RefCell<State>>, button: &gtk::
     button.connect_clicked(move |_| {
         let index = widgets.account_picker.selected() as usize;
         let Some(email) = state.borrow().account_emails.get(index).cloned() else {
-            return show_message(&widgets, "Connect a Google account before composing");
+            return show_message(&widgets, "Connect a mail account before composing");
         };
         present_compose(&widgets, email, None, None, None);
     });
@@ -935,7 +1537,7 @@ fn connect_forward(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                         crate::gmail::decode_attachment_data(data)?
                     } else {
                         if client.is_none() {
-                            client = Some(GmailClient::for_account(
+                            client = Some(MailClient::for_account(
                                 AccountStore::open()?,
                                 &source_email,
                             )?);
@@ -1099,7 +1701,7 @@ fn edit_draft(
     glib::MainContext::default().spawn_local(async move {
         let source_email = email.clone();
         let result = gio::spawn_blocking(move || -> anyhow::Result<_> {
-            let draft = GmailClient::for_account(AccountStore::open()?, &source_email)?
+            let draft = MailClient::for_account(AccountStore::open()?, &source_email)?
                 .draft_for_message(&message_id)?;
             let compose = draft_compose_message(&draft.message)?;
             Ok((draft, compose))
@@ -1383,7 +1985,7 @@ fn present_compose(
                 .as_ref()
                 .map(|draft| (draft.id.clone(), draft.message_id.clone()));
             let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut client = GmailClient::for_account(AccountStore::open()?, &account_email)?;
+                let mut client = MailClient::for_account(AccountStore::open()?, &account_email)?;
                 client.set_cancellation(Some(cancelled));
                 if let Some(target) = target {
                     client.write_existing_draft(&target.0, &target.1, &message, true)?;
@@ -1446,7 +2048,7 @@ fn present_compose(
                 .as_ref()
                 .map(|draft| (draft.id.clone(), draft.message_id.clone()));
             let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut client = GmailClient::for_account(AccountStore::open()?, &account_email)?;
+                let mut client = MailClient::for_account(AccountStore::open()?, &account_email)?;
                 client.set_cancellation(Some(cancelled));
                 if let Some(target) = target {
                     client.write_existing_draft(&target.0, &target.1, &message, false)?;
@@ -1666,43 +2268,58 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         Err(error) => return show_error(widgets, error),
     };
     widgets.accounts.splice(0, widgets.accounts.n_items(), &[]);
-    state.borrow_mut().account_emails.clear();
+    {
+        let mut state = state.borrow_mut();
+        state.account_emails.clear();
+        state.account_names.clear();
+        state.account_labels.clear();
+        state.current_label = "INBOX".to_owned();
+    }
     for account in accounts {
         widgets.accounts.append(&account.display_name);
-        state.borrow_mut().account_emails.push(account.email);
+        let mut state = state.borrow_mut();
+        state.account_names.push(account.display_name);
+        state.account_emails.push(account.email);
+    }
+    {
+        let mut state = state.borrow_mut();
+        let accounts = state.account_emails.iter().cloned().collect::<HashSet<_>>();
+        state
+            .unread_counts
+            .retain(|(email, _), _| accounts.contains(email));
     }
     let has_accounts = !state.borrow().account_emails.is_empty();
     widgets.account_picker.set_sensitive(has_accounts);
     if has_accounts {
         widgets.account_picker.set_selected(0);
         let email = state.borrow().account_emails[0].clone();
-        load_labels(widgets, state, email.clone());
+        widgets.mailbox_title.set_text(&format!("Inbox · {email}"));
         load_inbox(widgets, state, email, None, false);
+        for email in state.borrow().account_emails.clone() {
+            load_labels(widgets, state, email);
+        }
     } else {
-        clear_list(&widgets.labels);
-        state.borrow_mut().labels.clear();
         clear_list(&widgets.messages);
         add_status_row(
             &widgets.messages,
             "No account connected",
-            "Use the + button to add Google credentials and sign in.",
+            "Use the + button to add a Gmail account.",
         );
     }
+    rebuild_sidebar(widgets, state);
+    refresh_favorite_counts(widgets, state);
 }
 
 fn load_labels(widgets: &Widgets, state: &Rc<RefCell<State>>, email: String) {
-    clear_list(&widgets.labels);
-    add_status_row(&widgets.labels, "Loading labels…", "");
     let widgets = widgets.clone();
     let state = state.clone();
     glib::MainContext::default().spawn_local(async move {
         let request_email = email.clone();
         let result = gio::spawn_blocking(move || -> anyhow::Result<Vec<crate::gmail::Label>> {
-            GmailClient::for_account(AccountStore::open()?, &request_email)?.labels()
+            MailClient::for_account(AccountStore::open()?, &request_email)?.labels()
         })
         .await;
-        let index = widgets.account_picker.selected() as usize;
-        if state.borrow().account_emails.get(index) != Some(&email) {
+        if !state.borrow().account_emails.contains(&email) {
             return;
         }
         let mut labels = match result {
@@ -1711,37 +2328,28 @@ fn load_labels(widgets: &Widgets, state: &Rc<RefCell<State>>, email: String) {
                 .filter(|label| label.kind.eq_ignore_ascii_case("user"))
                 .collect::<Vec<_>>(),
             Ok(Err(error)) => {
-                clear_list(&widgets.labels);
-                add_label_row(&widgets.labels, "All Mail");
-                state.borrow_mut().labels = vec![(String::new(), "All Mail".to_owned())];
                 return show_message(&widgets, &format!("Could not load labels: {error}"));
             }
             Err(_) => {
-                clear_list(&widgets.labels);
-                add_label_row(&widgets.labels, "All Mail");
-                state.borrow_mut().labels = vec![(String::new(), "All Mail".to_owned())];
                 return show_message(&widgets, "The label task stopped unexpectedly");
             }
         };
         labels.sort_by_key(|label| label.name.to_lowercase());
-        let mut available = vec![(String::new(), "All Mail".to_owned())];
-        available.extend(labels.into_iter().map(|label| (label.id, label.name)));
-        clear_list(&widgets.labels);
-        for (_, name) in &available {
-            add_label_row(&widgets.labels, name);
+        let has_favorite_custom_label = labels
+            .iter()
+            .any(|label| widgets.preferences.borrow().is_favorite(&email, &label.id));
+        state.borrow_mut().account_labels.insert(
+            email.clone(),
+            labels
+                .into_iter()
+                .map(|label| (label.id, label.name))
+                .collect(),
+        );
+        rebuild_sidebar(&widgets, &state);
+        if has_favorite_custom_label {
+            refresh_favorite_counts_for_account(&widgets, &state, &email);
         }
-        state.borrow_mut().labels = available;
     });
-}
-
-fn add_label_row(list: &gtk::ListBox, name: &str) {
-    let row = adw::ActionRow::builder()
-        .title(name)
-        .use_markup(false)
-        .activatable(true)
-        .build();
-    row.add_prefix(&gtk::Image::from_icon_name("tag-symbolic"));
-    list.append(&row);
 }
 
 fn update_mailbox_spinner(widgets: &Widgets, state: &Rc<RefCell<State>>) {
@@ -1749,17 +2357,11 @@ fn update_mailbox_spinner(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     let active_account = state
         .account_emails
         .get(widgets.account_picker.selected() as usize);
-    let syncing_active_inbox = state.current_label == "INBOX"
-        && widgets.search.text().trim().is_empty()
-        && state
-            .inbox_sync_account
-            .as_ref()
-            .is_some_and(|email| Some(email) == active_account);
     let archiving = state
         .pending_archives
         .iter()
         .any(|(email, _)| Some(email) == active_account);
-    let busy = state.mailbox_loading || syncing_active_inbox || archiving;
+    let busy = state.mailbox_loading || archiving;
     widgets.mailbox_spinner.set_tooltip_text(Some(if archiving {
         "Archiving conversations…"
     } else {
@@ -1769,8 +2371,21 @@ fn update_mailbox_spinner(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     widgets.mailbox_spinner.set_visible(busy);
 }
 
+fn cancel_active_refresh(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    {
+        let mut state = state.borrow_mut();
+        state.load_generation += 1;
+        state.load_cancel.store(true, Ordering::Relaxed);
+        state.mailbox_loading = false;
+        if let Some(cancelled) = &state.inbox_sync_cancel {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+    update_mailbox_spinner(widgets, state);
+}
+
 fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
-    let email = {
+    let (email, cancelled) = {
         let mut state = state.borrow_mut();
         if state.inbox_sync_account.is_some()
             || state.mailbox_loading
@@ -1783,8 +2398,10 @@ fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let Some(email) = state.account_emails.get(index).cloned() else {
             return;
         };
+        let cancelled = Arc::new(AtomicBool::new(false));
         state.inbox_sync_account = Some(email.clone());
-        email
+        state.inbox_sync_cancel = Some(cancelled.clone());
+        (email, cancelled)
     };
     update_mailbox_spinner(widgets, state);
     let widgets = widgets.clone();
@@ -1792,31 +2409,24 @@ fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     glib::MainContext::default().spawn_local(async move {
         let sync_email = email.clone();
         let result = gio::spawn_blocking(move || -> anyhow::Result<Vec<Message>> {
-            let mut client = GmailClient::for_account(AccountStore::open()?, &sync_email)?;
+            let mut client = MailClient::for_account(AccountStore::open()?, &sync_email)?;
+            client.set_cancellation(Some(cancelled.clone()));
             let page = client.list_threads_with_limit(Some("INBOX"), None, None, 50)?;
-            let current_thread_ids = page
-                .threads
-                .iter()
-                .map(|thread| thread.id.clone())
-                .collect::<HashSet<_>>();
-            let recent = page.threads.into_iter().take(10).collect::<Vec<_>>();
-            let refreshed = fetch_threads_parallel(&sync_email, recent, None)?;
-            let refreshed_thread_ids = refreshed
-                .iter()
-                .map(|message| message.thread_id.clone())
-                .collect::<HashSet<_>>();
-            let mut combined = MailCache::open()?.messages(&sync_email, "INBOX")?;
-            combined.retain(|message| {
-                current_thread_ids.contains(&message.thread_id)
-                    && !refreshed_thread_ids.contains(&message.thread_id)
-            });
-            combined.extend(refreshed);
-            combined.sort_by_key(|message| std::cmp::Reverse(message_timestamp(message)));
+            let cached = MailCache::open()?.messages(&sync_email, "INBOX")?;
+            let needed = references_to_refresh(&page.threads, &cached, 3);
+            let refreshed =
+                fetch_threads_parallel(&sync_email, needed.clone(), Some(cancelled.clone()))?;
+            let combined = merge_refreshed_threads(cached, &page.threads, &needed, refreshed);
+            if cancelled.load(Ordering::Relaxed) {
+                anyhow::bail!("Request cancelled");
+            }
+            AccountStore::open()?.account(&sync_email)?;
             MailCache::open()?.replace_mailbox(&sync_email, "INBOX", &combined)?;
             Ok(combined)
         })
         .await;
         state.borrow_mut().inbox_sync_account = None;
+        state.borrow_mut().inbox_sync_cancel = None;
         update_mailbox_spinner(&widgets, &state);
         let index = widgets.account_picker.selected() as usize;
         let inbox_is_visible = state.borrow().current_label == "INBOX"
@@ -1855,6 +2465,48 @@ fn message_snapshot(message: &Message) -> (String, String, String, Vec<String>, 
     )
 }
 
+fn references_to_refresh(
+    references: &[ThreadRef],
+    cached: &[Message],
+    recent_count: usize,
+) -> Vec<ThreadRef> {
+    let cached_threads = cached
+        .iter()
+        .map(|message| message.thread_id.as_str())
+        .collect::<HashSet<_>>();
+    references
+        .iter()
+        .enumerate()
+        .filter(|(index, reference)| {
+            *index < recent_count || !cached_threads.contains(reference.id.as_str())
+        })
+        .map(|(_, reference)| reference.clone())
+        .collect()
+}
+
+fn merge_refreshed_threads(
+    mut cached: Vec<Message>,
+    references: &[ThreadRef],
+    refreshed_references: &[ThreadRef],
+    refreshed: Vec<Message>,
+) -> Vec<Message> {
+    let current_threads = references
+        .iter()
+        .map(|reference| reference.id.as_str())
+        .collect::<HashSet<_>>();
+    let updated_threads = refreshed_references
+        .iter()
+        .map(|reference| reference.id.as_str())
+        .collect::<HashSet<_>>();
+    cached.retain(|message| {
+        current_threads.contains(message.thread_id.as_str())
+            && !updated_threads.contains(message.thread_id.as_str())
+    });
+    cached.extend(refreshed);
+    cached.sort_by_key(|message| std::cmp::Reverse(message_timestamp(message)));
+    cached
+}
+
 fn load_inbox(
     widgets: &Widgets,
     state: &Rc<RefCell<State>>,
@@ -1867,7 +2519,7 @@ fn load_inbox(
     add_status_row(
         &widgets.messages,
         "Loading…",
-        "Fetching messages from Gmail; requests are paced to stay within its limits.",
+        "Fetching messages from Gmail…",
     );
     let widgets = widgets.clone();
     let state = state.clone();
@@ -1887,6 +2539,7 @@ fn load_inbox(
     let cached_mailbox = query.is_none().then(|| label.clone());
     glib::MainContext::default().spawn_local(async move {
         let mut showing_cached_messages = false;
+        let mut cached_messages = Vec::new();
         if let Some(mailbox) = cached_mailbox.clone() {
             let cache_email = email.clone();
             let cached =
@@ -1898,6 +2551,7 @@ fn load_inbox(
             if let Ok(Ok(messages)) = cached
                 && !messages.is_empty()
             {
+                cached_messages = messages.clone();
                 display_messages(&widgets, &state, messages);
                 if select_first {
                     select_first_conversation(&widgets);
@@ -1912,13 +2566,20 @@ fn load_inbox(
         let cache_email = email;
         let mailbox_to_cache = cached_mailbox;
         let result = gio::spawn_blocking(move || -> anyhow::Result<Vec<Message>> {
-            let mut client = GmailClient::for_account(AccountStore::open()?, &online_email)?;
+            let mut client = MailClient::for_account(AccountStore::open()?, &online_email)?;
             client.set_cancellation(Some(cancelled.clone()));
             let label = (!label.is_empty()).then_some(label.as_str());
             let page = client.list_threads(label, query.as_deref(), None)?;
+            let needed = references_to_refresh(&page.threads, &cached_messages, 3);
+            let refreshed =
+                fetch_threads_parallel(&online_email, needed.clone(), Some(cancelled.clone()))?;
             let messages =
-                fetch_threads_parallel(&online_email, page.threads, Some(cancelled.clone()))?;
+                merge_refreshed_threads(cached_messages, &page.threads, &needed, refreshed);
             if let Some(mailbox) = mailbox_to_cache {
+                if cancelled.load(Ordering::Relaxed) {
+                    anyhow::bail!("Request cancelled");
+                }
+                AccountStore::open()?.account(&online_email)?;
                 MailCache::open()?.replace_mailbox(&cache_email, &mailbox, &messages)?;
             }
             Ok(messages)
@@ -1982,6 +2643,7 @@ fn clear_reader_view(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let mut state = state.borrow_mut();
         state.selected = None;
         state.selected_conversation.clear();
+        state.history_expanded = false;
     }
     while let Some(child) = widgets.conversation_body.first_child() {
         widgets.conversation_body.remove(&child);
@@ -2041,6 +2703,84 @@ fn remove_conversation(widgets: &Widgets, state: &Rc<RefCell<State>>, thread_id:
     }
 }
 
+fn set_labels_for_messages(
+    messages: &mut [Message],
+    ids: &HashSet<String>,
+    label: &str,
+    enabled: bool,
+) {
+    for message in messages
+        .iter_mut()
+        .filter(|message| ids.contains(&message.id))
+    {
+        if enabled {
+            if !message.label_ids.iter().any(|existing| existing == label) {
+                message.label_ids.push(label.to_owned());
+            }
+        } else {
+            message.label_ids.retain(|existing| existing != label);
+        }
+    }
+}
+
+fn update_visible_labels(
+    state: &Rc<RefCell<State>>,
+    ids: &HashSet<String>,
+    label: &str,
+    enabled: bool,
+) {
+    let mut state = state.borrow_mut();
+    for conversation in &mut state.conversations {
+        set_labels_for_messages(conversation, ids, label, enabled);
+    }
+    set_labels_for_messages(&mut state.selected_conversation, ids, label, enabled);
+    if let Some(selected) = &mut state.selected {
+        set_labels_for_messages(std::slice::from_mut(selected), ids, label, enabled);
+    }
+}
+
+fn update_conversation_row(widgets: &Widgets, state: &Rc<RefCell<State>>, thread_id: &str) {
+    let state = state.borrow();
+    let Some((index, conversation)) =
+        state
+            .conversations
+            .iter()
+            .enumerate()
+            .find(|(_, messages)| {
+                messages
+                    .first()
+                    .is_some_and(|message| message.thread_id == thread_id)
+            })
+    else {
+        return;
+    };
+    let Some(message) = conversation.first() else {
+        return;
+    };
+    let Some(row) = widgets.messages.row_at_index(index as i32) else {
+        return;
+    };
+    let starred = conversation
+        .iter()
+        .any(|message| message.label_ids.contains(&"STARRED".to_owned()));
+    let has_draft = conversation
+        .iter()
+        .any(|message| message.label_ids.contains(&"DRAFT".to_owned()));
+    row.set_child(Some(&conversation_row_content(
+        message,
+        conversation.len(),
+        starred,
+        has_draft,
+    )));
+    row.remove_css_class("accent");
+    if conversation
+        .iter()
+        .any(|message| message.label_ids.contains(&"UNREAD".to_owned()))
+    {
+        row.add_css_class("accent");
+    }
+}
+
 fn fetch_threads_parallel(
     email: &str,
     references: Vec<crate::gmail::ThreadRef>,
@@ -2063,14 +2803,21 @@ fn fetch_threads_parallel(
                 let email = email.to_owned();
                 let cancelled = cancelled.clone();
                 scope.spawn(move || -> anyhow::Result<Vec<_>> {
-                    let mut client = GmailClient::for_account(AccountStore::open()?, &email)?;
+                    let mut client = MailClient::for_account(AccountStore::open()?, &email)?;
                     client.set_cancellation(cancelled);
-                    batch
+                    let references = batch
+                        .iter()
+                        .map(|(_, reference)| reference.clone())
+                        .collect::<Vec<_>>();
+                    let threads = client.threads(&references)?;
+                    if threads.len() != batch.len() {
+                        anyhow::bail!("mail server returned an incomplete thread batch");
+                    }
+                    Ok(batch
                         .into_iter()
-                        .map(|(index, reference)| {
-                            Ok((index, client.thread(&reference.id)?.messages))
-                        })
-                        .collect()
+                        .zip(threads)
+                        .map(|((index, _), thread)| (index, thread.messages))
+                        .collect())
                 })
             })
             .collect::<Vec<_>>();
@@ -2162,11 +2909,31 @@ fn conversation_list_row(
     starred: bool,
     has_draft: bool,
 ) -> gtk::ListBoxRow {
+    gtk::ListBoxRow::builder()
+        .activatable(true)
+        .selectable(true)
+        .child(&conversation_row_content(
+            message, count, starred, has_draft,
+        ))
+        .build()
+}
+
+fn conversation_row_content(
+    message: &Message,
+    count: usize,
+    starred: bool,
+    has_draft: bool,
+) -> gtk::Box {
     let sender = gtk::Label::builder()
-        .label(sender_name(message.header("From")))
+        .label(if count > 1 {
+            format!("{}  {count}", sender_name(message.header("From")))
+        } else {
+            sender_name(message.header("From"))
+        })
         .halign(Align::Start)
         .hexpand(true)
         .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["heading"])
         .build();
     let date = gtk::Label::builder()
         .label(relative_message_date(message))
@@ -2184,11 +2951,7 @@ fn conversation_list_row(
     heading.append(&date);
 
     let subject = gtk::Label::builder()
-        .label(if count > 1 {
-            format!("{} ({count})", message.header("Subject"))
-        } else {
-            message.header("Subject").to_owned()
-        })
+        .label(message.header("Subject"))
         .halign(Align::Start)
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -2201,18 +2964,14 @@ fn conversation_list_row(
         .css_classes(["caption", "dim-label"])
         .build();
     let content = gtk::Box::new(Orientation::Vertical, 2);
-    content.set_margin_top(7);
-    content.set_margin_bottom(7);
-    content.set_margin_start(10);
-    content.set_margin_end(10);
+    content.set_margin_top(4);
+    content.set_margin_bottom(4);
+    content.set_margin_start(6);
+    content.set_margin_end(6);
     content.append(&heading);
     content.append(&subject);
     content.append(&preview);
-    gtk::ListBoxRow::builder()
-        .activatable(true)
-        .selectable(true)
-        .child(&content)
-        .build()
+    content
 }
 
 fn sender_name(from: &str) -> String {
@@ -2247,13 +3006,13 @@ fn relative_message_date(message: &Message) -> String {
     let today = Local::now().date_naive();
     let message_date = date.date_naive();
     if message_date == today {
-        date.format("%-I:%M%P").to_string()
+        format!("Today at {}", date.format("%-I:%M %P"))
     } else if message_date == today - chrono::Duration::days(1) {
-        "Yesterday".to_owned()
+        format!("Yesterday at {}", date.format("%-I:%M %P"))
     } else if date.year() == today.year() {
-        date.format("%-d %b").to_string()
+        date.format("%-d %b at %-I:%M %P").to_string()
     } else {
-        date.format("%-d %b %Y").to_string()
+        date.format("%-d %b %Y at %-I:%M %P").to_string()
     }
 }
 
@@ -2290,18 +3049,6 @@ fn group_conversations(messages: Vec<Message>) -> Vec<Vec<Message>> {
 
 fn message_timestamp(message: &Message) -> i64 {
     message.internal_date.parse().unwrap_or_default()
-}
-
-fn message_recipient_summary(message: &Message, count: usize) -> String {
-    let mut lines = vec![format!(
-        "Latest from: {}  •  {count} message{}",
-        message.header("From"),
-        if count == 1 { "" } else { "s" }
-    )];
-    append_address_line(&mut lines, "To", message.header("To"));
-    append_address_line(&mut lines, "Cc", message.header("Cc"));
-    append_address_line(&mut lines, "Bcc", message.header("Bcc"));
-    lines.join("\n")
 }
 
 fn append_address_line(lines: &mut Vec<String>, label: &str, value: &str) {
@@ -2362,17 +3109,30 @@ fn attachment_summary(attachments: &[&Payload]) -> String {
     }
 }
 
-fn attachment_control(widgets: &Widgets, email: &str, message: &Message) -> Option<gtk::Widget> {
-    let attachments = message.attachments();
-    if attachments.is_empty() {
+fn attachment_control(
+    widgets: &Widgets,
+    email: &str,
+    message: &Message,
+    parts: &[&Payload],
+    icon: &str,
+    title: &str,
+) -> Option<gtk::Widget> {
+    if parts.is_empty() {
         return None;
     }
     let popover = gtk::Popover::new();
     let list = gtk::Box::new(Orientation::Vertical, 4);
-    for part in &attachments {
+    list.append(
+        &gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build(),
+    );
+    for part in parts {
         let button = gtk::Button::new();
         let row = gtk::Box::new(Orientation::Horizontal, 6);
-        row.append(&gtk::Image::from_icon_name("mail-attachment-symbolic"));
+        row.append(&gtk::Image::from_icon_name(icon));
         let label = gtk::Label::builder()
             .label(attachment_filename(part))
             .wrap(true)
@@ -2394,10 +3154,6 @@ fn attachment_control(widgets: &Widgets, email: &str, message: &Message) -> Opti
             }
             save_attachment(&widgets, &email, &message_id, &part, button);
         });
-        if attachments.len() == 1 {
-            button.set_valign(Align::Center);
-            return Some(button.upcast());
-        }
         list.append(&button);
     }
     let scroll = gtk::ScrolledWindow::builder()
@@ -2407,26 +3163,16 @@ fn attachment_control(widgets: &Widgets, email: &str, message: &Message) -> Opti
         .child(&list)
         .build();
     popover.set_child(Some(&scroll));
-    let summary = attachment_summary(&attachments);
-    let label = gtk::Label::builder()
-        .label(&summary)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .max_width_chars(36)
-        .xalign(0.0)
-        .build();
-    let tooltip = attachments
-        .iter()
-        .map(|part| attachment_filename(part))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let image = gtk::Image::from_icon_name(icon);
+    image.set_pixel_size(16);
     Some(
         gtk::MenuButton::builder()
-            .child(&label)
-            .always_show_arrow(true)
-            .tooltip_text(format!("Save an attachment\n{tooltip}"))
+            .child(&image)
+            .always_show_arrow(false)
+            .tooltip_text(format!("{title}: {}", attachment_summary(parts)))
             .popover(&popover)
             .valign(Align::Center)
+            .css_classes(["flat", "postbird-part-trigger"])
             .build()
             .upcast(),
     )
@@ -2447,7 +3193,7 @@ fn save_attachment(
     button.set_sensitive(false);
     glib::MainContext::default().spawn_local(async move {
         let picker = gtk::FileDialog::builder()
-            .title("Save attachment")
+            .title("Save file")
             .initial_name(attachment_filename(&part))
             .build();
         let file = match picker.save_future(Some(&widgets.window)).await {
@@ -2465,7 +3211,7 @@ fn save_attachment(
             let bytes = if let Some(data) = &part.body.data {
                 crate::gmail::decode_attachment_data(data)?
             } else {
-                GmailClient::for_account(AccountStore::open()?, &email)?
+                MailClient::for_account(AccountStore::open()?, &email)?
                     .attachment(&message_id, &part.body)?
             };
             file.replace_contents(
@@ -2495,30 +3241,106 @@ fn display_conversation(
     conversation: &[Message],
     load_remote_images: bool,
 ) {
-    let scroll = &widgets.conversation_scroll;
     let container = &widgets.conversation_body;
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
-    for (index, message) in conversation.iter().enumerate() {
+    let show_history = state.borrow().history_expanded;
+    let visible = visible_conversation_indices(conversation.len(), show_history);
+    for (index, message) in conversation.iter().rev().enumerate() {
+        if index == 1 && conversation.len() > 4 {
+            let hidden = conversation.len() - 3;
+            let history_label = if show_history {
+                format!("Hide {hidden} messages in between")
+            } else {
+                format!("Show {hidden} messages in between")
+            };
+            let history_button = gtk::Button::with_label(&history_label);
+            history_button.add_css_class("flat");
+            history_button.add_css_class("postbird-history-toggle");
+            let widgets_for_history = widgets.clone();
+            let state_for_history = state.clone();
+            history_button.connect_clicked(move |_| {
+                state_for_history.borrow_mut().history_expanded = !show_history;
+                let load_images = widgets_for_history.preferences.borrow().load_remote_images;
+                let messages = state_for_history.borrow().selected_conversation.clone();
+                if !messages.is_empty() {
+                    display_conversation(
+                        &widgets_for_history,
+                        &state_for_history,
+                        &messages,
+                        load_images,
+                    );
+                }
+            });
+            container.append(&history_button);
+        }
+        if !visible.contains(&index) {
+            continue;
+        }
+        let is_latest = index + 1 == conversation.len();
         let heading = gtk::Label::builder()
-            .label(format!(
-                "{}\n{}",
-                message.header("From"),
-                message.header("Date")
-            ))
+            .label(sender_name(message.header("From")))
             .halign(Align::Start)
             .xalign(0.0)
-            .wrap(true)
-            .css_classes(["caption"])
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["heading"])
+            .build();
+        let date = gtk::Label::builder()
+            .label(relative_message_date(message))
+            .halign(Align::End)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let heading_line = gtk::Box::new(Orientation::Horizontal, 6);
+        heading_line.append(&heading);
+        let account_email = {
+            state
+                .borrow()
+                .account_emails
+                .get(widgets.account_picker.selected() as usize)
+                .cloned()
+        };
+        if let Some(email) = account_email.as_deref() {
+            let (attachments, inline_images) = message.attachment_groups();
+            if let Some(control) = attachment_control(
+                widgets,
+                email,
+                message,
+                &inline_images,
+                "image-x-generic-symbolic",
+                "Embedded images",
+            ) {
+                heading_line.append(&control);
+            }
+            if let Some(control) = attachment_control(
+                widgets,
+                email,
+                message,
+                &attachments,
+                "mail-attachment-symbolic",
+                "Attachments",
+            ) {
+                heading_line.append(&control);
+            }
+        }
+        heading_line.append(&date);
+        let preview = gtk::Label::builder()
+            .label(message_preview(&message.snippet))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label"])
             .build();
         let heading_row = gtk::Box::new(Orientation::Horizontal, 12);
         let header_details = gtk::Box::new(Orientation::Vertical, 6);
         header_details.set_hexpand(true);
         header_details.set_valign(Align::Center);
-        header_details.append(&heading);
-        if let Some(recipients) = recipient_details(message) {
-            header_details.append(&recipients);
+        header_details.append(&heading_line);
+        header_details.append(&preview);
+        let recipients = recipient_details(message);
+        if let Some(recipients) = &recipients {
+            recipients.set_visible(is_latest);
+            header_details.append(recipients);
         }
         heading_row.append(&header_details);
         if message.label_ids.iter().any(|label| label == "DRAFT") {
@@ -2531,14 +3353,6 @@ fn display_conversation(
             edit.connect_clicked(move |button| edit_draft(&widgets, &state, &message, button));
             heading_row.append(&edit);
         }
-        if let Some(email) = state
-            .borrow()
-            .account_emails
-            .get(widgets.account_picker.selected() as usize)
-            && let Some(control) = attachment_control(widgets, email, message)
-        {
-            heading_row.append(&control);
-        }
         let body = gtk::Box::new(Orientation::Vertical, 6);
         body.set_hexpand(true);
         let expanded_content = gtk::Box::new(Orientation::Vertical, 6);
@@ -2546,62 +3360,35 @@ fn display_conversation(
         let expander = gtk::Expander::builder()
             .label_widget(&heading_row)
             .child(&expanded_content)
-            .expanded(index == 0)
+            .expanded(is_latest)
             .build();
-        let scroll_for_expander = scroll.clone();
-        let container_for_expander = container.clone();
-        connect_message_body(&expander, &body, message.clone(), load_remote_images);
-        expander.connect_expanded_notify(move |_| {
-            size_conversation_sections(&scroll_for_expander, &container_for_expander);
+        let preview_for_expander = preview.clone();
+        let recipients_for_expander = recipients.clone();
+        expander.connect_expanded_notify(move |expander| {
+            preview_for_expander.set_visible(!expander.is_expanded());
+            if let Some(recipients) = &recipients_for_expander {
+                recipients.set_visible(expander.is_expanded());
+            }
         });
+        preview.set_visible(!is_latest);
+        connect_message_body(
+            &expander,
+            &body,
+            &widgets.conversation_scroll,
+            message.clone(),
+            load_remote_images,
+        );
         expander.add_css_class("card");
         expander.add_css_class("message-section");
         container.append(&expander);
     }
-    size_conversation_sections(scroll, container);
 }
 
-fn size_conversation_sections(scroll: &gtk::ScrolledWindow, container: &gtk::Box) {
-    let mut expanders = Vec::new();
-    let mut child = container.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        if let Ok(expander) = widget.downcast::<gtk::Expander>() {
-            expanders.push(expander);
-        }
-    }
-    let expanded = expanders
-        .iter()
-        .filter(|expander| expander.is_expanded())
-        .count() as i32;
-    if expanded == 0 || scroll.height() <= 0 {
-        return;
-    }
-    let headers_and_spacing = expanders
-        .iter()
-        .map(|expander| {
-            expander.label_widget().map_or(0, |header| {
-                header
-                    .measure(Orientation::Vertical, (scroll.width() - 60).max(1))
-                    .1
-            }) + 24
-                + container.spacing()
-        })
-        .sum::<i32>();
-    let height = ((scroll.height() - headers_and_spacing) / expanded).max(320);
-    for expander in expanders {
-        if expander.is_expanded()
-            && let Some(view) = expander
-                .child()
-                .and_then(|child| child.downcast::<gtk::Box>().ok())
-                .and_then(|content| content.last_child())
-                .and_then(|child| child.downcast::<gtk::Box>().ok())
-        {
-            let body_height = height.max(256);
-            if view.height_request() != body_height {
-                view.set_height_request(body_height);
-            }
-        }
+fn visible_conversation_indices(count: usize, show_history: bool) -> Vec<usize> {
+    if show_history || count <= 4 {
+        (0..count).collect()
+    } else {
+        vec![0, count - 2, count - 1]
     }
 }
 
@@ -2610,16 +3397,18 @@ fn size_conversation_sections(scroll: &gtk::ScrolledWindow, container: &gtk::Box
 fn connect_message_body(
     expander: &gtk::Expander,
     body: &gtk::Box,
+    outer_scroll: &gtk::ScrolledWindow,
     message: Message,
     load_remote_images: bool,
 ) {
     let body = body.downgrade();
+    let outer_scroll = outer_scroll.clone();
     let populate = move |expander: &gtk::Expander| {
         if expander.is_expanded()
             && let Some(body) = body.upgrade()
             && body.first_child().is_none()
         {
-            populate_message_body(&body, &message, load_remote_images);
+            populate_message_body(&body, &outer_scroll, &message, load_remote_images);
         }
     };
     populate(expander);
@@ -2649,28 +3438,45 @@ fn append_text_body(body: &gtk::Box, text: &str) {
         .margin_start(12)
         .margin_end(12)
         .build();
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&label)
-        .build();
-    body.append(&scroll);
+    body.append(&label);
 }
 
-fn populate_message_body(body: &gtk::Box, message: &Message, load_remote_images: bool) {
+fn populate_message_body(
+    body: &gtk::Box,
+    outer_scroll: &gtk::ScrolledWindow,
+    message: &Message,
+    load_remote_images: bool,
+) {
     if !needs_html_renderer(message) {
         append_text_body(body, &message.body_text());
         return;
     }
     let view = new_message_webview(load_remote_images);
-    view.set_vexpand(true);
+    view.set_height_request(80);
+    let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let adjustment = outer_scroll.vadjustment();
+    wheel.connect_scroll(move |controller, _, delta_y| {
+        let maximum = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        let distance = match controller.unit() {
+            gtk::gdk::ScrollUnit::Wheel => delta_y * 72.0,
+            _ => delta_y,
+        };
+        adjustment.set_value((adjustment.value() + distance).clamp(adjustment.lower(), maximum));
+        glib::Propagation::Stop
+    });
+    view.add_controller(wheel);
     let weak_body = body.downgrade();
     let text = message.body_text();
+    let text_for_fit = text.clone();
+    let text_for_tick = text.clone();
     view.connect_web_process_terminated(move |view, reason| {
         // This handles an established renderer failing. WebKit's fatal launch
         // handshake abort happens in the parent and cannot be caught here.
         eprintln!("message renderer terminated: {reason:?}; showing plain text");
-        if let Some(body) = weak_body.upgrade() {
+        if let Some(body) = weak_body.upgrade()
+            && view.parent().is_some()
+        {
             body.remove(view);
             body.append(&gtk::Label::new(Some(
                 "Message display stopped. Showing plain text.",
@@ -2678,13 +3484,86 @@ fn populate_message_body(body: &gtk::Box, message: &Message, load_remote_images:
             append_text_body(&body, &text);
         }
     });
+    let fitting = Rc::new(std::cell::Cell::new(false));
+    let weak_body = body.downgrade();
+    let fitting_after_load = fitting.clone();
+    view.connect_load_changed(move |view, event| {
+        if event == webkit6::LoadEvent::Finished
+            && let Some(body) = weak_body.upgrade()
+        {
+            fit_webview_to_content(view, &body, &text_for_fit, &fitting_after_load);
+        }
+    });
+    let weak_body = body.downgrade();
+    let weak_view = view.downgrade();
+    let last_width = Rc::new(std::cell::Cell::new(0));
+    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+        let Some(view) = weak_view.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if view.parent().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        let width = view.width();
+        if width > 0
+            && width != last_width.get()
+            && !view.is_loading()
+            && let Some(body) = weak_body.upgrade()
+        {
+            last_width.set(width);
+            fit_webview_to_content(&view, &body, &text_for_tick, &fitting);
+        }
+        glib::ControlFlow::Continue
+    });
     body.append(&view);
     view.load_html(&message.rendered_body(), None);
 }
 
+fn fit_webview_to_content(
+    view: &webkit6::WebView,
+    body: &gtk::Box,
+    text: &str,
+    fitting: &Rc<std::cell::Cell<bool>>,
+) {
+    if fitting.replace(true) {
+        return;
+    }
+    let weak_view = view.downgrade();
+    let body = body.downgrade();
+    let text = text.to_owned();
+    let fitting = fitting.clone();
+    // Email script markup is disabled; this app-owned script only measures layout.
+    view.evaluate_javascript(
+        "Math.ceil(document.body ? Math.max(document.body.scrollHeight, document.body.offsetHeight) + 16 : document.documentElement.scrollHeight)",
+        Some("postbird-sizing"),
+        None,
+        None::<&gio::Cancellable>,
+        move |result| {
+            fitting.set(false);
+            let (Some(view), Some(body)) = (weak_view.upgrade(), body.upgrade()) else {
+                return;
+            };
+            if view.parent().is_none() {
+                return;
+            }
+            match result {
+                Ok(height) if height.is_number() && height.to_double().is_finite()
+                    && (20.0..=40_000.0).contains(&height.to_double()) => {
+                    view.set_height_request((height.to_double().ceil() as i32).max(80));
+                }
+                _ => {
+                    body.remove(&view);
+                    body.append(&gtk::Label::new(Some("Showing plain text for this message.")));
+                    append_text_body(&body, &text);
+                }
+            }
+        },
+    );
+}
+
 fn new_message_webview(load_remote_images: bool) -> webkit6::WebView {
     let settings = webkit6::Settings::new();
-    settings.set_enable_javascript(false);
+    settings.set_enable_javascript(true);
     settings.set_enable_javascript_markup(false);
     settings.set_enable_html5_database(false);
     settings.set_enable_html5_local_storage(false);
@@ -2694,6 +3573,7 @@ fn new_message_webview(load_remote_images: bool) -> webkit6::WebView {
         .network_session(&webkit6::NetworkSession::new_ephemeral())
         .hexpand(true)
         .build();
+    view.set_background_color(&gtk::gdk::RGBA::WHITE);
     view.connect_decide_policy(|_, decision, decision_type| {
         if !matches!(
             decision_type,
@@ -2744,10 +3624,6 @@ fn show_error(widgets: &Widgets, error: impl std::fmt::Display) {
     if error.to_string() == "Request cancelled" {
         return;
     }
-    if error.to_string() == crate::gmail::QUOTA_PENDING {
-        show_message(widgets, crate::gmail::QUOTA_PENDING);
-        return;
-    }
     let dialog = adw::AlertDialog::builder()
         .heading("Postbird could not complete that action")
         .body(error.to_string())
@@ -2789,6 +3665,96 @@ fn entry(placeholder: &str) -> gtk::Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_lookup_releases_state_before_selection_callback() {
+        let state = Rc::new(RefCell::new(State {
+            account_emails: vec![
+                "first@example.com".to_owned(),
+                "second@example.com".to_owned(),
+                "third@example.com".to_owned(),
+            ],
+            ..State::default()
+        }));
+
+        assert_eq!(account_index(&state, "third@example.com"), Some(2));
+        assert!(state.try_borrow_mut().is_ok());
+    }
+
+    #[test]
+    fn long_conversations_keep_the_first_and_last_two_messages_visible() {
+        assert_eq!(visible_conversation_indices(16, false), vec![0, 14, 15]);
+        assert_eq!(visible_conversation_indices(4, false), vec![0, 1, 2, 3]);
+        assert_eq!(visible_conversation_indices(5, true), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn account_tree_keeps_custom_folders_with_their_own_account() {
+        let mut state = State::default();
+        state.account_labels.insert(
+            "one@example.com".to_owned(),
+            vec![("Projects".to_owned(), "Projects".to_owned())],
+        );
+        let first = sidebar_folders(&state, "one@example.com");
+        let second = sidebar_folders(&state, "two@example.com");
+        assert!(first.iter().any(|(id, _, _)| id == "Projects"));
+        assert!(!second.iter().any(|(id, _, _)| id == "Projects"));
+        assert!(
+            first
+                .iter()
+                .any(|(id, title, _)| id.is_empty() && title == "All Mail")
+        );
+        assert!(second.iter().any(|(id, _, _)| id == "INBOX"));
+    }
+
+    #[test]
+    fn incremental_refresh_fetches_recent_and_missing_threads_only() {
+        let references = ["recent", "cached", "new"]
+            .into_iter()
+            .map(|id| ThreadRef { id: id.into() })
+            .collect::<Vec<_>>();
+        let cached = vec![
+            message("old-recent", "recent", 10),
+            message("old-cached", "cached", 9),
+            message("removed", "gone", 8),
+        ];
+        let needed = references_to_refresh(&references, &cached, 1);
+        assert_eq!(
+            needed
+                .iter()
+                .map(|reference| reference.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recent", "new"]
+        );
+        let merged = merge_refreshed_threads(
+            cached,
+            &references,
+            &needed,
+            vec![
+                message("fresh-recent", "recent", 11),
+                message("fresh-new", "new", 12),
+            ],
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh-new", "fresh-recent", "old-cached"]
+        );
+    }
+
+    #[test]
+    fn local_label_changes_are_idempotent_and_scoped_to_selected_messages() {
+        let mut messages = vec![message("one", "thread", 1), message("two", "thread", 2)];
+        let ids = HashSet::from(["one".to_owned()]);
+        set_labels_for_messages(&mut messages, &ids, "STARRED", true);
+        set_labels_for_messages(&mut messages, &ids, "STARRED", true);
+        assert_eq!(messages[0].label_ids, vec!["STARRED"]);
+        assert!(messages[1].label_ids.is_empty());
+        set_labels_for_messages(&mut messages, &ids, "STARRED", false);
+        assert!(messages[0].label_ids.is_empty());
+    }
 
     #[test]
     fn optimistic_archives_hide_stale_results_but_not_new_mail_or_other_accounts() {
@@ -2887,16 +3853,15 @@ mod tests {
         .unwrap();
         let body = gtk::Box::new(Orientation::Vertical, 6);
         let expander = gtk::Expander::builder().child(&body).build();
-        connect_message_body(&expander, &body, message.clone(), false);
+        let outer_scroll = gtk::ScrolledWindow::new();
+        connect_message_body(&expander, &body, &outer_scroll, message.clone(), false);
         assert!(
             body.first_child().is_none(),
             "collapsed messages stay unloaded"
         );
         expander.set_expanded(true);
         let first = body.first_child().unwrap();
-        let scroll = first.clone().downcast::<gtk::ScrolledWindow>().unwrap();
-        let viewport = scroll.child().unwrap().downcast::<gtk::Viewport>().unwrap();
-        let label = viewport.child().unwrap().downcast::<gtk::Label>().unwrap();
+        let label = first.clone().downcast::<gtk::Label>().unwrap();
         assert!(
             label.text().contains("Hello"),
             "plain-text message retains its text"
@@ -2923,7 +3888,7 @@ mod tests {
         message.payload.body.data = Some("PGI-SGVsbG88L2I-".to_owned());
         let body = gtk::Box::new(Orientation::Vertical, 6);
         let expander = gtk::Expander::builder().child(&body).build();
-        connect_message_body(&expander, &body, message, false);
+        connect_message_body(&expander, &body, &outer_scroll, message, false);
         assert!(body.first_child().is_none());
         expander.set_expanded(true);
         let view = body
@@ -2936,7 +3901,7 @@ mod tests {
             &[&webkit6::WebProcessTerminationReason::Crashed],
         );
         assert!(view.parent().is_none());
-        assert!(body.last_child().unwrap().is::<gtk::ScrolledWindow>());
+        assert!(body.last_child().unwrap().is::<gtk::Label>());
     }
     use serde_json::json;
 
@@ -3084,7 +4049,7 @@ mod tests {
             "two",
             (Local::now() - chrono::Duration::days(1)).timestamp_millis(),
         );
-        assert_eq!(relative_message_date(&yesterday), "Yesterday");
+        assert!(relative_message_date(&yesterday).starts_with("Yesterday at "));
     }
 
     #[test]

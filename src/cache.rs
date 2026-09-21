@@ -109,14 +109,66 @@ impl MailCache {
     }
 
     pub fn mark_read(&mut self, account: &str, message_ids: &[String]) -> Result<()> {
+        self.set_label(account, message_ids, "UNREAD", false)
+    }
+
+    pub fn set_label(
+        &mut self,
+        account: &str,
+        message_ids: &[String],
+        label: &str,
+        enabled: bool,
+    ) -> Result<()> {
         let ids = message_ids.iter().collect::<HashSet<_>>();
-        let mut messages = self.messages(account, "INBOX")?;
-        for message in &mut messages {
-            if ids.contains(&message.id) {
-                message.label_ids.retain(|label| label != "UNREAD");
+        let transaction = self.connection.transaction()?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT mailbox, id, message_json FROM mailbox_messages WHERE account = ?1",
+            )?;
+            statement
+                .query_map([account], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        {
+            let mut update = transaction.prepare(
+                "UPDATE mailbox_messages SET message_json = ?4 WHERE account = ?1 AND mailbox = ?2 AND id = ?3",
+            )?;
+            let mut delete = transaction.prepare(
+                "DELETE FROM mailbox_messages WHERE account = ?1 AND mailbox = ?2 AND id = ?3",
+            )?;
+            for (mailbox, id, value) in rows {
+                if !ids.contains(&id) {
+                    continue;
+                }
+                if mailbox == "STARRED" && label == "STARRED" && !enabled {
+                    delete.execute(params![account, mailbox, id])?;
+                    continue;
+                }
+                let mut message: Message =
+                    serde_json::from_str(&value).context("cached message is invalid")?;
+                if enabled {
+                    if !message.label_ids.iter().any(|existing| existing == label) {
+                        message.label_ids.push(label.to_owned());
+                    }
+                } else {
+                    message.label_ids.retain(|existing| existing != label);
+                }
+                update.execute(params![
+                    account,
+                    mailbox,
+                    id,
+                    serde_json::to_string(&message)?
+                ])?;
             }
         }
-        self.replace_mailbox(account, "INBOX", &messages)
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn remove_messages(&mut self, account: &str, message_ids: &[String]) -> Result<()> {
@@ -127,6 +179,29 @@ impl MailCache {
             .filter(|message| !ids.contains(&message.id))
             .collect::<Vec<_>>();
         self.replace_mailbox(account, "INBOX", &messages)
+    }
+
+    pub fn remove_messages_everywhere(
+        &mut self,
+        account: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut delete = transaction
+                .prepare("DELETE FROM mailbox_messages WHERE account = ?1 AND id = ?2")?;
+            for id in message_ids {
+                delete.execute(params![account, id])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_account(&mut self, account: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM mailbox_messages WHERE account = ?1", [account])?;
+        Ok(())
     }
 }
 
@@ -172,6 +247,10 @@ mod tests {
             cache.messages("person@example.com", "INBOX").unwrap()[0].label_ids,
             vec!["INBOX"]
         );
+        assert_eq!(
+            cache.messages("person@example.com", "SENT").unwrap()[0].label_ids,
+            vec!["INBOX"]
+        );
         cache
             .remove_messages("person@example.com", &["one".to_owned()])
             .unwrap();
@@ -185,6 +264,91 @@ mod tests {
             cache.messages("person@example.com", "SENT").unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn removing_account_clears_all_its_mailboxes_only() {
+        let mut cache = MailCache::at(Path::new(":memory:")).unwrap();
+        let message = test_message();
+        for account in ["deleted@example.com", "kept@example.com"] {
+            for mailbox in ["INBOX", "SENT"] {
+                cache
+                    .replace_mailbox(account, mailbox, std::slice::from_ref(&message))
+                    .unwrap();
+            }
+        }
+
+        cache.remove_account("deleted@example.com").unwrap();
+
+        for mailbox in ["INBOX", "SENT"] {
+            assert!(
+                cache
+                    .messages("deleted@example.com", mailbox)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                cache.messages("kept@example.com", mailbox).unwrap().len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn local_actions_update_each_cached_copy_without_touching_other_accounts() {
+        let mut cache = MailCache::at(Path::new(":memory:")).unwrap();
+        let message = test_message();
+        for account in ["acted@example.com", "kept@example.com"] {
+            for mailbox in ["INBOX", "STARRED"] {
+                cache
+                    .replace_mailbox(account, mailbox, std::slice::from_ref(&message))
+                    .unwrap();
+            }
+        }
+        cache
+            .set_label("acted@example.com", &["one".into()], "STARRED", true)
+            .unwrap();
+        for mailbox in ["INBOX", "STARRED"] {
+            assert!(
+                cache.messages("acted@example.com", mailbox).unwrap()[0]
+                    .label_ids
+                    .contains(&"STARRED".to_owned())
+            );
+            assert!(
+                !cache.messages("kept@example.com", mailbox).unwrap()[0]
+                    .label_ids
+                    .contains(&"STARRED".to_owned())
+            );
+        }
+        cache
+            .set_label("acted@example.com", &["one".into()], "STARRED", false)
+            .unwrap();
+        assert!(
+            !cache.messages("acted@example.com", "INBOX").unwrap()[0]
+                .label_ids
+                .contains(&"STARRED".to_owned())
+        );
+        assert!(
+            cache
+                .messages("acted@example.com", "STARRED")
+                .unwrap()
+                .is_empty()
+        );
+        cache
+            .remove_messages_everywhere("acted@example.com", &["one".into()])
+            .unwrap();
+        for mailbox in ["INBOX", "STARRED"] {
+            assert!(
+                cache
+                    .messages("acted@example.com", mailbox)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                cache.messages("kept@example.com", mailbox).unwrap().len(),
+                1
+            );
+        }
     }
 
     #[test]

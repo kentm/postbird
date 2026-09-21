@@ -1,7 +1,8 @@
 # Rust build output
 /target/
+__pycache__/
 
-# OAuth credentials and local secrets
+# Local secrets (including credentials from older versions)
 .env
 .env.*
 !.env.example

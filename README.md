@@ -1,47 +1,68 @@
 # Postbird
 
 Postbird is a native Linux Gmail client built with Rust, GTK 4, and libadwaita.
-It talks directly to Google's Gmail API; there is no Postbird server and Gmail
-data remains on your computer apart from API requests to Google.
-
-> **OAuth approval status:** Postbird is currently awaiting Google OAuth
-> verification. Until approval is complete, Google may display an
-> "unverified app" warning during sign-in and access may be limited to Google
-> accounts registered as test users in the app's Cloud project. Do not proceed
-> past the warning unless you trust the Postbird build and the OAuth client
-> credentials being used. This notice will be updated when verification is
-> complete.
+It talks directly to Gmail via IMAP/SMTP with an app password or GNOME Online
+Accounts. There is no Postbird server or Postbird OAuth client; mail data remains
+on your computer apart from requests to Google.
 
 ## Features
 
 - Multiple Google accounts with instant account switching
-- Browser-based OAuth using Google's loopback flow and PKCE
-- Refresh tokens stored in the Linux keyring
+- Gmail app-password access over TLS-protected IMAP/SMTP
+- GNOME Online Accounts sign-in over Gmail IMAP/SMTP and XOAUTH2
+- App passwords stored in the Linux keyring; GOA tokens are never stored by Postbird
 - Inbox, Starred, Sent, Drafts, and Trash views
-- Gmail search, pagination, and offline inbox cache
+- Gmail search and offline mailbox cache
 - Read, archive, star, mark unread, and trash messages
 - Compose, reply, save drafts, and send messages
 
-## Google setup
+## Gmail app-password setup
 
-Google requires credentials from a Google Cloud project:
+Enable 2-Step Verification in your Google Account, then create an app password.
+Launch Postbird, press **+**, choose **Gmail app password**, and enter the full
+mail address and generated password. Postbird checks both IMAP and SMTP before
+saving the account. Do not enter your normal Google Account password.
 
-1. Open the [Google Cloud Console](https://console.cloud.google.com/).
-2. Create or select a project and enable the **Gmail API**.
-3. Configure the OAuth consent screen. During development, add each Gmail
-   address you plan to use as a test user.
-4. Create an OAuth client with application type **Desktop app**.
-5. Download its JSON credentials file.
-6. Launch Postbird, press the **+** button, and choose the downloaded JSON file.
+App-password accounts use `imap.gmail.com:993` for mail and `smtp.gmail.com:465`
+for sending, both with TLS. Postbird uses Gmail's IMAP extensions for thread IDs,
+labels, and search. The IMAP/SMTP transport uses Python 3's standard library,
+so Python 3 must be installed at runtime. Some managed Workspace, Advanced
+Protection, and security-key-only accounts cannot create app passwords.
 
-Postbird copies the credentials to its user configuration directory. Each
-account signs in through the system browser. The browser returns authorization
-to a temporary listener bound only to `127.0.0.1`.
+## GNOME Online Accounts setup (experimental)
 
-The app requests `gmail.modify`, which Google classifies as a restricted scope.
-Personal/test use works with consent-screen test users. Postbird's public OAuth
-verification is pending, so the warning and test-user restrictions described
-above currently apply.
+Add a Google account in GNOME Online Accounts and enable Mail for it. In
+Postbird, press **+**, choose **GNOME Online Accounts**, select the account,
+and connect. Postbird checks IMAP and SMTP before adding it. GOA retains the
+sign-in credentials; Postbird stores only the selected GOA account ID and asks
+GOA for a short-lived access token when it connects. Removing it from Postbird
+does not remove it from GNOME Online Accounts.
+
+This path requires `gnome-online-accounts` and Python's `gi` bindings for GOA
+at runtime. It is a technical integration test, not an established exemption
+from Google's restricted-scope verification or CASA requirements. GNOME asks
+third-party apps to coordinate with its maintainers before shipping use of
+its account profiles.
+
+## Check an app password without adding an account
+
+You can separately test whether your Gmail account accepts an app password.
+This standalone probe does not add an account
+to Postbird, save the password, or send mail. It logs in to Gmail IMAP, opens
+the Inbox read-only, and logs in to Gmail SMTP.
+
+Enable Google 2-Step Verification, create an app password in your Google Account,
+then run:
+
+```sh
+python3 scripts/gmail_app_password_probe.py
+```
+
+Enter your full email address and the generated app password when prompted.
+Some managed Workspace and Advanced Protection accounts cannot use app passwords.
+Do not enter your normal Google Account password. The probe uses Python's standard
+library and stores no credentials; the secret remains in process memory only
+until the probe exits.
 
 ## Build and run
 
@@ -51,6 +72,9 @@ On Arch Linux:
 sudo pacman -S --needed rust gtk4 libadwaita webkitgtk-6.0
 cargo run
 ```
+
+For the optional GOA connection, also install `gnome-online-accounts` and
+`python-gobject`.
 
 Validate the project:
 
@@ -70,8 +94,14 @@ the desktop application menu.
 
 ## Local data
 
-- Account list and imported OAuth client: `~/.config/postbird/`
+- Account list and UI preferences: `~/.config/postbird/`
 - Offline message cache: `~/.local/share/postbird/mail.db`
-- Google tokens: Linux keyring, service `io.github.postbird.Mail`
+- App passwords: Linux keyring, service `io.github.postbird.Mail`
 
-Postbird never stores Google refresh tokens in plaintext files.
+Removing an account in Postbird also clears that account's cached mail. It does
+not remove other accounts or delete mail from Gmail. Older Postbird OAuth
+accounts are skipped when loading accounts; re-add them through GOA or an app
+password. Postbird does not automatically delete old OAuth client files or
+keyring entries during this upgrade.
+
+Postbird never stores app passwords in plaintext files.

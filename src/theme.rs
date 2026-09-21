@@ -24,8 +24,8 @@ pub fn install_omarchy_integration() {
     };
     let layout = gtk::CssProvider::new();
     layout.load_from_string(
-        "expander-widget.message-section > box > title { padding: 12px 16px; }
-         expander-widget.message-section > box > title > expander { margin-right: 12px; }",
+        "expander-widget.message-section > box > title { padding: 6px 8px; }
+         expander-widget.message-section > box > title > expander { margin-right: 6px; }",
     );
     gtk::style_context_add_provider_for_display(
         &display,
