@@ -49,26 +49,6 @@ from Google's restricted-scope verification or CASA requirements. GNOME asks
 third-party apps to coordinate with its maintainers before shipping use of
 its account profiles.
 
-## Check an app password without adding an account
-
-You can separately test whether your Gmail account accepts an app password.
-This standalone probe does not add an account
-to Postbird, save the password, or send mail. It logs in to Gmail IMAP, opens
-the Inbox read-only, and logs in to Gmail SMTP.
-
-Enable Google 2-Step Verification, create an app password in your Google Account,
-then run:
-
-```sh
-python3 scripts/gmail_app_password_probe.py
-```
-
-Enter your full email address and the generated app password when prompted.
-Some managed Workspace and Advanced Protection accounts cannot use app passwords.
-Do not enter your normal Google Account password. The probe uses Python's standard
-library and stores no credentials; the secret remains in process memory only
-until the probe exits.
-
 ## Build and run
 
 On Arch Linux:
@@ -86,6 +66,7 @@ Validate the project:
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 ## Install for the current user
