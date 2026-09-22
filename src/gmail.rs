@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use anyhow::{Context, Result};
 use base64::{
@@ -227,6 +227,25 @@ impl Message {
         (files, inline_images)
     }
 
+    pub fn inline_image_parts(&self) -> Vec<(&Payload, &str)> {
+        self.attachment_groups()
+            .1
+            .into_iter()
+            .filter_map(|part| {
+                let id = part
+                    .headers
+                    .iter()
+                    .find(|header| header.name.eq_ignore_ascii_case("Content-ID"))?
+                    .value
+                    .trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .trim();
+                (!id.is_empty()).then_some((part, id))
+            })
+            .collect()
+    }
+
     pub fn header(&self, name: &str) -> &str {
         self.payload
             .headers
@@ -249,9 +268,16 @@ impl Message {
         find_body(&self.payload, "text/html")
     }
 
-    pub fn rendered_body(&self) -> String {
+    pub fn rendered_body_with_images(
+        &self,
+        inline_images: &HashMap<String, String>,
+        load_remote_images: bool,
+    ) -> String {
         if let Some(html) = self.body_html() {
-            return render_html_document(html);
+            return render_html_document(
+                replace_cid_urls(&html, inline_images),
+                load_remote_images,
+            );
         }
         format!(
             r#"<!doctype html><html><head><meta charset="utf-8">{RENDERER_STYLE}</head><body><pre class="plain">{}</pre></body></html>"#,
@@ -262,27 +288,91 @@ impl Message {
 
 const RENDERER_STYLE: &str = r#"<style id="postbird-renderer">
 html, body { overflow-wrap: anywhere; }
-img { max-width: 100%; height: auto; }
+/* Mail often fixes both dimensions; override the height when narrowing an image. */
+img { max-width: min(100%, 100vw) !important; min-width: 0 !important; height: auto !important; }
 pre.plain { white-space: pre-wrap; font: 15px system-ui, sans-serif; margin: 0; padding: 1rem; }
 blockquote { margin-inline: .5rem 0; padding-inline-start: 1rem; border-inline-start: 3px solid #8888; }
 </style>"#;
 
-fn render_html_document(mut html: String) -> String {
+fn render_html_document(mut html: String, load_remote_images: bool) -> String {
+    let image_sources = if load_remote_images {
+        "data: http: https:"
+    } else {
+        "data:"
+    };
+    // Local CID images become data URLs. Keep all other network resources blocked
+    // unless the user explicitly enables remote images.
+    let head = format!(
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src {image_sources}; style-src 'unsafe-inline'; font-src data:; base-uri 'none'; form-action 'none'\">{RENDERER_STYLE}"
+    );
     let lower = html.to_ascii_lowercase();
     let is_document = lower.contains("<!doctype") || lower.contains("<html");
     if !is_document {
         return format!(
-            "<!doctype html><html><head><meta charset=\"utf-8\">{RENDERER_STYLE}</head><body>{html}</body></html>"
+            "<!doctype html><html><head><meta charset=\"utf-8\">{head}</head><body>{html}</body></html>"
         );
     }
-    if let Some(position) = lower.find("</head>") {
-        html.insert_str(position, RENDERER_STYLE);
+    if let Some(position) = lower
+        .find("<head")
+        .and_then(|start| lower[start..].find('>').map(|end| start + end + 1))
+    {
+        html.insert_str(position, &head);
+    } else if let Some(position) = lower
+        .find("<html")
+        .and_then(|start| lower[start..].find('>').map(|end| start + end + 1))
+    {
+        html.insert_str(position, &format!("<head>{head}</head>"));
     } else if let Some(position) = lower.find("<body") {
-        html.insert_str(position, RENDERER_STYLE);
+        html.insert_str(position, &format!("<head>{head}</head>"));
     } else {
-        html.insert_str(0, RENDERER_STYLE);
+        html.insert_str(0, &format!("<head>{head}</head>"));
     }
     html
+}
+
+fn replace_cid_urls(html: &str, images: &HashMap<String, String>) -> String {
+    if images.is_empty() {
+        return html.to_owned();
+    }
+    let lower = html.to_ascii_lowercase();
+    let mut rendered = String::with_capacity(html.len());
+    let mut cursor = 0;
+    while let Some(offset) = lower[cursor..].find("cid:") {
+        let start = cursor + offset;
+        rendered.push_str(&html[cursor..start]);
+        let id_start = start + 4;
+        let id_end = html[id_start..]
+            .find(|character: char| {
+                matches!(
+                    character,
+                    '"' | '\'' | '<' | '>' | ')' | ' ' | '\n' | '\r' | '\t'
+                )
+            })
+            .map_or(html.len(), |end| id_start + end);
+        let original = &html[start..id_end];
+        let id = percent_decode(&html[id_start..id_end])
+            .unwrap_or_else(|| html[id_start..id_end].to_owned())
+            .to_ascii_lowercase();
+        rendered.push_str(images.get(&id).map_or(original, String::as_str));
+        cursor = id_end;
+    }
+    rendered.push_str(&html[cursor..]);
+    rendered
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut remaining = value.as_bytes().iter().copied();
+    while let Some(byte) = remaining.next() {
+        if byte == b'%' {
+            let high = (remaining.next()? as char).to_digit(16)?;
+            let low = (remaining.next()? as char).to_digit(16)?;
+            bytes.push(((high << 4) | low) as u8);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn escape_html(value: &str) -> String {
@@ -534,7 +624,10 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(html.rendered_body().contains("<b>Hi</b>"));
+        assert!(
+            html.rendered_body_with_images(&HashMap::new(), false)
+                .contains("<b>Hi</b>")
+        );
 
         let plain: Message = serde_json::from_value(json!({
             "id": "2", "threadId": "t", "payload": {
@@ -542,18 +635,62 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(plain.rendered_body().contains("&lt;script&gt;"));
+        assert!(
+            plain
+                .rendered_body_with_images(&HashMap::new(), false)
+                .contains("&lt;script&gt;")
+        );
+    }
+
+    #[test]
+    fn resolves_local_cid_images_without_enabling_remote_images() {
+        let html = r#"<img src="CID:Logo%40example.com"><img src='https://tracker.example/pixel'>"#;
+        let message: Message = serde_json::from_value(json!({
+            "id": "1", "threadId": "t", "payload": {
+                "mimeType": "multipart/related", "parts": [
+                    {"mimeType": "text/html", "body": {"data": URL_SAFE_NO_PAD.encode(html)}},
+                    {"mimeType": "image/png", "headers": [{"name": "Content-ID", "value": "<Logo@example.com>"}],
+                     "body": {"attachmentId": "1"}}
+                ]
+            }
+        }))
+        .unwrap();
+        assert_eq!(message.inline_image_parts().len(), 1);
+        let images = HashMap::from([(
+            "logo@example.com".to_owned(),
+            "data:image/png;base64,AQID".to_owned(),
+        )]);
+        let rendered = message.rendered_body_with_images(&images, false);
+        assert!(rendered.contains("src=\"data:image/png;base64,AQID\""));
+        assert!(rendered.contains("img-src data:;"));
+        assert!(rendered.contains("src='https://tracker.example/pixel'"));
+        assert!(!rendered.contains("img-src data: http: https:"));
+        let remote_enabled = message.rendered_body_with_images(&images, true);
+        assert!(remote_enabled.contains("img-src data: http: https:"));
     }
 
     #[test]
     fn preserves_complete_html_documents() {
         let rendered = render_html_document(
             "<!DOCTYPE html><html><head><style>.email{color:red}</style></head><body class=email>Hi</body></html>".to_owned(),
+            false,
         );
         assert_eq!(rendered.matches("<!DOCTYPE").count(), 1);
         assert_eq!(rendered.matches("<html").count(), 1);
         assert!(rendered.contains("postbird-renderer"));
         assert!(rendered.contains(".email{color:red}"));
+    }
+
+    #[test]
+    fn fixed_size_mail_images_get_aspect_preserving_reader_rules() {
+        let rendered = render_html_document(
+            "<img width='1200' height='900' style='width:1200px;height:900px' src='cid:photo'>"
+                .to_owned(),
+            false,
+        );
+        assert!(rendered.contains("max-width: min(100%, 100vw) !important"));
+        assert!(rendered.contains("height: auto !important"));
+        assert!(rendered.contains("style='width:1200px;height:900px'"));
     }
 
     #[test]

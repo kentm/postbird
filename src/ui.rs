@@ -9,6 +9,7 @@ use std::{
 };
 
 use adw::prelude::*;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Datelike, Local};
 use gtk::{Align, Orientation, gio, glib};
 use lettre::message::{Mailbox, Mailboxes};
@@ -3376,6 +3377,7 @@ fn display_conversation(
             &body,
             &widgets.conversation_scroll,
             message.clone(),
+            account_email.clone(),
             load_remote_images,
         );
         expander.add_css_class("card");
@@ -3399,6 +3401,7 @@ fn connect_message_body(
     body: &gtk::Box,
     outer_scroll: &gtk::ScrolledWindow,
     message: Message,
+    account_email: Option<String>,
     load_remote_images: bool,
 ) {
     let body = body.downgrade();
@@ -3408,7 +3411,13 @@ fn connect_message_body(
             && let Some(body) = body.upgrade()
             && body.first_child().is_none()
         {
-            populate_message_body(&body, &outer_scroll, &message, load_remote_images);
+            populate_message_body(
+                &body,
+                &outer_scroll,
+                &message,
+                account_email.as_deref(),
+                load_remote_images,
+            );
         }
     };
     populate(expander);
@@ -3445,13 +3454,14 @@ fn populate_message_body(
     body: &gtk::Box,
     outer_scroll: &gtk::ScrolledWindow,
     message: &Message,
+    account_email: Option<&str>,
     load_remote_images: bool,
 ) {
     if !needs_html_renderer(message) {
         append_text_body(body, &message.body_text());
         return;
     }
-    let view = new_message_webview(load_remote_images);
+    let view = new_message_webview();
     view.set_height_request(80);
     let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -3516,7 +3526,87 @@ fn populate_message_body(
         glib::ControlFlow::Continue
     });
     body.append(&view);
-    view.load_html(&message.rendered_body(), None);
+    let has_cid = message
+        .body_html()
+        .is_some_and(|html| html.to_ascii_lowercase().contains("cid:"));
+    if !has_cid || message.inline_image_parts().is_empty() || account_email.is_none() {
+        view.load_html(
+            &message.rendered_body_with_images(&HashMap::new(), load_remote_images),
+            None,
+        );
+        return;
+    }
+    let message = message.clone();
+    let email = account_email.unwrap_or_default().to_owned();
+    let weak_view = view.downgrade();
+    glib::MainContext::default().spawn_local(async move {
+        let message_for_fetch = message.clone();
+        let result =
+            gio::spawn_blocking(move || embedded_image_uris(&message_for_fetch, &email)).await;
+        let Some(view) = weak_view.upgrade().filter(|view| view.parent().is_some()) else {
+            return;
+        };
+        let images = match result {
+            Ok(Ok(images)) => images,
+            Ok(Err(error)) => {
+                eprintln!("could not load embedded images: {error:#}");
+                HashMap::new()
+            }
+            Err(_) => {
+                eprintln!("embedded image loading stopped unexpectedly");
+                HashMap::new()
+            }
+        };
+        view.load_html(
+            &message.rendered_body_with_images(&images, load_remote_images),
+            None,
+        );
+    });
+}
+
+fn embedded_image_uris(message: &Message, email: &str) -> anyhow::Result<HashMap<String, String>> {
+    let mut images = HashMap::new();
+    let mut deferred = Vec::new();
+    for (part, content_id) in message.inline_image_parts() {
+        let mime_type = part.mime_type.split(';').next().unwrap_or_default().trim();
+        if !mime_type.starts_with("image/")
+            || !mime_type.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'+' | b'-' | b'.')
+            })
+        {
+            continue;
+        }
+        if let Some(data) = &part.body.data {
+            let bytes = crate::gmail::decode_attachment_data(data)?;
+            images.insert(
+                content_id.to_ascii_lowercase(),
+                format!("data:{mime_type};base64,{}", STANDARD.encode(bytes)),
+            );
+        } else if let Some(path) = &part.body.attachment_id {
+            deferred.push((
+                content_id.to_ascii_lowercase(),
+                mime_type.to_owned(),
+                path.clone(),
+            ));
+        }
+    }
+    if !deferred.is_empty() {
+        let paths = deferred
+            .iter()
+            .map(|(_, _, path)| path.clone())
+            .collect::<Vec<_>>();
+        let fetched = MailClient::for_account(AccountStore::open()?, email)?
+            .inline_images(&message.id, &paths)?;
+        for (id, mime_type, path) in deferred {
+            if let Some(bytes) = fetched.get(&path) {
+                images.insert(
+                    id,
+                    format!("data:{mime_type};base64,{}", STANDARD.encode(bytes)),
+                );
+            }
+        }
+    }
+    Ok(images)
 }
 
 fn fit_webview_to_content(
@@ -3561,13 +3651,15 @@ fn fit_webview_to_content(
     );
 }
 
-fn new_message_webview(load_remote_images: bool) -> webkit6::WebView {
+fn new_message_webview() -> webkit6::WebView {
     let settings = webkit6::Settings::new();
     settings.set_enable_javascript(true);
     settings.set_enable_javascript_markup(false);
     settings.set_enable_html5_database(false);
     settings.set_enable_html5_local_storage(false);
-    settings.set_auto_load_images(load_remote_images);
+    // The document CSP controls remote image requests. WebKit's global switch
+    // would also block the local data URLs used for embedded CID images.
+    settings.set_auto_load_images(true);
     let view = webkit6::WebView::builder()
         .settings(&settings)
         .network_session(&webkit6::NetworkSession::new_ephemeral())
@@ -3854,7 +3946,14 @@ mod tests {
         let body = gtk::Box::new(Orientation::Vertical, 6);
         let expander = gtk::Expander::builder().child(&body).build();
         let outer_scroll = gtk::ScrolledWindow::new();
-        connect_message_body(&expander, &body, &outer_scroll, message.clone(), false);
+        connect_message_body(
+            &expander,
+            &body,
+            &outer_scroll,
+            message.clone(),
+            None,
+            false,
+        );
         assert!(
             body.first_child().is_none(),
             "collapsed messages stay unloaded"
@@ -3888,7 +3987,7 @@ mod tests {
         message.payload.body.data = Some("PGI-SGVsbG88L2I-".to_owned());
         let body = gtk::Box::new(Orientation::Vertical, 6);
         let expander = gtk::Expander::builder().child(&body).build();
-        connect_message_body(&expander, &body, &outer_scroll, message, false);
+        connect_message_body(&expander, &body, &outer_scroll, message, None, false);
         assert!(body.first_child().is_none());
         expander.set_expanded(true);
         let view = body
@@ -3902,6 +4001,30 @@ mod tests {
         );
         assert!(view.parent().is_none());
         assert!(body.last_child().unwrap().is::<gtk::Label>());
+    }
+
+    #[test]
+    fn embedded_image_bytes_are_usable_without_remote_loading_or_an_account() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "id": "synthetic", "threadId": "thread", "payload": {
+                "mimeType": "multipart/related", "parts": [
+                    {"mimeType": "text/html", "body": {"data": "PGltZyBzcmM9J2NpZDpsb2dvJz4"}},
+                    {"mimeType": "image/png", "headers": [{"name": "Content-ID", "value": "<logo>"}],
+                     "body": {"data": "AQID"}}
+                ]
+            }
+        }))
+        .unwrap();
+        let images = embedded_image_uris(&message, "unused@example.com").unwrap();
+        assert_eq!(
+            images.get("logo").map(String::as_str),
+            Some("data:image/png;base64,AQID")
+        );
+        assert!(
+            message
+                .rendered_body_with_images(&images, false)
+                .contains("src='data:image/png;base64,AQID'")
+        );
     }
     use serde_json::json;
 

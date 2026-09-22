@@ -419,6 +419,26 @@ def attachment(connection, request):
     return encoded(part.get_payload(decode=True) or (part.as_bytes() if part.is_multipart() else b""))
 
 
+def inline_images(connection, request):
+    paths = request["attachment_ids"]
+    if not paths:
+        return {}
+    uid = locate(connection, request["id"])
+    rows = fetch_rows(connection, [uid], "(BODY.PEEK[])")
+    if not rows:
+        raise RuntimeError("Message is no longer available")
+    message = email.message_from_bytes(rows[0][1], policy=email.policy.default)
+    result = {}
+    for path in paths:
+        part = message
+        for index in path.split("."):
+            part = list(part.iter_parts())[int(index)]
+        if part.get_content_maintype() != "image" or not part.get("Content-ID"):
+            raise RuntimeError("An embedded image changed; refresh the message")
+        result[path] = encoded(part.get_payload(decode=True) or b"")
+    return result
+
+
 def send(request):
     raw = raw_message(request)
     parsed = email.message_from_bytes(raw, policy=email.policy.SMTP)
@@ -502,6 +522,8 @@ def dispatch(request):
             return [thread(connection, {"id": thread_id}) for thread_id in request["ids"]]
         if operation == "attachment":
             return attachment(connection, request)
+        if operation == "inline_images":
+            return inline_images(connection, request)
         if operation == "draft_for_message":
             select(connection, mailbox_name(connection, "DRAFT"))
             found = ids(connection, "X-GM-MSGID", request["id"])

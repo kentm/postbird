@@ -129,6 +129,24 @@ class GmailImapBackendTests(unittest.TestCase):
         self.assertTrue(backend.is_attachment(part))
         self.assertEqual(backend.payload(part)["body"]["attachmentId"], "")
 
+    @patch("gmail_imap_backend.locate", return_value=b"7")
+    @patch("gmail_imap_backend.fetch_rows")
+    def test_embedded_images_are_fetched_together_for_one_message(self, fetch_rows, locate):
+        raw = (
+            b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=part\r\n\r\n"
+            b"--part\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:logo\">\r\n"
+            b"--part\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\n"
+            b"Content-Transfer-Encoding: base64\r\n\r\nAQID\r\n--part--\r\n"
+        )
+        fetch_rows.return_value = [(b"metadata", raw)]
+        connection = MagicMock()
+        self.assertEqual(
+            backend.inline_images(connection, {"id": "123", "attachment_ids": ["1"]}),
+            {"1": backend.encoded(b"\x01\x02\x03")},
+        )
+        locate.assert_called_once_with(connection, "123")
+        fetch_rows.assert_called_once_with(connection, [b"7"], "(BODY.PEEK[])")
+
     def test_lists_threads_without_fetching_message_bodies(self):
         connection = MagicMock()
         connection.list.return_value = ("OK", [b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"'])

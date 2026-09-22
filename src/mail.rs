@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::Write,
     process::{Command, Stdio},
     sync::{
@@ -212,6 +213,21 @@ impl ImapClient {
             )?
         };
         Ok(crate::gmail::decode_attachment_data(&data)?)
+    }
+
+    pub fn inline_images(
+        &mut self,
+        message_id: &str,
+        attachment_ids: &[String],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        let encoded: HashMap<String, String> = self.call(
+            "inline_images",
+            json!({"id": message_id, "attachment_ids": attachment_ids}),
+        )?;
+        encoded
+            .into_iter()
+            .map(|(id, data)| Ok((id, crate::gmail::decode_attachment_data(&data)?)))
+            .collect()
     }
 
     pub fn archive_thread(&mut self, id: &str) -> Result<()> {
