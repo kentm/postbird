@@ -38,6 +38,10 @@ sign-in credentials; Postbird stores only the selected GOA account ID and asks
 GOA for a short-lived access token when it connects. Removing it from Postbird
 does not remove it from GNOME Online Accounts.
 
+If GOA is unavailable or no Google account has Mail enabled, Postbird explains
+what to set up and offers to open Online Accounts (when its settings app is
+installed), retry, or use a Gmail app password instead.
+
 This path requires `gnome-online-accounts` and Python's `gi` bindings for GOA
 at runtime. It is a technical integration test, not an established exemption
 from Google's restricted-scope verification or CASA requirements. GNOME asks

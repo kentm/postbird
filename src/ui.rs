@@ -1,6 +1,8 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    ffi::OsStr,
+    path::PathBuf,
     rc::Rc,
     sync::{
         Arc,
@@ -152,11 +154,7 @@ pub fn build(app: &adw::Application) {
     let message_title = detail_label("Select a message", "postbird-message-title");
     let message_sender = detail_label("", "dim-label");
     let conversation_body = gtk::Box::new(Orientation::Vertical, 4);
-    let conversation_scroll = gtk::ScrolledWindow::builder()
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&conversation_body)
-        .build();
+    let conversation_scroll = new_conversation_scroll(&conversation_body);
     let message_content = gtk::Box::new(Orientation::Vertical, 4);
     message_content.set_visible(false);
     message_content.set_margin_top(9);
@@ -278,6 +276,21 @@ pub fn build(app: &adw::Application) {
     load_accounts(&widgets, &state);
     connect_background_sync(&widgets, &state);
     window.present();
+}
+
+fn new_conversation_scroll(body: &gtk::Box) -> gtk::ScrolledWindow {
+    // A WebView takes focus on the first text selection. GTK's default
+    // viewport then scrolls to the entire (potentially very tall) WebView,
+    // moving the conversation underneath the drag gesture.
+    let viewport = gtk::Viewport::builder()
+        .scroll_to_focus(false)
+        .child(body)
+        .build();
+    gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&viewport)
+        .build()
 }
 
 fn install_visual_style() {
@@ -989,17 +1002,24 @@ async fn add_app_password_account(widgets: &Widgets, state: &Rc<RefCell<State>>)
 }
 
 async fn add_goa_account(widgets: &Widgets, state: &Rc<RefCell<State>>) {
-    let result = gio::spawn_blocking(ImapClient::goa_accounts).await;
-    let accounts = match result {
-        Ok(Ok(accounts)) if !accounts.is_empty() => accounts,
-        Ok(Ok(_)) => {
-            return show_message(
-                widgets,
-                "No Google Mail account is available in GNOME Online Accounts",
-            );
+    let accounts = loop {
+        let result = gio::spawn_blocking(ImapClient::goa_accounts).await;
+        let issue = match result {
+            Ok(Ok(accounts)) if !accounts.is_empty() => break accounts,
+            Ok(Ok(_)) => GoaSetupIssue::NoMailAccount,
+            Ok(Err(error)) => GoaSetupIssue::from_backend_error(&error.to_string()),
+            Err(_) => {
+                GoaSetupIssue::Unavailable("The Online Accounts check stopped unexpectedly".into())
+            }
+        };
+        match goa_setup_dialog(widgets, &issue).await.as_str() {
+            "retry" => continue,
+            "app-password" => {
+                add_app_password_account(widgets, state).await;
+                return;
+            }
+            _ => return,
         }
-        Ok(Err(error)) => return show_error(widgets, error),
-        Err(_) => return show_message(widgets, "The Online Accounts check stopped unexpectedly"),
     };
     let names = gtk::StringList::new(&[]);
     for account in &accounts {
@@ -1043,6 +1063,86 @@ async fn add_goa_account(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         Ok(Err(error)) => show_error(widgets, error),
         Err(_) => show_message(widgets, "The Online Accounts check stopped unexpectedly"),
     }
+}
+
+enum GoaSetupIssue {
+    MissingBindings,
+    NoMailAccount,
+    Unavailable(String),
+}
+
+impl GoaSetupIssue {
+    fn from_backend_error(error: &str) -> Self {
+        if error.contains("bindings are unavailable") {
+            Self::MissingBindings
+        } else {
+            Self::Unavailable(error.to_owned())
+        }
+    }
+
+    fn guidance(&self) -> (&'static str, String) {
+        match self {
+            Self::MissingBindings => (
+                "GNOME Online Accounts is not ready",
+                "Postbird needs GNOME Online Accounts and Python's GObject bindings. Install them with your distribution's package manager (on Arch: gnome-online-accounts and python-gobject). Then add a Google account in Online Accounts and enable Mail. You can use a Gmail app password instead.".into(),
+            ),
+            Self::NoMailAccount => (
+                "No Google Mail account found",
+                "Open Online Accounts, add your Google account, and enable Mail for it. If the account is already there, check that Mail is switched on. Then return to Postbird and try again. You can also use a Gmail app password.".into(),
+            ),
+            Self::Unavailable(error) => (
+                "Could not connect to Online Accounts",
+                format!("Check that Online Accounts opens and your Google account has Mail enabled, then retry. You can also use a Gmail app password.\n\nDetails: {error}"),
+            ),
+        }
+    }
+}
+
+fn online_accounts_settings_command() -> Option<(PathBuf, &'static [&'static str])> {
+    if let Some(path) = glib::find_program_in_path("gnome-online-accounts-gtk") {
+        return Some((path, &[]));
+    }
+    glib::find_program_in_path("gnome-control-center")
+        .map(|path| (path, &["online-accounts"] as &'static [&'static str]))
+}
+
+fn open_online_accounts_settings(path: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
+    let mut command = vec![path.as_os_str()];
+    command.extend(args.iter().map(OsStr::new));
+    gio::Subprocess::newv(&command, gio::SubprocessFlags::NONE)?;
+    Ok(())
+}
+
+async fn goa_setup_dialog(widgets: &Widgets, issue: &GoaSetupIssue) -> String {
+    let (heading, body) = issue.guidance();
+    let settings = online_accounts_settings_command();
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(body)
+        .close_response("close")
+        .default_response("close")
+        .build();
+    dialog.add_responses(&[
+        ("close", "Close"),
+        ("app-password", "Use app password"),
+        ("retry", "Retry"),
+    ]);
+    if settings.is_some() {
+        dialog.add_response("open-settings", "Open Online Accounts");
+    }
+    let response = dialog.choose_future(Some(&widgets.window)).await;
+    if response == "open-settings"
+        && let Some((path, args)) = settings
+    {
+        match open_online_accounts_settings(&path, args) {
+            Ok(()) => show_message(
+                widgets,
+                "Enable Mail in Online Accounts, then choose GOA in Postbird again",
+            ),
+            Err(error) => show_error(widgets, format!("Could not open Online Accounts: {error}")),
+        }
+    }
+    response.to_string()
 }
 
 fn account_index(state: &Rc<RefCell<State>>, email: &str) -> Option<u32> {
@@ -3757,6 +3857,38 @@ fn entry(placeholder: &str) -> gtk::Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a graphical session; tests the conversation viewport configuration"]
+    fn conversation_viewport_does_not_jump_to_a_focused_webview() {
+        gtk::init().expect("GTK display connection");
+        let body = gtk::Box::new(Orientation::Vertical, 4);
+        let scroll = new_conversation_scroll(&body);
+        let viewport = scroll.child().unwrap().downcast::<gtk::Viewport>().unwrap();
+        assert_eq!(viewport.child(), Some(body.upcast()));
+        assert!(!viewport.is_scroll_to_focus());
+    }
+
+    #[test]
+    fn goa_setup_failures_offer_actionable_paths() {
+        let missing = GoaSetupIssue::from_backend_error(
+            "GNOME Online Accounts Python bindings are unavailable",
+        );
+        let (heading, guidance) = missing.guidance();
+        assert!(heading.contains("not ready"));
+        assert!(guidance.contains("python-gobject"));
+        assert!(guidance.contains("enable Mail"));
+        assert!(guidance.contains("app password"));
+
+        let (_, guidance) = GoaSetupIssue::NoMailAccount.guidance();
+        assert!(guidance.contains("Open Online Accounts"));
+        assert!(guidance.contains("Mail"));
+
+        let (_, guidance) =
+            GoaSetupIssue::from_backend_error("Could not connect to GNOME Online Accounts")
+                .guidance();
+        assert!(guidance.contains("Details: Could not connect"));
+    }
 
     #[test]
     fn account_lookup_releases_state_before_selection_callback() {
