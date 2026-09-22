@@ -11,6 +11,7 @@ pub struct UiPreferences {
     pub message_split: i32,
     pub load_remote_images: bool,
     pub favorite_folders: Vec<FavoriteFolder>,
+    pub favorite_order: Vec<FavoriteFolder>,
     pub unfavorite_inboxes: Vec<String>,
     pub favorite_names: Vec<FavoriteName>,
 }
@@ -35,6 +36,7 @@ impl Default for UiPreferences {
             message_split: 390,
             load_remote_images: false,
             favorite_folders: Vec::new(),
+            favorite_order: Vec::new(),
             unfavorite_inboxes: Vec::new(),
             favorite_names: Vec::new(),
         }
@@ -80,6 +82,9 @@ impl UiPreferences {
         if label_id == "INBOX" {
             if self.is_favorite(account_email, label_id) {
                 self.unfavorite_inboxes.push(account_email.to_owned());
+                self.favorite_order.retain(|folder| {
+                    folder.account_email != account_email || folder.label_id != label_id
+                });
             } else {
                 self.unfavorite_inboxes
                     .retain(|email| email != account_email);
@@ -90,12 +95,60 @@ impl UiPreferences {
             self.favorite_folders.retain(|folder| {
                 folder.account_email != account_email || folder.label_id != label_id
             });
+            self.favorite_order.retain(|folder| {
+                folder.account_email != account_email || folder.label_id != label_id
+            });
         } else {
             self.favorite_folders.push(FavoriteFolder {
                 account_email: account_email.to_owned(),
                 label_id: label_id.to_owned(),
             });
         }
+    }
+
+    pub fn ordered_favorites(&self, available: &[FavoriteFolder]) -> Vec<FavoriteFolder> {
+        let mut ordered = Vec::with_capacity(available.len());
+        for folder in self.favorite_order.iter().chain(available) {
+            if available.contains(folder) && !ordered.contains(folder) {
+                ordered.push(folder.clone());
+            }
+        }
+        ordered
+    }
+
+    pub fn move_favorite(
+        &mut self,
+        available: &[FavoriteFolder],
+        source: &FavoriteFolder,
+        target: &FavoriteFolder,
+        after: bool,
+    ) -> bool {
+        if source == target || !available.contains(source) || !available.contains(target) {
+            return false;
+        }
+        let mut ordered = self.ordered_favorites(available);
+        let previous = ordered.clone();
+        let source_index = ordered.iter().position(|folder| folder == source).unwrap();
+        let moved = ordered.remove(source_index);
+        let target_index = ordered.iter().position(|folder| folder == target).unwrap();
+        ordered.insert(target_index + usize::from(after), moved);
+        if ordered == previous {
+            return false;
+        }
+        let mut reordered = ordered.into_iter();
+        let mut saved_order = Vec::new();
+        for folder in &self.favorite_order {
+            if available.contains(folder) {
+                if let Some(next) = reordered.next() {
+                    saved_order.push(next);
+                }
+            } else {
+                saved_order.push(folder.clone());
+            }
+        }
+        saved_order.extend(reordered);
+        self.favorite_order = saved_order;
+        true
     }
 
     pub fn favorite_name(&self, account_email: &str, label_id: &str) -> Option<&str> {
@@ -121,6 +174,8 @@ impl UiPreferences {
     pub fn remove_account(&mut self, account_email: &str) {
         self.favorite_folders
             .retain(|folder| folder.account_email != account_email);
+        self.favorite_order
+            .retain(|folder| folder.account_email != account_email);
         self.unfavorite_inboxes
             .retain(|email| email != account_email);
         self.favorite_names
@@ -139,6 +194,7 @@ mod tests {
         assert_eq!(preferences.message_split, 390);
         assert!(!preferences.load_remote_images);
         assert!(preferences.is_favorite("reader@example.com", "INBOX"));
+        assert!(preferences.favorite_order.is_empty());
     }
 
     #[test]
@@ -167,5 +223,89 @@ mod tests {
         assert!(loaded.is_favorite("one@example.com", "INBOX"));
         assert!(!loaded.is_favorite("one@example.com", "Projects"));
         assert_eq!(loaded.favorite_name("one@example.com", "Projects"), None);
+    }
+
+    #[test]
+    fn favorite_order_moves_across_accounts_and_survives_reload() {
+        let first = FavoriteFolder {
+            account_email: "one@example.com".into(),
+            label_id: "INBOX".into(),
+        };
+        let second = FavoriteFolder {
+            account_email: "two@example.com".into(),
+            label_id: "INBOX".into(),
+        };
+        let custom = FavoriteFolder {
+            account_email: "one@example.com".into(),
+            label_id: "Projects".into(),
+        };
+        let available = vec![first.clone(), second.clone(), custom.clone()];
+        let mut preferences = UiPreferences::default();
+        preferences.toggle_favorite("one@example.com", "Projects");
+        assert_eq!(preferences.ordered_favorites(&available), available);
+        assert!(preferences.move_favorite(&available, &custom, &first, false));
+        assert_eq!(
+            preferences.ordered_favorites(&available),
+            [custom.clone(), first.clone(), second.clone()]
+        );
+        assert!(!preferences.move_favorite(&available, &custom, &first, false));
+        let reloaded: UiPreferences =
+            serde_json::from_str(&serde_json::to_string(&preferences).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.ordered_favorites(&available),
+            [custom.clone(), first.clone(), second.clone()]
+        );
+        let new_inbox = FavoriteFolder {
+            account_email: "three@example.com".into(),
+            label_id: "INBOX".into(),
+        };
+        assert_eq!(
+            reloaded.ordered_favorites(&[available, vec![new_inbox.clone()]].concat()),
+            [custom, first, second, new_inbox]
+        );
+    }
+
+    #[test]
+    fn removing_favorite_removes_its_saved_position() {
+        let first = FavoriteFolder {
+            account_email: "one@example.com".into(),
+            label_id: "INBOX".into(),
+        };
+        let second = FavoriteFolder {
+            account_email: "two@example.com".into(),
+            label_id: "INBOX".into(),
+        };
+        let mut preferences = UiPreferences::default();
+        let available = [first.clone(), second.clone()];
+        assert!(preferences.move_favorite(&available, &second, &first, false));
+        preferences.toggle_favorite("two@example.com", "INBOX");
+        assert_eq!(preferences.favorite_order, std::slice::from_ref(&first));
+        preferences.toggle_favorite("two@example.com", "INBOX");
+        assert_eq!(preferences.ordered_favorites(&available), [first, second]);
+    }
+
+    #[test]
+    fn dragging_before_a_custom_folder_loads_keeps_its_saved_place() {
+        let inbox = FavoriteFolder {
+            account_email: "one@example.com".into(),
+            label_id: "INBOX".into(),
+        };
+        let other = FavoriteFolder {
+            account_email: "two@example.com".into(),
+            label_id: "INBOX".into(),
+        };
+        let delayed = FavoriteFolder {
+            account_email: "one@example.com".into(),
+            label_id: "Projects".into(),
+        };
+        let mut preferences = UiPreferences {
+            favorite_order: vec![inbox.clone(), delayed.clone(), other.clone()],
+            ..UiPreferences::default()
+        };
+        assert!(preferences.move_favorite(&[inbox.clone(), other.clone()], &other, &inbox, false,));
+        assert_eq!(
+            preferences.ordered_favorites(&[inbox.clone(), other.clone(), delayed.clone()]),
+            [other, delayed, inbox]
+        );
     }
 }

@@ -40,6 +40,12 @@ pub struct GoaAccount {
 }
 
 #[derive(Deserialize)]
+pub struct BatchUpdateResult {
+    pub updated: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct HelperResponse {
     ok: bool,
     result: Option<Value>,
@@ -236,6 +242,10 @@ impl ImapClient {
 
     pub fn set_unread(&mut self, id: &str, value: bool) -> Result<()> {
         self.call("set_unread", json!({"id": id, "value": value}))
+    }
+
+    pub fn set_unread_many(&mut self, ids: &[String], value: bool) -> Result<BatchUpdateResult> {
+        self.call("set_unread_many", json!({"ids": ids, "value": value}))
     }
 
     pub fn set_starred(&mut self, id: &str, value: bool) -> Result<()> {

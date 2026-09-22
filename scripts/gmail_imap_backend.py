@@ -331,13 +331,24 @@ def list_threads(connection, request):
     limit = max(1, min(int(request.get("limit", 50)), 100))
     threads = []
     seen = set()
-    # FETCH by message sequence number so large folders never produce an
-    # unbounded SEARCH ALL response. Walk backward until enough unique threads
-    # are found; one conversation can contain many messages.
-    for end in range(count, 0, -500):
-        start = max(1, end - 499)
-        sequence_set = f"{start}:{end}"
-        if query:
+    if query == "is:unread":
+        # Use the same IMAP Seen flag as STATUS UNSEEN (the sidebar badge).
+        # This also finds old unread mail without scanning every recent batch.
+        matches = require_ok(connection.search(None, "UNSEEN"), "SEARCH")
+        unread_sequences = matches[0].split() if matches and matches[0] else []
+        sequence_sets = (
+            b",".join(unread_sequences[max(0, end - 500):end]).decode("ascii")
+            for end in range(len(unread_sequences), 0, -500)
+        )
+    else:
+        sequence_sets = (
+            f"{max(1, end - 499)}:{end}"
+            for end in range(count, 0, -500)
+        )
+    # FETCH by message sequence number, walking backward until enough unique
+    # threads are found. Normal folder loads avoid an unbounded SEARCH ALL.
+    for sequence_set in sequence_sets:
+        if query and query != "is:unread":
             matches = require_ok(
                 connection.search(None, sequence_set, "X-GM-RAW", quoted(query)),
                 "SEARCH",
@@ -358,16 +369,26 @@ def list_threads(connection, request):
     return {"threads": threads}
 
 
-def thread(connection, request):
-    thread_id = request["id"]
-    messages = {}
+def threads(connection, thread_ids):
+    if not thread_ids:
+        return []
+    messages = {thread_id: {} for thread_id in thread_ids}
     for label in ("ALL", "DRAFT", "TRASH"):
         select(connection, mailbox_name(connection, label))
-        found = ids(connection, "X-GM-THRID", thread_id)
-        if found:
-            for message in fetch_messages(connection, found):
-                messages[message["id"]] = message
-    return {"messages": sorted(messages.values(), key=lambda item: int(item["internalDate"]))}
+        found = set()
+        for thread_id in thread_ids:
+            found.update(ids(connection, "X-GM-THRID", thread_id))
+        for message in fetch_messages(connection, sorted(found, key=int)):
+            if message["threadId"] in messages:
+                messages[message["threadId"]][message["id"]] = message
+    return [
+        {"messages": sorted(messages[thread_id].values(), key=lambda item: int(item["internalDate"]))}
+        for thread_id in thread_ids
+    ]
+
+
+def thread(connection, request):
+    return threads(connection, [request["id"]])[0]
 
 
 def list_labels(connection):
@@ -397,6 +418,37 @@ def unread_counts(connection, labels):
             raise RuntimeError("IMAP STATUS did not include an unread count")
         counts.append(int(match.group(1)))
     return counts
+
+
+def set_unread_many(connection, request):
+    remaining = list(dict.fromkeys(request["ids"]))
+    updated = []
+    action = "-FLAGS.SILENT" if request["value"] else "+FLAGS.SILENT"
+    for label in ("ALL", "DRAFT", "TRASH"):
+        if not remaining:
+            break
+        try:
+            select(connection, mailbox_name(connection, label), readonly=False)
+            found = []
+            for message_id in remaining:
+                matches = ids(connection, "X-GM-MSGID", message_id)
+                if matches:
+                    found.append((message_id, matches[0]))
+            if found:
+                uid_set = b",".join(uid for _, uid in found).decode("ascii")
+                require_ok(connection.uid("STORE", uid_set, action, "(\\Seen)"), "set_unread_many")
+                updated.extend(message_id for message_id, _ in found)
+                found_ids = {message_id for message_id, _ in found}
+                remaining = [message_id for message_id in remaining if message_id not in found_ids]
+        except imaplib.IMAP4.error as error:
+            return {"updated": updated, "error": f"Mail authentication or protocol error ({type(error).__name__})"}
+        except OSError as error:
+            return {"updated": updated, "error": f"Mail network error ({type(error).__name__})"}
+        except RuntimeError as error:
+            return {"updated": updated, "error": str(error)}
+    if remaining:
+        return {"updated": updated, "error": "Some messages are no longer available; refresh the mailbox"}
+    return {"updated": updated, "error": None}
 
 
 def raw_message(request):
@@ -514,12 +566,14 @@ def dispatch(request):
             return list_labels(connection)
         if operation == "unread_counts":
             return unread_counts(connection, request["labels"])
+        if operation == "set_unread_many":
+            return set_unread_many(connection, request)
         if operation == "list_threads":
             return list_threads(connection, request)
         if operation == "thread":
             return thread(connection, request)
         if operation == "threads":
-            return [thread(connection, {"id": thread_id}) for thread_id in request["ids"]]
+            return threads(connection, request["ids"])
         if operation == "attachment":
             return attachment(connection, request)
         if operation == "inline_images":

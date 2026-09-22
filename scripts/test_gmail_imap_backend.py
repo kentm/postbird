@@ -86,6 +86,27 @@ class GmailImapBackendTests(unittest.TestCase):
         self.assertEqual(backend.unread_counts(connection, [""]), [91])
         mailbox_name.assert_called_once_with(connection, "ALL")
 
+    @patch("gmail_imap_backend.mailbox_name", return_value="[Gmail]/All Mail")
+    def test_marking_multiple_messages_read_uses_one_store(self, _mailbox_name):
+        connection = MagicMock()
+        connection.select.return_value = ("OK", [b"2"])
+
+        def uid(command, *args):
+            if command == "SEARCH":
+                return "OK", [str({"one": 11, "two": 12}[args[-1]]).encode()]
+            return "OK", [b""]
+
+        connection.uid.side_effect = uid
+        result = backend.set_unread_many(
+            connection, {"ids": ["one", "two"], "value": False}
+        )
+        self.assertEqual(result, {"updated": ["one", "two"], "error": None})
+        connection.select.assert_called_once_with("[Gmail]/All Mail", readonly=False)
+        self.assertEqual(
+            [call.args for call in connection.uid.call_args_list if call.args[0] == "STORE"],
+            [("STORE", "11,12", "+FLAGS.SILENT", "(\\Seen)")],
+        )
+
     def test_quotes_gmail_search_without_command_injection(self):
         self.assertEqual(backend.quoted('from:"Ada" \\ test'), '"from:\\"Ada\\" \\\\ test"')
 
@@ -207,13 +228,45 @@ class GmailImapBackendTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in connection.fetch.call_args_list], ["1000", "2"])
         connection.uid.assert_not_called()
 
+    def test_unread_filter_finds_old_messages_with_same_flag_as_badge(self):
+        connection = MagicMock()
+        connection.select.return_value = ("OK", [b"100000"])
+        connection.search.return_value = ("OK", [b"4 10 25"])
+        connection.fetch.return_value = (
+            "OK", [b"4 (X-GM-THRID 7)", b"10 (X-GM-THRID 8)", b"25 (X-GM-THRID 9)"],
+        )
+        result = backend.list_threads(connection, {"label": "INBOX", "query": "is:unread"})
+        self.assertEqual(result, {"threads": [{"id": "9"}, {"id": "8"}, {"id": "7"}]})
+        connection.search.assert_called_once_with(None, "UNSEEN")
+        connection.fetch.assert_called_once_with("4,10,25", "(X-GM-THRID)")
+
     @patch("gmail_imap_backend.connect_imap")
-    @patch("gmail_imap_backend.thread")
-    def test_batch_fetch_reuses_one_imap_connection(self, get_thread, connect_imap):
-        get_thread.side_effect = lambda _connection, request: {"messages": [request["id"]]}
+    @patch("gmail_imap_backend.mailbox_name", side_effect=lambda _connection, label: label)
+    @patch("gmail_imap_backend.ids")
+    @patch("gmail_imap_backend.fetch_messages")
+    def test_batch_fetch_reuses_one_imap_connection_and_selects_each_mailbox_once(
+        self, fetch_messages, search_ids, _mailbox_name, connect_imap
+    ):
+        connect_imap.return_value.select.return_value = ("OK", [b"1"])
+        search_ids.side_effect = lambda _connection, _criterion, thread_id: {
+            "one": [b"1"], "two": [b"2"]
+        }[thread_id]
+        fetch_messages.side_effect = lambda _connection, _uids: [
+            {"id": "a", "threadId": "one", "internalDate": "1"},
+            {"id": "b", "threadId": "two", "internalDate": "2"},
+        ]
         result = backend.dispatch({"operation": "threads", "ids": ["one", "two"]})
-        self.assertEqual(result, [{"messages": ["one"]}, {"messages": ["two"]}])
+        self.assertEqual(
+            [[message["id"] for message in item["messages"]] for item in result],
+            [["a"], ["b"]],
+        )
         connect_imap.assert_called_once()
+        self.assertEqual(connect_imap.return_value.select.call_count, 3)
+        self.assertEqual(fetch_messages.call_count, 3)
+        self.assertEqual(
+            [call.args[1] for call in fetch_messages.call_args_list],
+            [[b"1", b"2"]] * 3,
+        )
         connect_imap.return_value.logout.assert_called_once()
 
     @patch("gmail_imap_backend.mailbox_name", return_value="[Gmail]/All Mail")

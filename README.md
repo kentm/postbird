@@ -12,6 +12,7 @@ on your computer apart from requests to Google.
 - GNOME Online Accounts sign-in over Gmail IMAP/SMTP and XOAUTH2
 - App passwords stored in the Linux keyring; GOA tokens are never stored by Postbird
 - Inbox, Starred, Sent, Drafts, and Trash views
+- Favourite folders across accounts, with custom names and drag-to-reorder
 - Gmail search and offline mailbox cache
 - Read, archive, star, mark unread, and trash messages
 - Compose, reply, save drafts, and send messages

@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     ffi::OsStr,
     path::PathBuf,
@@ -22,13 +22,14 @@ use crate::{
     cache::MailCache,
     gmail::{ComposeMessage, ForwardedAttachment, Message, Payload, ThreadRef},
     mail::{ImapClient, MailClient},
-    preferences::UiPreferences,
+    preferences::{FavoriteFolder, UiPreferences},
 };
 
 #[derive(Clone)]
 struct Widgets {
     window: adw::ApplicationWindow,
     toast: adw::ToastOverlay,
+    sidebar_toast: adw::ToastOverlay,
     accounts: gtk::StringList,
     account_picker: gtk::DropDown,
     messages: gtk::ListBox,
@@ -59,12 +60,17 @@ struct State {
     account_labels: HashMap<String, Vec<(String, String)>>,
     unread_counts: HashMap<(String, String), u32>,
     unread_refresh_generation: HashMap<String, u64>,
+    favorite_refresh_inflight: HashSet<String>,
+    favorite_refresh_pending: HashSet<String>,
+    mark_read_inflight: HashMap<String, usize>,
     collapsed_accounts: HashSet<String>,
+    accounts_loaded: bool,
     conversations: Vec<Vec<Message>>,
     selected: Option<Message>,
     selected_conversation: Vec<Message>,
     history_expanded: bool,
     current_label: String,
+    active_query: Option<String>,
     load_generation: u64,
     load_cancel: Arc<AtomicBool>,
     mailbox_loading: bool,
@@ -82,12 +88,17 @@ impl Default for State {
             account_labels: HashMap::new(),
             unread_counts: HashMap::new(),
             unread_refresh_generation: HashMap::new(),
+            favorite_refresh_inflight: HashSet::new(),
+            favorite_refresh_pending: HashSet::new(),
+            mark_read_inflight: HashMap::new(),
             collapsed_accounts: HashSet::new(),
+            accounts_loaded: false,
             conversations: Vec::new(),
             selected: None,
             selected_conversation: Vec::new(),
             history_expanded: false,
             current_label: "INBOX".to_owned(),
+            active_query: None,
             load_generation: 0,
             load_cancel: Arc::new(AtomicBool::new(false)),
             mailbox_loading: false,
@@ -109,6 +120,7 @@ pub fn build(app: &adw::Application) {
         .build();
     window.add_css_class("postbird-window");
     let toast = adw::ToastOverlay::new();
+    let sidebar_toast = adw::ToastOverlay::new();
     let state = Rc::new(RefCell::new(State::default()));
     let preferences = Rc::new(RefCell::new(UiPreferences::load()));
 
@@ -207,6 +219,7 @@ pub fn build(app: &adw::Application) {
     let widgets = Widgets {
         window: window.clone(),
         toast: toast.clone(),
+        sidebar_toast,
         accounts,
         account_picker,
         messages,
@@ -238,7 +251,7 @@ pub fn build(app: &adw::Application) {
     }
 
     let message_split = gtk::Paned::new(Orientation::Horizontal);
-    message_split.set_start_child(Some(&message_list_panel(&widgets)));
+    message_split.set_start_child(Some(&message_list_panel(&widgets, &state)));
     message_split.set_end_child(Some(&detail_stack));
     message_split.set_position(preferences.borrow().message_split);
     message_split.set_wide_handle(true);
@@ -311,6 +324,8 @@ fn install_visual_style() {
          .postbird-folder { min-height: 28px; padding: 2px 4px; border-radius: 7px; }
          .postbird-folder:hover { background: #39445a; }
          .postbird-folder.active { background: #315c9e; }
+         .postbird-favorite-row.drop-before { box-shadow: inset 0 2px #7daaff; }
+         .postbird-favorite-row.drop-after { box-shadow: inset 0 -2px #7daaff; }
          .postbird-favorite { min-width: 24px; padding: 0; opacity: 0.72; }
          .postbird-sidebar .postbird-unread-badge { background: #7daaff; color: #15243d;
              border-radius: 99px; padding: 1px 6px; font-weight: bold; font-size: 0.85em; }
@@ -320,11 +335,17 @@ fn install_visual_style() {
          .postbird-list-panel listbox, .postbird-list-panel row { background: transparent; }
          .postbird-list-panel row:hover { background: #343b49; }
          .postbird-list-panel row:selected { background: #185bb4; }
+         .postbird-list-panel .postbird-unread-dot { min-width: 11px;
+             color: #8db6ff; font-size: 11px; }
+         .postbird-list-panel row.accent .postbird-row-subject { font-weight: 700; }
+         .postbird-list-panel row:selected .postbird-unread-dot { color: #ffffff; }
          .postbird-reader, .postbird-reader scrolledwindow { background: #ffffff; color: #181b20; }
          .postbird-reader label, .postbird-reader image { color: #181b20; }
          .postbird-reader .dim-label { color: #717984; }
          .postbird-reader .postbird-message-title { font-size: 18px; font-weight: 700; }
-         .postbird-reader .postbird-part-trigger { min-width: 24px; min-height: 24px; padding: 2px; }
+         .postbird-reader .postbird-part-trigger { min-width: 20px; min-height: 0; padding: 0; }
+         .postbird-reader .postbird-part-trigger > button { min-width: 0; min-height: 0;
+             padding: 0; border: 0; box-shadow: none; background: transparent; }
          .postbird-reader .message-section { background: #ffffff; color: #181b20;
              border: 0; border-bottom: 1px solid #e3e7ed; border-radius: 0; box-shadow: none; }
          .postbird-reader .postbird-history-toggle { background: #f0f4fa; border-radius: 12px;
@@ -384,7 +405,8 @@ fn mailbox_sidebar(widgets: &Widgets, state: &Rc<RefCell<State>>) -> gtk::Widget
             .build(),
     );
     rebuild_sidebar(widgets, state);
-    sidebar.upcast()
+    widgets.sidebar_toast.set_child(Some(&sidebar));
+    widgets.sidebar_toast.clone().upcast()
 }
 
 fn sidebar_folders(state: &State, email: &str) -> Vec<(String, String, &'static str)> {
@@ -482,7 +504,21 @@ fn sidebar_folder_row(
         );
     }
     button.set_child(Some(&content));
-    button.set_tooltip_text(Some(&format!("{title} — {email}")));
+    button.set_tooltip_text(Some(&if account_name.is_some() {
+        let unread = state
+            .borrow()
+            .unread_counts
+            .get(&(email.to_owned(), label_id.to_owned()))
+            .copied()
+            .unwrap_or(0);
+        if unread > 0 {
+            format!("{title} — {email} · {unread} unread in this folder, including older mail. Use Unread to find them. Drag to reorder")
+        } else {
+            format!("{title} — {email} · Drag to reorder")
+        }
+    } else {
+        format!("{title} — {email}")
+    }));
     let widgets_for_select = widgets.clone();
     let state_for_select = state.clone();
     let selected_email = email.to_owned();
@@ -498,6 +534,10 @@ fn sidebar_folder_row(
         );
     });
     row.append(&button);
+
+    if account_name.is_some() {
+        attach_favorite_reordering(widgets, state, &row, &button, email, label_id);
+    }
 
     if account_name.is_some() {
         let rename = gtk::Button::builder()
@@ -577,6 +617,16 @@ fn sidebar_folder_row(
                 );
             }
         }
+        {
+            let mut state = state_for_favorite.borrow_mut();
+            state
+                .unread_counts
+                .remove(&(favorite_email.clone(), favorite_label.clone()));
+            *state
+                .unread_refresh_generation
+                .entry(favorite_email.clone())
+                .or_default() += 1;
+        }
         rebuild_sidebar(&widgets_for_favorite, &state_for_favorite);
         refresh_favorite_counts_for_account(
             &widgets_for_favorite,
@@ -586,6 +636,113 @@ fn sidebar_folder_row(
     });
     row.append(&star);
     row
+}
+
+fn available_favorite_folders(state: &State, preferences: &UiPreferences) -> Vec<FavoriteFolder> {
+    state
+        .account_emails
+        .iter()
+        .flat_map(|email| {
+            sidebar_folders(state, email)
+                .into_iter()
+                .filter(|(label_id, _, _)| preferences.is_favorite(email, label_id))
+                .map(|(label_id, _, _)| FavoriteFolder {
+                    account_email: email.clone(),
+                    label_id,
+                })
+        })
+        .collect()
+}
+
+fn attach_favorite_reordering(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    row: &gtk::Box,
+    button: &gtk::Button,
+    email: &str,
+    label_id: &str,
+) {
+    row.add_css_class("postbird-favorite-row");
+    let folder = FavoriteFolder {
+        account_email: email.to_owned(),
+        label_id: label_id.to_owned(),
+    };
+    let source = gtk::DragSource::new();
+    source.set_actions(gtk::gdk::DragAction::MOVE);
+    let dragged_folder = folder.clone();
+    source.connect_prepare(move |_, _, _| {
+        let value = glib::BoxedAnyObject::new(dragged_folder.clone()).to_value();
+        Some(gtk::gdk::ContentProvider::for_value(&value))
+    });
+    button.add_controller(source);
+
+    let target = gtk::DropTarget::new(
+        glib::BoxedAnyObject::static_type(),
+        gtk::gdk::DragAction::MOVE,
+    );
+    let motion_row = row.clone();
+    target.connect_motion(move |_, _, y| {
+        motion_row.remove_css_class("drop-before");
+        motion_row.remove_css_class("drop-after");
+        motion_row.add_css_class(if y < f64::from(motion_row.height()) / 2.0 {
+            "drop-before"
+        } else {
+            "drop-after"
+        });
+        gtk::gdk::DragAction::MOVE
+    });
+    let leave_row = row.clone();
+    target.connect_leave(move |_| {
+        leave_row.remove_css_class("drop-before");
+        leave_row.remove_css_class("drop-after");
+    });
+    let drop_row = row.clone();
+    let widgets_for_drop = widgets.clone();
+    let state_for_drop = state.clone();
+    target.connect_drop(move |_, value, _, y| {
+        drop_row.remove_css_class("drop-before");
+        drop_row.remove_css_class("drop-after");
+        let Ok(payload) = value.get::<glib::BoxedAnyObject>() else {
+            return false;
+        };
+        let Ok(source) = payload.try_borrow::<FavoriteFolder>() else {
+            return false;
+        };
+        let source = source.clone();
+        let available = {
+            let state = state_for_drop.borrow();
+            let preferences = widgets_for_drop.preferences.borrow();
+            available_favorite_folders(&state, &preferences)
+        };
+        let moved = {
+            let mut preferences = widgets_for_drop.preferences.borrow_mut();
+            let previous = preferences.favorite_order.clone();
+            if !preferences.move_favorite(
+                &available,
+                &source,
+                &folder,
+                y >= f64::from(drop_row.height()) / 2.0,
+            ) {
+                return false;
+            }
+            if let Err(error) = preferences.save() {
+                preferences.favorite_order = previous;
+                show_message(
+                    &widgets_for_drop,
+                    &format!("Could not save Favourites: {error}"),
+                );
+                return false;
+            }
+            true
+        };
+        if moved {
+            let widgets = widgets_for_drop.clone();
+            let state = state_for_drop.clone();
+            glib::idle_add_local_once(move || rebuild_sidebar(&widgets, &state));
+        }
+        moved
+    });
+    row.add_controller(target);
 }
 
 fn rebuild_sidebar(widgets: &Widgets, state: &Rc<RefCell<State>>) {
@@ -614,24 +771,31 @@ fn rebuild_sidebar(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             .collect::<Vec<_>>()
     };
     navigation.append(&sidebar_heading("FAVOURITES"));
-    let mut any_favorites = false;
-    for (email, name, folders, _) in &accounts {
-        for (label_id, title, icon) in folders {
-            if widgets.preferences.borrow().is_favorite(email, label_id) {
-                any_favorites = true;
-                navigation.append(&sidebar_folder_row(
-                    widgets,
-                    state,
-                    email,
-                    label_id,
-                    title,
-                    icon,
-                    Some(name),
-                ));
-            }
+    let favorites = {
+        let state = state.borrow();
+        let preferences = widgets.preferences.borrow();
+        preferences.ordered_favorites(&available_favorite_folders(&state, &preferences))
+    };
+    for favorite in &favorites {
+        if let Some((email, name, folders, _)) = accounts
+            .iter()
+            .find(|(email, _, _, _)| email == &favorite.account_email)
+            && let Some((label_id, title, icon)) = folders
+                .iter()
+                .find(|(label_id, _, _)| label_id == &favorite.label_id)
+        {
+            navigation.append(&sidebar_folder_row(
+                widgets,
+                state,
+                email,
+                label_id,
+                title,
+                icon,
+                Some(name),
+            ));
         }
     }
-    if !any_favorites {
+    if favorites.is_empty() {
         navigation.append(
             &gtk::Label::builder()
                 .label("Star a folder to keep it here")
@@ -697,14 +861,37 @@ fn refresh_favorite_counts_for_account(widgets: &Widgets, state: &Rc<RefCell<Sta
     if labels.is_empty() {
         return;
     }
-    let generation = {
+    let (generation, previous_counts) = {
         let mut state = state.borrow_mut();
+        if state.mark_read_inflight.get(email).copied().unwrap_or(0) > 0 {
+            state.favorite_refresh_pending.insert(email.to_owned());
+            return;
+        }
+        if !state.favorite_refresh_inflight.insert(email.to_owned()) {
+            state.favorite_refresh_pending.insert(email.to_owned());
+            return;
+        }
+        state.favorite_refresh_pending.remove(email);
         let generation = state
             .unread_refresh_generation
             .entry(email.to_owned())
             .or_default();
         *generation += 1;
-        *generation
+        let generation = *generation;
+        let previous_counts = labels
+            .iter()
+            .map(|label| {
+                (
+                    label.clone(),
+                    state
+                        .unread_counts
+                        .get(&(email.to_owned(), label.clone()))
+                        .copied()
+                        .unwrap_or(0),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        (generation, previous_counts)
     };
     let widgets = widgets.clone();
     let state = state.clone();
@@ -712,46 +899,84 @@ fn refresh_favorite_counts_for_account(widgets: &Widgets, state: &Rc<RefCell<Sta
     glib::MainContext::default().spawn_local(async move {
         let request_email = email.clone();
         let request_labels = labels.clone();
-        let result = gio::spawn_blocking(move || -> anyhow::Result<Vec<u32>> {
-            MailClient::for_account(AccountStore::open()?, &request_email)?
-                .unread_counts(&request_labels)
+        let result = gio::spawn_blocking(move || -> anyhow::Result<_> {
+            let counts = MailClient::for_account(AccountStore::open()?, &request_email)?
+                .unread_counts(&request_labels)?;
+            let mut prefetched = HashMap::new();
+            let mut failed = HashSet::new();
+            for (label, count) in request_labels.iter().zip(&counts) {
+                if *count <= previous_counts.get(label).copied().unwrap_or(0) {
+                    continue;
+                }
+                match prefetch_favorite_folder(&request_email, label, *count) {
+                    Ok(messages) => {
+                        prefetched.insert(label.clone(), messages);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Could not prefetch favourite {label} for {request_email}: {error}"
+                        );
+                        failed.insert(label.clone());
+                    }
+                }
+            }
+            Ok((counts, prefetched, failed))
         })
         .await;
-        let Ok(Ok(counts)) = result else {
-            return;
-        };
-        if counts.len() != labels.len() {
-            return;
-        }
-        let fresh_counts = labels
-            .into_iter()
-            .zip(counts)
-            .filter(|(_, count)| *count > 0)
-            .collect::<HashMap<_, _>>();
-        {
+        let mut visible_messages = None;
+        let mut changed = false;
+        let rerun = {
             let mut state = state.borrow_mut();
-            if state.unread_refresh_generation.get(&email) != Some(&generation)
-                || !state.account_emails.contains(&email)
+            state.favorite_refresh_inflight.remove(&email);
+            let rerun = if state.mark_read_inflight.get(&email).copied().unwrap_or(0) == 0 {
+                state.favorite_refresh_pending.remove(&email)
+            } else {
+                state.favorite_refresh_pending.insert(email.clone());
+                false
+            };
+            if state.unread_refresh_generation.get(&email) == Some(&generation)
+                && state.account_emails.contains(&email)
+                && let Ok(Ok((counts, mut prefetched, failed))) = result
+                && counts.len() == labels.len()
             {
-                return;
+                for (label, count) in labels.iter().zip(counts) {
+                    if failed.contains(label) {
+                        continue;
+                    }
+                    let key = (email.clone(), label.clone());
+                    let old_count = state.unread_counts.get(&key).copied().unwrap_or(0);
+                    if old_count == count {
+                        continue;
+                    }
+                    changed = true;
+                    if count > 0 {
+                        state.unread_counts.insert(key, count);
+                    } else {
+                        state.unread_counts.remove(&key);
+                    }
+                    if state.current_label == *label
+                        && !state.mailbox_loading
+                        && widgets.search.text().is_empty()
+                        && state
+                            .account_emails
+                            .get(widgets.account_picker.selected() as usize)
+                            == Some(&email)
+                    {
+                        visible_messages = prefetched.remove(label);
+                    }
+                }
             }
-            let current_counts = state
-                .unread_counts
-                .iter()
-                .filter(|((account, _), _)| account == &email)
-                .map(|((_, label), count)| (label.clone(), *count))
-                .collect::<HashMap<_, _>>();
-            if current_counts == fresh_counts {
-                return;
-            }
-            state
-                .unread_counts
-                .retain(|(account, _), _| account != &email);
-            for (label, count) in fresh_counts {
-                state.unread_counts.insert((email.clone(), label), count);
-            }
+            rerun
+        };
+        if changed {
+            rebuild_sidebar(&widgets, &state);
         }
-        rebuild_sidebar(&widgets, &state);
+        if let Some(messages) = visible_messages {
+            show_loaded_mailbox(&widgets, &state, messages, false, true);
+        }
+        if rerun {
+            refresh_favorite_counts_for_account(&widgets, &state, &email);
+        }
     });
 }
 
@@ -770,7 +995,11 @@ fn select_mailbox(
     else {
         return;
     };
-    state.borrow_mut().current_label = label_id.to_owned();
+    {
+        let mut state = state.borrow_mut();
+        state.current_label = label_id.to_owned();
+        state.active_query = None;
+    }
     widgets
         .mailbox_title
         .set_text(&format!("{title} · {email}"));
@@ -783,7 +1012,7 @@ fn select_mailbox(
     rebuild_sidebar(widgets, state);
 }
 
-fn message_list_panel(widgets: &Widgets) -> gtk::Widget {
+fn message_list_panel(widgets: &Widgets, state: &Rc<RefCell<State>>) -> gtk::Widget {
     let panel = gtk::Box::new(Orientation::Vertical, 5);
     panel.add_css_class("postbird-list-panel");
     panel.set_size_request(300, -1);
@@ -796,7 +1025,31 @@ fn message_list_panel(widgets: &Widgets) -> gtk::Widget {
     title_row.append(&widgets.mailbox_title);
     title_row.append(&widgets.mailbox_spinner);
     panel.append(&title_row);
-    panel.append(&widgets.search);
+    let search_row = gtk::Box::new(Orientation::Horizontal, 5);
+    widgets.search.set_hexpand(true);
+    search_row.append(&widgets.search);
+    let unread_filter = gtk::Button::builder()
+        .label("Unread")
+        .tooltip_text("Find unread mail in this folder, including older messages")
+        .build();
+    let widgets_for_unread = widgets.clone();
+    let state_for_unread = state.clone();
+    unread_filter.connect_clicked(move |_| {
+        let index = widgets_for_unread.account_picker.selected() as usize;
+        let Some(email) = state_for_unread.borrow().account_emails.get(index).cloned() else {
+            return;
+        };
+        widgets_for_unread.search.set_text("is:unread");
+        load_inbox(
+            &widgets_for_unread,
+            &state_for_unread,
+            email,
+            Some("is:unread".to_owned()),
+            false,
+        );
+    });
+    search_row.append(&unread_filter);
+    panel.append(&search_row);
     panel.append(
         &gtk::ScrolledWindow::builder()
             .vexpand(true)
@@ -820,18 +1073,53 @@ fn connect_selection(widgets: &Widgets, state: &Rc<RefCell<State>>, stack: &gtk:
             else {
                 return;
             };
-            let unread_ids = conversation
+            let unread_messages = conversation
                 .iter()
                 .filter(|message| message.label_ids.iter().any(|label| label == "UNREAD"))
-                .map(|message| message.id.clone())
+                .cloned()
                 .collect::<Vec<_>>();
-            if !unread_ids.is_empty() {
+            if !unread_messages.is_empty() {
+                let email = state
+                    .borrow()
+                    .account_emails
+                    .get(widgets.account_picker.selected() as usize)
+                    .cloned();
                 for message in &mut conversation {
                     message.label_ids.retain(|label| label != "UNREAD");
                 }
-                row.remove_css_class("accent");
-                state.borrow_mut().conversations[row_index] = conversation.clone();
-                mark_read_in_background(&widgets, &state, unread_ids);
+                let adjustments = if let Some(email) = email.as_deref() {
+                    let mut state = state.borrow_mut();
+                    let current_label = state.current_label.clone();
+                    state.conversations[row_index] = conversation.clone();
+                    *state
+                        .mark_read_inflight
+                        .entry(email.to_owned())
+                        .or_default() += 1;
+                    *state
+                        .unread_refresh_generation
+                        .entry(email.to_owned())
+                        .or_default() += 1;
+                    decrease_unread_counts(&mut state, email, &unread_messages, &current_label)
+                } else {
+                    state.borrow_mut().conversations[row_index] = conversation.clone();
+                    HashMap::new()
+                };
+                if let Some(thread) = conversation.first() {
+                    update_conversation_row(&widgets, &state, &thread.thread_id);
+                }
+                if let Some(email) = email {
+                    if !adjustments.is_empty() {
+                        rebuild_sidebar(&widgets, &state);
+                    }
+                    mark_read_in_background(
+                        &widgets,
+                        &state,
+                        email,
+                        unread_messages,
+                        adjustments,
+                        state.borrow().current_label.clone(),
+                    );
+                }
             }
             let Some(message) = conversation.first().cloned() else {
                 return;
@@ -856,33 +1144,188 @@ fn connect_selection(widgets: &Widgets, state: &Rc<RefCell<State>>, stack: &gtk:
         });
 }
 
+fn unread_count_deltas(messages: &[Message], current_label: &str) -> HashMap<String, u32> {
+    let mut deltas = HashMap::new();
+    for message in messages {
+        let mut labels = message
+            .label_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        // A conversation can contain Sent messages that are not in the opened
+        // Inbox. Only add a known system folder when this message has its label.
+        if !matches!(
+            current_label,
+            "INBOX" | "SENT" | "DRAFT" | "TRASH" | "STARRED"
+        ) {
+            labels.insert(current_label);
+        }
+        for label in labels {
+            *deltas.entry(label.to_owned()).or_default() += 1;
+        }
+    }
+    deltas
+}
+
+fn decrease_unread_counts(
+    state: &mut State,
+    email: &str,
+    messages: &[Message],
+    current_label: &str,
+) -> HashMap<String, u32> {
+    let mut applied = HashMap::new();
+    for (label, count) in unread_count_deltas(messages, current_label) {
+        let key = (email.to_owned(), label.clone());
+        if let Some(old_count) = state.unread_counts.get(&key).copied() {
+            let decrease = old_count.min(count);
+            if decrease > 0 {
+                let new_count = old_count - decrease;
+                if new_count == 0 {
+                    state.unread_counts.remove(&key);
+                } else {
+                    state.unread_counts.insert(key, new_count);
+                }
+                applied.insert(label, decrease);
+            }
+        }
+    }
+    applied
+}
+
 fn mark_read_in_background(
     widgets: &Widgets,
     state: &Rc<RefCell<State>>,
-    message_ids: Vec<String>,
+    email: String,
+    unread_messages: Vec<Message>,
+    count_adjustments: HashMap<String, u32>,
+    current_label: String,
 ) {
-    let index = widgets.account_picker.selected() as usize;
-    let Some(email) = state.borrow().account_emails.get(index).cloned() else {
-        return;
-    };
+    let message_ids = unread_messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
     let widgets = widgets.clone();
     let state = state.clone();
     glib::MainContext::default().spawn_local(async move {
         let refresh_email = email.clone();
-        let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
-            let mut client = MailClient::for_account(AccountStore::open()?, &email)?;
-            for id in &message_ids {
-                client.set_unread(id, false)?;
+        let attempted_ids = message_ids.clone();
+        let result =
+            gio::spawn_blocking(move || -> anyhow::Result<(Vec<String>, Option<String>)> {
+                let mut client = MailClient::for_account(AccountStore::open()?, &email)?;
+                let result = client.set_unread_many(&message_ids, false)?;
+                let marked_ids = result.updated;
+                let failure = result.error;
+                if !marked_ids.is_empty()
+                    && let Err(error) =
+                        MailCache::open().and_then(|mut cache| cache.mark_read(&email, &marked_ids))
+                {
+                    eprintln!("Could not update the read-state cache: {error}");
+                }
+                Ok((marked_ids, failure))
+            })
+            .await;
+        let marked_ids = match result {
+            Ok(Ok((marked_ids, failure))) => {
+                restore_unmarked_messages(
+                    &widgets,
+                    &state,
+                    &refresh_email,
+                    &attempted_ids,
+                    &marked_ids,
+                );
+                if let Some(error) = failure {
+                    show_message(&widgets, &format!("Could not mark as read: {error}"));
+                }
+                marked_ids
             }
-            MailCache::open()?.mark_read(&email, &message_ids)
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => refresh_favorite_counts_for_account(&widgets, &state, &refresh_email),
-            Ok(Err(error)) => show_message(&widgets, &format!("Could not mark as read: {error}")),
-            Err(_) => show_message(&widgets, "The mark-as-read task stopped unexpectedly"),
+            Ok(Err(error)) => {
+                restore_unmarked_messages(&widgets, &state, &refresh_email, &attempted_ids, &[]);
+                show_message(&widgets, &format!("Could not mark as read: {error}"));
+                Vec::new()
+            }
+            Err(_) => {
+                restore_unmarked_messages(&widgets, &state, &refresh_email, &attempted_ids, &[]);
+                show_message(&widgets, "The mark-as-read task stopped unexpectedly");
+                Vec::new()
+            }
+        };
+        let marked_ids = marked_ids.into_iter().collect::<HashSet<_>>();
+        let failed_messages = unread_messages
+            .iter()
+            .filter(|message| !marked_ids.contains(&message.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let failed_deltas = unread_count_deltas(&failed_messages, &current_label);
+        let mut counts_changed = false;
+        {
+            let mut state = state.borrow_mut();
+            if let Some(inflight) = state.mark_read_inflight.get_mut(&refresh_email) {
+                *inflight -= 1;
+                if *inflight == 0 {
+                    state.mark_read_inflight.remove(&refresh_email);
+                }
+            }
+            for (label, adjusted) in count_adjustments {
+                let restore = adjusted.min(failed_deltas.get(&label).copied().unwrap_or(0));
+                if restore > 0 {
+                    *state
+                        .unread_counts
+                        .entry((refresh_email.clone(), label))
+                        .or_default() += restore;
+                    counts_changed = true;
+                }
+            }
         }
+        if counts_changed {
+            rebuild_sidebar(&widgets, &state);
+        }
+        refresh_favorite_counts_for_account(&widgets, &state, &refresh_email);
     });
+}
+
+fn restore_unmarked_messages(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    email: &str,
+    attempted_ids: &[String],
+    marked_ids: &[String],
+) {
+    let current_account = state
+        .borrow()
+        .account_emails
+        .get(widgets.account_picker.selected() as usize)
+        .cloned();
+    if current_account.as_deref() != Some(email) {
+        return;
+    }
+    let marked_ids = marked_ids.iter().collect::<HashSet<_>>();
+    let failed_ids = attempted_ids
+        .iter()
+        .filter(|id| !marked_ids.contains(id))
+        .cloned()
+        .collect::<HashSet<_>>();
+    if failed_ids.is_empty() {
+        return;
+    }
+    update_visible_labels(state, &failed_ids, "UNREAD", true);
+    let threads = state
+        .borrow()
+        .conversations
+        .iter()
+        .filter(|conversation| {
+            conversation
+                .iter()
+                .any(|message| failed_ids.contains(&message.id))
+        })
+        .filter_map(|conversation| {
+            conversation
+                .first()
+                .map(|message| message.thread_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for thread in threads {
+        update_conversation_row(widgets, state, &thread);
+    }
 }
 
 fn connect_account_picker(widgets: &Widgets, state: &Rc<RefCell<State>>) {
@@ -906,6 +1349,8 @@ fn connect_account_picker(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                 widgets
                     .mailbox_title
                     .set_text(&format!("{title} · {email}"));
+                state.borrow_mut().active_query = None;
+                widgets.search.set_text("");
                 load_inbox(&widgets, &state, email, None, true);
                 rebuild_sidebar(&widgets, &state);
             }
@@ -1157,6 +1602,24 @@ fn account_index(state: &Rc<RefCell<State>>, email: &str) -> Option<u32> {
 fn connect_search(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     let widgets = widgets.clone();
     let state = state.clone();
+    let widgets_for_clear = widgets.clone();
+    let state_for_clear = state.clone();
+    widgets
+        .search
+        .clone()
+        .connect_search_changed(move |search| {
+            if !search_clear_needs_reload(
+                state_for_clear.borrow().active_query.as_deref(),
+                search.text().as_str(),
+            ) {
+                return;
+            }
+            let index = widgets_for_clear.account_picker.selected() as usize;
+            let Some(email) = state_for_clear.borrow().account_emails.get(index).cloned() else {
+                return;
+            };
+            load_inbox(&widgets_for_clear, &state_for_clear, email, None, true);
+        });
     widgets.search.clone().connect_activate(move |search| {
         let index = widgets.account_picker.selected() as usize;
         let Some(email) = state.borrow().account_emails.get(index).cloned() else {
@@ -1171,6 +1634,10 @@ fn connect_search(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             true,
         );
     });
+}
+
+fn search_clear_needs_reload(active_query: Option<&str>, text: &str) -> bool {
+    active_query.is_some() && text.is_empty()
 }
 
 fn connect_remove_account(widgets: &Widgets, state: &Rc<RefCell<State>>, button: &gtk::Button) {
@@ -1210,6 +1677,11 @@ fn connect_remove_account(widgets: &Widgets, state: &Rc<RefCell<State>>, button:
                         state.load_cancel.store(true, Ordering::Relaxed);
                         state.pending_archives.retain(|(account, _)| account != &email);
                         state.archived_messages.retain(|(account, _), _| account != &email);
+                        *state
+                            .unread_refresh_generation
+                            .entry(email.clone())
+                            .or_default() += 1;
+                        state.favorite_refresh_pending.remove(&email);
                         state.current_label = "INBOX".to_owned();
                     }
                     reset_reader(&widgets, &state);
@@ -1853,17 +2325,26 @@ fn present_compose(
     replying_to: Option<Message>,
     editing: Option<EditingDraft>,
 ) {
+    present_compose_with_title(widgets, account_email, initial, replying_to, editing, None);
+}
+
+fn present_compose_with_title(
+    widgets: &Widgets,
+    account_email: String,
+    initial: Option<ComposeMessage>,
+    replying_to: Option<Message>,
+    editing: Option<EditingDraft>,
+    title_override: Option<&str>,
+) {
     let parent = widgets.window.clone();
+    let title = compose_dialog_title(
+        editing.is_some(),
+        replying_to.is_some(),
+        initial.is_some(),
+        title_override,
+    );
     let dialog = adw::Dialog::builder()
-        .title(if editing.is_some() {
-            "Edit Draft"
-        } else if replying_to.is_some() {
-            "Reply"
-        } else if initial.is_some() {
-            "Forward"
-        } else {
-            "New message"
-        })
+        .title(&title)
         .content_width(900)
         .content_height(720)
         .build();
@@ -1974,10 +2455,9 @@ fn present_compose(
     }
     form.append(&attachment_label);
     form.append(&formatting);
-    if editing.is_some()
-        && initial
-            .as_ref()
-            .is_some_and(|message| message.html_body.is_some())
+    if initial
+        .as_ref()
+        .is_some_and(|message| message.html_body.is_some())
     {
         let note = gtk::Label::builder()
             .label("Editing the body replaces its original formatting with Postbird formatting. Changing only recipients or the subject preserves the original HTML.")
@@ -1996,9 +2476,9 @@ fn present_compose(
     dialog.set_child(Some(&toolbar));
 
     let original_content = rich_text_content(&body);
-    let original_html = editing
+    let original_html = initial
         .as_ref()
-        .and_then(|_| initial.as_ref()?.html_body.clone());
+        .and_then(|message| message.html_body.clone());
     let content_for_send = original_content.clone();
     let html_for_send = original_html.clone();
     let editing_for_send = editing.clone();
@@ -2038,7 +2518,6 @@ fn present_compose(
             dialog.set_can_close(!busy);
         }
     });
-    let busy_send = set_busy.clone();
     let widgets_for_send = widgets.clone();
     let widgets_for_draft = widgets.clone();
     let dialog_for_send = dialog.clone();
@@ -2058,10 +2537,15 @@ fn present_compose(
     let attachments_send = attachment_paths.clone();
     let forwarded_send = forwarded_attachments.clone();
     let cancel_send = cancelled.clone();
+    let reply_context_for_send = replying_to.clone();
+    let title_for_send = title.clone();
+    let send_started = Rc::new(Cell::new(false));
     send.connect_clicked(move |_| {
+        if send_started.replace(true) {
+            return;
+        }
         cancel_send.store(false, Ordering::Relaxed);
         let cancelled = cancel_send.clone();
-        busy_send(true);
         let editing = editing_for_send.clone();
         let (plain_body, html_body) =
             compose_body_content(&body_send, &content_for_send, html_for_send.as_deref());
@@ -2080,34 +2564,65 @@ fn present_compose(
         let widgets = widgets_for_send.clone();
         let dialog = dialog_for_send.clone();
         let account_email = account_for_send.clone();
-        let set_busy = busy_send.clone();
+        let reply_context = reply_context_for_send.clone();
+        let compose_title = title_for_send.clone();
+        let sending_toast = adw::Toast::new("Sending…");
+        sending_toast.set_timeout(0);
+        sending_toast.set_priority(adw::ToastPriority::High);
+        widgets.sidebar_toast.add_toast(sending_toast.clone());
+        dialog.close();
         glib::MainContext::default().spawn_local(async move {
             let target = editing
                 .as_ref()
                 .map(|draft| (draft.id.clone(), draft.message_id.clone()));
+            let send_message = message.clone();
+            let send_account = account_email.clone();
             let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut client = MailClient::for_account(AccountStore::open()?, &account_email)?;
+                let mut client = MailClient::for_account(AccountStore::open()?, &send_account)?;
                 client.set_cancellation(Some(cancelled));
                 if let Some(target) = target {
-                    client.write_existing_draft(&target.0, &target.1, &message, true)?;
+                    client.write_existing_draft(&target.0, &target.1, &send_message, true)?;
                 } else {
-                    client.send(&message)?;
+                    client.send(&send_message)?;
                 }
                 Ok(())
             })
             .await;
-            set_busy(false);
+            sending_toast.dismiss();
             match result {
                 Ok(Ok(())) => {
-                    dialog.close();
-                    show_message(&widgets, "Message sent");
+                    show_sidebar_message(&widgets, "Message sent");
                     refresh_after_draft(&widgets, &editing);
                 }
                 Ok(Err(error)) => {
-                    show_error(&widgets, error);
+                    show_sidebar_message(&widgets, "Send failed");
+                    present_compose_with_title(
+                        &widgets,
+                        account_email,
+                        Some(message),
+                        reply_context,
+                        editing,
+                        Some(&compose_title),
+                    );
+                    show_error(
+                        &widgets,
+                        format!("The message was reopened so you can review it. Delivery may be uncertain; check Sent before retrying.\n\n{error}"),
+                    );
                 }
                 Err(_) => {
-                    show_message(&widgets, "The send task stopped unexpectedly");
+                    show_sidebar_message(&widgets, "Send failed");
+                    present_compose_with_title(
+                        &widgets,
+                        account_email,
+                        Some(message),
+                        reply_context,
+                        editing,
+                        Some(&compose_title),
+                    );
+                    show_error(
+                        &widgets,
+                        "The send task stopped unexpectedly. The message was reopened; check Sent before retrying.",
+                    );
                 }
             }
         });
@@ -2176,6 +2691,25 @@ fn present_compose(
         });
     });
     dialog.present(Some(&parent));
+}
+
+fn compose_dialog_title(
+    editing: bool,
+    replying: bool,
+    initial: bool,
+    title_override: Option<&str>,
+) -> String {
+    title_override
+        .unwrap_or(if editing {
+            "Edit Draft"
+        } else if replying {
+            "Reply"
+        } else if initial {
+            "Forward"
+        } else {
+            "New message"
+        })
+        .to_owned()
 }
 
 fn reply_context(message: &Message) -> gtk::Expander {
@@ -2375,7 +2909,9 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         state.account_names.clear();
         state.account_labels.clear();
         state.current_label = "INBOX".to_owned();
+        state.active_query = None;
     }
+    widgets.search.set_text("");
     for account in accounts {
         widgets.accounts.append(&account.display_name);
         let mut state = state.borrow_mut();
@@ -2384,6 +2920,7 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     }
     {
         let mut state = state.borrow_mut();
+        initialize_account_collapse(&mut state, &widgets.preferences.borrow());
         let accounts = state.account_emails.iter().cloned().collect::<HashSet<_>>();
         state
             .unread_counts
@@ -2409,6 +2946,27 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     }
     rebuild_sidebar(widgets, state);
     refresh_favorite_counts(widgets, state);
+}
+
+fn initialize_account_collapse(state: &mut State, preferences: &UiPreferences) {
+    let accounts = state.account_emails.iter().cloned().collect::<HashSet<_>>();
+    if !state.accounts_loaded {
+        let has_favorites = state.account_emails.iter().any(|email| {
+            preferences.is_favorite(email, "INBOX")
+                || preferences
+                    .favorite_folders
+                    .iter()
+                    .any(|folder| folder.account_email == *email)
+        });
+        if has_favorites {
+            state.collapsed_accounts = accounts;
+        }
+        state.accounts_loaded = true;
+    } else {
+        state
+            .collapsed_accounts
+            .retain(|email| accounts.contains(email));
+    }
 }
 
 fn load_labels(widgets: &Widgets, state: &Rc<RefCell<State>>, email: String) {
@@ -2486,7 +3044,7 @@ fn cancel_active_refresh(widgets: &Widgets, state: &Rc<RefCell<State>>) {
 }
 
 fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
-    let (email, cancelled) = {
+    let (email, cancelled, include_unread) = {
         let mut state = state.borrow_mut();
         if state.inbox_sync_account.is_some()
             || state.mailbox_loading
@@ -2499,10 +3057,14 @@ fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let Some(email) = state.account_emails.get(index).cloned() else {
             return;
         };
+        if state.favorite_refresh_inflight.contains(&email) {
+            return;
+        }
         let cancelled = Arc::new(AtomicBool::new(false));
         state.inbox_sync_account = Some(email.clone());
         state.inbox_sync_cancel = Some(cancelled.clone());
-        (email, cancelled)
+        let include_unread = widgets.preferences.borrow().is_favorite(&email, "INBOX");
+        (email, cancelled, include_unread)
     };
     update_mailbox_spinner(widgets, state);
     let widgets = widgets.clone();
@@ -2512,12 +3074,12 @@ fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let result = gio::spawn_blocking(move || -> anyhow::Result<Vec<Message>> {
             let mut client = MailClient::for_account(AccountStore::open()?, &sync_email)?;
             client.set_cancellation(Some(cancelled.clone()));
-            let page = client.list_threads_with_limit(Some("INBOX"), None, None, 50)?;
+            let (references, _) = list_folder_references(&mut client, "INBOX", include_unread)?;
             let cached = MailCache::open()?.messages(&sync_email, "INBOX")?;
-            let needed = references_to_refresh(&page.threads, &cached, 3);
+            let needed = references_to_refresh(&references, &cached, 3);
             let refreshed =
                 fetch_threads_parallel(&sync_email, needed.clone(), Some(cancelled.clone()))?;
-            let combined = merge_refreshed_threads(cached, &page.threads, &needed, refreshed);
+            let combined = merge_refreshed_threads(cached, &references, &needed, refreshed);
             if cancelled.load(Ordering::Relaxed) {
                 anyhow::bail!("Request cancelled");
             }
@@ -2585,6 +3147,83 @@ fn references_to_refresh(
         .collect()
 }
 
+fn combine_thread_references(recent: Vec<ThreadRef>, unread: Vec<ThreadRef>) -> Vec<ThreadRef> {
+    let mut seen = HashSet::new();
+    recent
+        .into_iter()
+        .chain(unread)
+        .filter(|reference| seen.insert(reference.id.clone()))
+        .collect()
+}
+
+fn list_folder_references(
+    client: &mut MailClient,
+    label: &str,
+    include_unread: bool,
+) -> anyhow::Result<(Vec<ThreadRef>, Vec<ThreadRef>)> {
+    let recent = client
+        .list_threads_with_limit(Some(label), None, None, 50)?
+        .threads;
+    let unread = if include_unread {
+        client
+            .list_threads_with_limit(Some(label), Some("is:unread"), None, 50)?
+            .threads
+    } else {
+        Vec::new()
+    };
+    let references = combine_thread_references(recent, unread.clone());
+    Ok((references, unread))
+}
+
+fn references_to_prefetch(
+    references: &[ThreadRef],
+    unread: &[ThreadRef],
+    cached: &[Message],
+) -> Vec<ThreadRef> {
+    let unread_threads = unread
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<HashSet<_>>();
+    let cached_unread_threads = cached
+        .iter()
+        .filter(|message| message.label_ids.iter().any(|label| label == "UNREAD"))
+        .map(|message| message.thread_id.as_str())
+        .collect::<HashSet<_>>();
+    references
+        .iter()
+        .enumerate()
+        .filter(|(index, reference)| {
+            *index < 10
+                || unread_threads.contains(reference.id.as_str())
+                || cached_unread_threads.contains(reference.id.as_str())
+        })
+        .map(|(_, reference)| reference.clone())
+        .collect()
+}
+
+fn prefetch_favorite_folder(
+    email: &str,
+    label: &str,
+    expected_unread: u32,
+) -> anyhow::Result<Vec<Message>> {
+    let mut client = MailClient::for_account(AccountStore::open()?, email)?;
+    let (references, unread) = list_folder_references(&mut client, label, true)?;
+    let cached = MailCache::open()?.messages(email, label)?;
+    let needed = references_to_prefetch(&references, &unread, &cached);
+    let refreshed = fetch_threads_parallel(email, needed.clone(), None)?;
+    if expected_unread > 0
+        && !refreshed
+            .iter()
+            .any(|message| message.label_ids.iter().any(|label| label == "UNREAD"))
+    {
+        anyhow::bail!("Gmail reported unread mail but returned no unread messages");
+    }
+    let messages = merge_refreshed_threads(cached, &references, &needed, refreshed);
+    AccountStore::open()?.account(email)?;
+    MailCache::open()?.replace_mailbox(email, label, &messages)?;
+    Ok(messages)
+}
+
 fn merge_refreshed_threads(
     mut cached: Vec<Message>,
     references: &[ThreadRef],
@@ -2630,6 +3269,7 @@ fn load_inbox(
         state.load_cancel.store(true, Ordering::Relaxed);
         state.load_cancel = Arc::new(AtomicBool::new(false));
         state.mailbox_loading = true;
+        state.active_query = query.clone();
         (
             state.current_label.clone(),
             state.load_generation,
@@ -2637,6 +3277,8 @@ fn load_inbox(
         )
     };
     update_mailbox_spinner(&widgets, &state);
+    let include_unread =
+        query.is_none() && widgets.preferences.borrow().is_favorite(&email, &label);
     let cached_mailbox = query.is_none().then(|| label.clone());
     glib::MainContext::default().spawn_local(async move {
         let mut showing_cached_messages = false;
@@ -2664,18 +3306,23 @@ fn load_inbox(
         }
 
         let online_email = email.clone();
-        let cache_email = email;
-        let mailbox_to_cache = cached_mailbox;
-        let result = gio::spawn_blocking(move || -> anyhow::Result<Vec<Message>> {
+        let cache_email = email.clone();
+        let mailbox_to_cache = cached_mailbox.clone();
+        let first_page = gio::spawn_blocking(move || -> anyhow::Result<_> {
             let mut client = MailClient::for_account(AccountStore::open()?, &online_email)?;
             client.set_cancellation(Some(cancelled.clone()));
-            let label = (!label.is_empty()).then_some(label.as_str());
-            let page = client.list_threads(label, query.as_deref(), None)?;
-            let needed = references_to_refresh(&page.threads, &cached_messages, 3);
+            let references = if let Some(query) = query.as_deref() {
+                client
+                    .list_threads(Some(&label), Some(query), None)?
+                    .threads
+            } else {
+                list_folder_references(&mut client, &label, include_unread)?.0
+            };
+            let needed = references_to_refresh(&references, &cached_messages, 3);
+            let (first, remaining) = split_refresh_batch(needed, 10);
             let refreshed =
-                fetch_threads_parallel(&online_email, needed.clone(), Some(cancelled.clone()))?;
-            let messages =
-                merge_refreshed_threads(cached_messages, &page.threads, &needed, refreshed);
+                fetch_threads_parallel(&online_email, first.clone(), Some(cancelled.clone()))?;
+            let messages = merge_refreshed_threads(cached_messages, &references, &first, refreshed);
             if let Some(mailbox) = mailbox_to_cache {
                 if cancelled.load(Ordering::Relaxed) {
                     anyhow::bail!("Request cancelled");
@@ -2683,7 +3330,70 @@ fn load_inbox(
                 AccountStore::open()?.account(&online_email)?;
                 MailCache::open()?.replace_mailbox(&cache_email, &mailbox, &messages)?;
             }
-            Ok(messages)
+            Ok((messages, references, remaining))
+        })
+        .await;
+        if state.borrow().load_generation != generation {
+            return;
+        }
+        let (messages, references, remaining) = match first_page {
+            Ok(Ok(page)) => page,
+            Ok(Err(error)) if showing_cached_messages => {
+                state.borrow_mut().mailbox_loading = false;
+                update_mailbox_spinner(&widgets, &state);
+                show_message(
+                    &widgets,
+                    &format!("Showing cached mail; refresh failed: {error}"),
+                );
+                return;
+            }
+            Ok(Err(error)) => {
+                state.borrow_mut().mailbox_loading = false;
+                update_mailbox_spinner(&widgets, &state);
+                clear_list(&widgets.messages);
+                add_status_row(&widgets.messages, "Could not load mail", &error.to_string());
+                show_error(&widgets, error);
+                return;
+            }
+            Err(_) => {
+                state.borrow_mut().mailbox_loading = false;
+                update_mailbox_spinner(&widgets, &state);
+                show_message(&widgets, "The inbox task stopped unexpectedly");
+                return;
+            }
+        };
+        show_loaded_mailbox(
+            &widgets,
+            &state,
+            messages.clone(),
+            select_first,
+            showing_cached_messages,
+        );
+        if remaining.is_empty() {
+            state.borrow_mut().mailbox_loading = false;
+            update_mailbox_spinner(&widgets, &state);
+            return;
+        }
+
+        let more_email = email.clone();
+        let more_cache_email = email;
+        let more_mailbox_to_cache = cached_mailbox;
+        let more_cancelled = state.borrow().load_cancel.clone();
+        let more = gio::spawn_blocking(move || -> anyhow::Result<Vec<Message>> {
+            let refreshed = fetch_threads_parallel(
+                &more_email,
+                remaining.clone(),
+                Some(more_cancelled.clone()),
+            )?;
+            let combined = merge_refreshed_threads(messages, &references, &remaining, refreshed);
+            if let Some(mailbox) = more_mailbox_to_cache {
+                if more_cancelled.load(Ordering::Relaxed) {
+                    anyhow::bail!("Request cancelled");
+                }
+                AccountStore::open()?.account(&more_email)?;
+                MailCache::open()?.replace_mailbox(&more_cache_email, &mailbox, &combined)?;
+            }
+            Ok(combined)
         })
         .await;
         if state.borrow().load_generation != generation {
@@ -2691,39 +3401,66 @@ fn load_inbox(
         }
         state.borrow_mut().mailbox_loading = false;
         update_mailbox_spinner(&widgets, &state);
-        match result {
-            Ok(Ok(messages))
-                if should_display_loaded_messages(
-                    showing_cached_messages,
-                    mailbox_changed(&state, &messages),
-                ) =>
-            {
-                display_messages(&widgets, &state, messages);
-                if select_first {
-                    select_first_conversation(&widgets);
-                } else {
-                    clear_reader_view(&widgets, &state);
-                }
-            }
-            Ok(Ok(_)) => {
-                if select_first && widgets.messages.selected_row().is_none() {
-                    select_first_conversation(&widgets);
-                }
-            }
-            Ok(Err(error)) if showing_cached_messages => {
-                show_message(
-                    &widgets,
-                    &format!("Showing cached mail; refresh failed: {error}"),
-                );
-            }
-            Ok(Err(error)) => {
-                clear_list(&widgets.messages);
-                add_status_row(&widgets.messages, "Could not load mail", &error.to_string());
-                show_error(&widgets, error);
-            }
-            Err(_) => show_message(&widgets, "The inbox task stopped unexpectedly"),
+        match more {
+            Ok(Ok(messages)) => show_loaded_mailbox(&widgets, &state, messages, select_first, true),
+            Ok(Err(error)) => show_message(
+                &widgets,
+                &format!("More conversations could not be loaded: {error}"),
+            ),
+            Err(_) => show_message(&widgets, "The conversation load stopped unexpectedly"),
         }
     });
+}
+
+fn split_refresh_batch(
+    references: Vec<ThreadRef>,
+    first_count: usize,
+) -> (Vec<ThreadRef>, Vec<ThreadRef>) {
+    let mut remaining = references;
+    let first = remaining
+        .drain(..remaining.len().min(first_count))
+        .collect();
+    (first, remaining)
+}
+
+fn show_loaded_mailbox(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    messages: Vec<Message>,
+    select_first: bool,
+    showing_messages: bool,
+) {
+    if !should_display_loaded_messages(showing_messages, mailbox_changed(state, &messages)) {
+        if select_first && widgets.messages.selected_row().is_none() {
+            select_first_conversation(widgets);
+        }
+        return;
+    }
+    let selected_thread = state
+        .borrow()
+        .selected
+        .as_ref()
+        .map(|message| message.thread_id.clone());
+    display_messages(widgets, state, messages);
+    let selected_index = selected_thread.and_then(|thread_id| {
+        state
+            .borrow()
+            .conversations
+            .iter()
+            .position(|conversation| {
+                conversation
+                    .first()
+                    .is_some_and(|message| message.thread_id == thread_id)
+            })
+    });
+    if let Some(row) = selected_index.and_then(|index| widgets.messages.row_at_index(index as i32))
+    {
+        widgets.messages.select_row(Some(&row));
+    } else if select_first {
+        select_first_conversation(widgets);
+    } else {
+        clear_reader_view(widgets, state);
+    }
 }
 
 fn should_display_loaded_messages(showing_cached_messages: bool, mailbox_changed: bool) -> bool {
@@ -2867,17 +3604,18 @@ fn update_conversation_row(widgets: &Widgets, state: &Rc<RefCell<State>>, thread
     let has_draft = conversation
         .iter()
         .any(|message| message.label_ids.contains(&"DRAFT".to_owned()));
+    let unread = conversation
+        .iter()
+        .any(|message| message.label_ids.contains(&"UNREAD".to_owned()));
     row.set_child(Some(&conversation_row_content(
         message,
         conversation.len(),
         starred,
         has_draft,
+        unread,
     )));
     row.remove_css_class("accent");
-    if conversation
-        .iter()
-        .any(|message| message.label_ids.contains(&"UNREAD".to_owned()))
-    {
+    if unread {
         row.add_css_class("accent");
     }
 }
@@ -2984,11 +3722,11 @@ fn display_messages(widgets: &Widgets, state: &Rc<RefCell<State>>, messages: Vec
         let has_draft = conversation
             .iter()
             .any(|message| message.label_ids.iter().any(|label| label == "DRAFT"));
-        let row = conversation_list_row(message, conversation.len(), starred, has_draft);
-        if conversation
+        let unread = conversation
             .iter()
-            .any(|message| message.label_ids.iter().any(|label| label == "UNREAD"))
-        {
+            .any(|message| message.label_ids.iter().any(|label| label == "UNREAD"));
+        let row = conversation_list_row(message, conversation.len(), starred, has_draft, unread);
+        if unread {
             row.add_css_class("accent");
         }
         widgets.messages.append(&row);
@@ -3009,12 +3747,13 @@ fn conversation_list_row(
     count: usize,
     starred: bool,
     has_draft: bool,
+    unread: bool,
 ) -> gtk::ListBoxRow {
     gtk::ListBoxRow::builder()
         .activatable(true)
         .selectable(true)
         .child(&conversation_row_content(
-            message, count, starred, has_draft,
+            message, count, starred, has_draft, unread,
         ))
         .build()
 }
@@ -3024,6 +3763,7 @@ fn conversation_row_content(
     count: usize,
     starred: bool,
     has_draft: bool,
+    unread: bool,
 ) -> gtk::Box {
     let sender = gtk::Label::builder()
         .label(if count > 1 {
@@ -3042,6 +3782,14 @@ fn conversation_row_content(
         .css_classes(["caption", "dim-label"])
         .build();
     let heading = gtk::Box::new(Orientation::Horizontal, 8);
+    if unread {
+        heading.append(
+            &gtk::Label::builder()
+                .label("●")
+                .css_classes(["postbird-unread-dot"])
+                .build(),
+        );
+    }
     heading.append(&sender);
     if has_draft {
         heading.append(&draft_indicator());
@@ -3056,6 +3804,7 @@ fn conversation_row_content(
         .halign(Align::Start)
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["postbird-row-subject"])
         .build();
     let preview = gtk::Label::builder()
         .label(message_preview(&message.snippet))
@@ -3158,11 +3907,18 @@ fn append_address_line(lines: &mut Vec<String>, label: &str, value: &str) {
     }
 }
 
-fn recipient_details(message: &Message) -> Option<gtk::Label> {
+fn message_header_lines(message: &Message) -> Vec<String> {
     let mut lines = Vec::new();
+    append_address_line(&mut lines, "From", message.header("From"));
+    append_address_line(&mut lines, "Reply-To", message.header("Reply-To"));
     append_address_line(&mut lines, "To", message.header("To"));
     append_address_line(&mut lines, "Cc", message.header("Cc"));
     append_address_line(&mut lines, "Bcc", message.header("Bcc"));
+    lines
+}
+
+fn message_header_details(message: &Message) -> Option<gtk::Label> {
+    let lines = message_header_lines(message);
     if lines.is_empty() {
         return None;
     }
@@ -3382,6 +4138,7 @@ fn display_conversation(
         let is_latest = index + 1 == conversation.len();
         let heading = gtk::Label::builder()
             .label(sender_name(message.header("From")))
+            .tooltip_text(message.header("From"))
             .halign(Align::Start)
             .xalign(0.0)
             .hexpand(true)
@@ -3433,15 +4190,15 @@ fn display_conversation(
             .css_classes(["dim-label"])
             .build();
         let heading_row = gtk::Box::new(Orientation::Horizontal, 12);
-        let header_details = gtk::Box::new(Orientation::Vertical, 6);
+        let header_details = gtk::Box::new(Orientation::Vertical, 2);
         header_details.set_hexpand(true);
         header_details.set_valign(Align::Center);
         header_details.append(&heading_line);
         header_details.append(&preview);
-        let recipients = recipient_details(message);
-        if let Some(recipients) = &recipients {
-            recipients.set_visible(is_latest);
-            header_details.append(recipients);
+        let full_headers = message_header_details(message);
+        if let Some(full_headers) = &full_headers {
+            full_headers.set_visible(is_latest);
+            header_details.append(full_headers);
         }
         heading_row.append(&header_details);
         if message.label_ids.iter().any(|label| label == "DRAFT") {
@@ -3464,11 +4221,11 @@ fn display_conversation(
             .expanded(is_latest)
             .build();
         let preview_for_expander = preview.clone();
-        let recipients_for_expander = recipients.clone();
+        let headers_for_expander = full_headers.clone();
         expander.connect_expanded_notify(move |expander| {
             preview_for_expander.set_visible(!expander.is_expanded());
-            if let Some(recipients) = &recipients_for_expander {
-                recipients.set_visible(expander.is_expanded());
+            if let Some(headers) = &headers_for_expander {
+                headers.set_visible(expander.is_expanded());
             }
         });
         preview.set_visible(!is_latest);
@@ -3827,6 +4584,11 @@ fn show_error(widgets: &Widgets, error: impl std::fmt::Display) {
 fn show_message(widgets: &Widgets, message: &str) {
     widgets.toast.add_toast(adw::Toast::new(message));
 }
+fn show_sidebar_message(widgets: &Widgets, message: &str) {
+    let toast = adw::Toast::new(message);
+    toast.set_priority(adw::ToastPriority::High);
+    widgets.sidebar_toast.add_toast(toast);
+}
 fn detail_label(text: &str, css_class: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
@@ -3857,6 +4619,163 @@ fn entry(placeholder: &str) -> gtk::Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accounts_start_collapsed_only_when_favorites_exist() {
+        let mut state = State {
+            account_emails: vec!["one@example.com".into(), "two@example.com".into()],
+            ..State::default()
+        };
+        let mut preferences = UiPreferences::default();
+
+        initialize_account_collapse(&mut state, &preferences);
+        assert_eq!(state.collapsed_accounts.len(), 2);
+
+        state.collapsed_accounts.remove("one@example.com");
+        initialize_account_collapse(&mut state, &preferences);
+        assert!(!state.collapsed_accounts.contains("one@example.com"));
+        assert!(state.collapsed_accounts.contains("two@example.com"));
+
+        let mut no_favorites = State {
+            account_emails: state.account_emails.clone(),
+            ..State::default()
+        };
+        preferences.toggle_favorite("one@example.com", "INBOX");
+        preferences.toggle_favorite("two@example.com", "INBOX");
+        initialize_account_collapse(&mut no_favorites, &preferences);
+        assert!(no_favorites.collapsed_accounts.is_empty());
+
+        let mut custom_favorite = State {
+            account_emails: state.account_emails.clone(),
+            ..State::default()
+        };
+        preferences.toggle_favorite("one@example.com", "Projects");
+        initialize_account_collapse(&mut custom_favorite, &preferences);
+        assert_eq!(custom_favorite.collapsed_accounts.len(), 2);
+    }
+
+    #[test]
+    fn clearing_an_applied_search_restores_the_folder_view() {
+        assert!(search_clear_needs_reload(Some("is:unread"), ""));
+        assert!(search_clear_needs_reload(Some("from:friend"), ""));
+        assert!(!search_clear_needs_reload(None, ""));
+        assert!(!search_clear_needs_reload(Some("is:unread"), "new query"));
+    }
+
+    #[test]
+    fn first_mail_batch_is_small_and_leaves_the_rest_to_load() {
+        let references = (0..25)
+            .map(|index| ThreadRef {
+                id: index.to_string(),
+            })
+            .collect();
+        let (first, remaining) = split_refresh_batch(references, 10);
+        assert_eq!(first.len(), 10);
+        assert_eq!(first[0].id, "0");
+        assert_eq!(remaining.len(), 15);
+        assert_eq!(remaining[0].id, "10");
+    }
+
+    #[test]
+    fn favorite_prefetch_includes_unread_threads_outside_the_recent_page() {
+        let recent = (0..50)
+            .map(|index| ThreadRef {
+                id: format!("recent-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let unread = vec![ThreadRef {
+            id: "old-unread".into(),
+        }];
+        let references = combine_thread_references(recent, unread.clone());
+        assert_eq!(references.len(), 51);
+        assert_eq!(references.last().unwrap().id, "old-unread");
+        let needed = references_to_prefetch(&references, &unread, &[]);
+        assert_eq!(needed.len(), 11);
+        assert!(needed.iter().any(|reference| reference.id == "old-unread"));
+        let old_unread_message = message("old-message", "old-unread", 1);
+        let merged = merge_refreshed_threads(vec![old_unread_message], &references, &[], vec![]);
+        assert_eq!(merged[0].thread_id, "old-unread");
+
+        let mut previously_unread = message("cached", "recent-40", 42);
+        previously_unread.label_ids.push("UNREAD".into());
+        let needed = references_to_prefetch(&references, &[], &[previously_unread]);
+        assert!(needed.iter().any(|reference| reference.id == "recent-40"));
+    }
+
+    #[test]
+    fn opening_unread_conversation_updates_favorite_counts_immediately() {
+        let mut first = message("one", "thread", 1);
+        first.label_ids = vec!["UNREAD".into(), "INBOX".into()];
+        let mut second = message("two", "thread", 2);
+        second.label_ids = vec!["UNREAD".into(), "INBOX".into()];
+        let mut state = State::default();
+        state
+            .unread_counts
+            .insert(("reader@example.com".into(), "INBOX".into()), 3);
+        state
+            .unread_counts
+            .insert(("reader@example.com".into(), "Projects".into()), 2);
+        let applied = decrease_unread_counts(
+            &mut state,
+            "reader@example.com",
+            &[first, second],
+            "Projects",
+        );
+        assert_eq!(applied.get("INBOX"), Some(&2));
+        assert_eq!(applied.get("Projects"), Some(&2));
+        assert_eq!(
+            state
+                .unread_counts
+                .get(&("reader@example.com".into(), "INBOX".into())),
+            Some(&1)
+        );
+        assert!(
+            !state
+                .unread_counts
+                .contains_key(&("reader@example.com".into(), "Projects".into()))
+        );
+
+        let mut sent = message("sent", "thread", 3);
+        sent.label_ids = vec!["UNREAD".into(), "SENT".into()];
+        assert!(!unread_count_deltas(&[sent], "INBOX").contains_key("INBOX"));
+    }
+
+    #[test]
+    fn expanded_headers_reveal_full_sender_and_reply_to_addresses() {
+        let message: Message = serde_json::from_value(json!({
+            "id": "message",
+            "threadId": "thread",
+            "payload": {"headers": [
+                {"name": "From", "value": "Trusted Name <unknown@example.org>"},
+                {"name": "Reply-To", "value": "elsewhere@example.net"},
+                {"name": "To", "value": "reader@example.com"}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(
+            message_header_lines(&message),
+            [
+                "From: Trusted Name <unknown@example.org>",
+                "Reply-To: elsewhere@example.net",
+                "To: reader@example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn reopened_send_keeps_its_original_compose_title() {
+        assert_eq!(
+            compose_dialog_title(false, false, false, None),
+            "New message"
+        );
+        assert_eq!(compose_dialog_title(false, true, true, None), "Reply");
+        assert_eq!(compose_dialog_title(false, false, true, None), "Forward");
+        assert_eq!(compose_dialog_title(true, false, true, None), "Edit Draft");
+        assert_eq!(
+            compose_dialog_title(false, false, true, Some("New message")),
+            "New message"
+        );
+    }
 
     #[test]
     #[ignore = "requires a graphical session; tests the conversation viewport configuration"]
