@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use rusqlite::{Connection, TransactionBehavior, params};
 
-const CACHE_SCHEMA_VERSION: i64 = 1;
+const CACHE_SCHEMA_VERSION: i64 = 2;
 static CACHE_SCHEMA_LOCK: Mutex<()> = Mutex::new(());
 
 use crate::gmail::Message;
@@ -71,6 +71,13 @@ impl MailCache {
                  data BLOB NOT NULL,
                  PRIMARY KEY(account, message_id, part_id)
              );
+             CREATE TABLE IF NOT EXISTS contacts (
+                 account TEXT NOT NULL,
+                 email TEXT NOT NULL,
+                 name TEXT NOT NULL,
+                 last_seen INTEGER NOT NULL,
+                 PRIMARY KEY(account, email)
+             );
              CREATE TABLE IF NOT EXISTS imap_backoff (
                  account TEXT PRIMARY KEY,
                  retry_at INTEGER NOT NULL
@@ -127,8 +134,72 @@ impl MailCache {
                 ])?;
             }
         }
+        if mailbox == "INBOX" {
+            Self::index_contacts(&transaction, account, messages)?;
+        }
         transaction.commit()?;
         Ok(())
+    }
+
+    fn index_contacts(connection: &Connection, account: &str, messages: &[Message]) -> Result<()> {
+        let mut insert = connection.prepare(
+            "INSERT INTO contacts(account, email, name, last_seen) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account, email) DO UPDATE SET
+             name = CASE WHEN excluded.name != '' AND (contacts.name = '' OR excluded.last_seen >= contacts.last_seen)
+                         THEN excluded.name ELSE contacts.name END,
+             last_seen = MAX(contacts.last_seen, excluded.last_seen)",
+        )?;
+        for message in messages {
+            for contact in crate::contacts::from_message(message) {
+                if contact.email.eq_ignore_ascii_case(account) {
+                    continue;
+                }
+                insert.execute(params![
+                    account,
+                    contact.email,
+                    contact.name,
+                    message.internal_date.parse::<i64>().unwrap_or_default()
+                ])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn index_cached_contacts(&mut self, account: &str) -> Result<()> {
+        // Run on a worker: existing mail is indexed even before the next sync.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Keep the read and write atomic with account removal, so a delayed
+        // backfill cannot recreate contacts for an account just removed.
+        let messages = {
+            let mut statement = transaction.prepare(
+                "SELECT message_json FROM mailbox_messages WHERE account = ?1 AND mailbox = 'INBOX'",
+            )?;
+            let rows = statement
+                .query_map([account], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.iter()
+                .map(|json| serde_json::from_str(json))
+                .collect::<serde_json::Result<Vec<Message>>>()?
+        };
+        Self::index_contacts(&transaction, account, &messages)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn contacts(&self, account: &str) -> Result<Vec<crate::contacts::Contact>> {
+        let mut statement = self.connection.prepare(
+            "SELECT email, name FROM contacts WHERE account = ?1 ORDER BY last_seen DESC, email",
+        )?;
+        Ok(statement
+            .query_map([account], |row| {
+                Ok(crate::contacts::Contact {
+                    email: row.get(0)?,
+                    name: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn messages(&self, account: &str, mailbox: &str) -> Result<Vec<Message>> {
@@ -312,6 +383,7 @@ impl MailCache {
         transaction.execute("DELETE FROM mailbox_messages WHERE account = ?1", [account])?;
         transaction.execute("DELETE FROM message_images WHERE account = ?1", [account])?;
         transaction.execute("DELETE FROM imap_backoff WHERE account = ?1", [account])?;
+        transaction.execute("DELETE FROM contacts WHERE account = ?1", [account])?;
         transaction.commit()?;
         Ok(())
     }
@@ -321,6 +393,59 @@ impl MailCache {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn contacts_are_deduplicated_persisted_and_scoped_to_accounts() {
+        let path = std::env::temp_dir().join(format!(
+            "postbird-contacts-{}.db",
+            gtk::glib::uuid_string_random()
+        ));
+        let mut message = test_message();
+        message.payload.headers = serde_json::from_value(json!([
+            {"name":"From", "value":"\"Doe, Jane\" <Jane@example.com>"},
+            {"name":"Reply-To", "value":"Jane@example.com"},
+            {"name":"To", "value":"owner@example.com, Bob <bob@example.com>"},
+            {"name":"Cc", "value":"jane@example.com"},
+            {"name":"Bcc", "value":"private@example.com"}
+        ]))
+        .unwrap();
+        {
+            let mut cache = MailCache::at(&path).unwrap();
+            cache
+                .replace_mailbox("owner@example.com", "INBOX", &[message.clone()])
+                .unwrap();
+            cache
+                .replace_mailbox("owner@example.com", "INBOX", &[message.clone()])
+                .unwrap();
+            let contacts = cache.contacts("owner@example.com").unwrap();
+            assert_eq!(contacts.len(), 2);
+            assert!(
+                contacts
+                    .iter()
+                    .any(|c| c.email == "jane@example.com" && c.name == "Doe, Jane")
+            );
+            assert!(cache.contacts("other@example.com").unwrap().is_empty());
+            // A newer bare address does not erase the useful display name.
+            message.internal_date = "100".into();
+            message.payload.headers.retain(|h| h.name == "Cc");
+            cache
+                .replace_mailbox("owner@example.com", "INBOX", &[message])
+                .unwrap();
+            assert!(
+                cache
+                    .contacts("owner@example.com")
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.name == "Doe, Jane")
+            );
+        }
+        let mut cache = MailCache::at(&path).unwrap();
+        assert_eq!(cache.contacts("owner@example.com").unwrap().len(), 2);
+        cache.remove_account("owner@example.com").unwrap();
+        assert!(cache.contacts("owner@example.com").unwrap().is_empty());
+        drop(cache);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn opening_an_initialized_cache_does_not_need_the_write_lock() {

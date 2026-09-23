@@ -492,6 +492,10 @@ impl ImapClient {
         self.call("draft_for_message", json!({"id": message_id}))
     }
 
+    pub fn delete_draft(&mut self, message_id: &str) -> Result<()> {
+        self.call("delete_draft", json!({"id": message_id}))
+    }
+
     pub fn write_existing_draft(
         &mut self,
         id: &str,

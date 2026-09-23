@@ -1,11 +1,12 @@
 mod accounts;
 mod cache;
 mod compose;
-mod compose_history;
+mod contacts;
 mod gmail;
 mod mail;
 mod mailbox_sync;
 mod preferences;
+mod rich_editor;
 mod theme;
 mod ui;
 

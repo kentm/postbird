@@ -18,7 +18,8 @@ on your computer apart from requests to Google.
 - Read, archive, star, mark unread, and trash messages
 - Compose, reply, save drafts, and send messages
 - Per-account sending aliases, selectable in the compose From field
-- Always-light message editor with formatting, file attachments, and pasted inline images
+- Larger WYSIWYG message editor with HTML replies/forwards, formatting, file attachments, and pasted inline images
+- Local, per-account recipient suggestions matching names or email addresses
 
 ## Gmail app-password setup
 
@@ -78,6 +79,20 @@ read. Small conversation refreshes share one connection, and recent/unread
 folder listings share a connection. Unread-count checks avoid downloading the
 visible folder again while it is already syncing, and successful mark-as-read
 operations use their local count adjustments without an immediate extra check.
+
+## Composing messages
+
+Replies include the previous message as an editable quotation. Replies, forwards,
+and reopened drafts retain HTML formatting, tables, links, and embedded images.
+The toolbar supports emphasis, lists, undo, and redo; paste accepts formatted text
+and screenshots. Remote images are blocked in the editor, while their URLs remain
+in the outgoing HTML.
+
+Postbird indexes names and addresses from From, Reply-To, To, and Cc headers in
+locally synced Inbox messages on background workers. Existing cached messages are
+indexed at startup, and Inbox sync updates the index. Type a name or email address
+in To, Cc, or Bcc to select a suggestion. Contacts remain local, are separate for
+each account, and are removed when that account is removed from Postbird.
 
 ## Sending aliases
 

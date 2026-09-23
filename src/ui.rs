@@ -22,7 +22,7 @@ use webkit6::prelude::*;
 use crate::{
     accounts::{Account, AccountKind, AccountStore},
     cache::MailCache,
-    compose::{AttachmentList, InlineImages},
+    compose::AttachmentList,
     gmail::{ComposeMessage, ForwardedAttachment, Message, Payload, ThreadRef},
     mail::{ImapClient, InboxWatch, IncomingMail, MailClient, MailCursor, WatchEvent},
     mailbox_sync::{MailboxSync, RECHECK_AFTER, Revision},
@@ -358,7 +358,7 @@ fn new_conversation_scroll(body: &gtk::Box) -> gtk::ScrolledWindow {
         .build()
 }
 
-fn install_visual_style() {
+pub(crate) fn install_visual_style() {
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
@@ -374,6 +374,7 @@ fn install_visual_style() {
          .postbird-sidebar scrolledwindow, .postbird-sidebar viewport {
              background: #202633; }
          .postbird-sidebar label, .postbird-sidebar image { color: #eff3fb; }
+         .postbird-sidebar .postbird-sidebar-name { font-weight: 400; }
          .postbird-sidebar .dim-label, .postbird-sidebar-heading { color: #aeb8c9; }
          .postbird-sidebar-heading { margin: 4px 4px 1px; letter-spacing: 0.08em; }
          .postbird-sidebar spinner { color: #aeb8c9; }
@@ -449,7 +450,16 @@ fn install_visual_style() {
          .postbird-compose textview text selection, .postbird-compose entry selection {
              background: #315c9e; color: #ffffff;
          }
-         .postbird-compose .dim-label { color: #626975; }",
+         .postbird-compose .dim-label { color: #626975; }
+         .postbird-contact-popup { background: transparent; color: #181b20; }
+         .postbird-contact-popup > contents { background: #ffffff; color: #181b20;
+             padding: 6px; border: 1px solid #d9dde4; border-radius: 10px; }
+         .postbird-contact-list { background: #ffffff; color: #181b20; }
+         .postbird-contact-list row { padding: 8px 10px; border-radius: 6px; color: #181b20; }
+         .postbird-contact-list row:hover { background: #f2f4f7; }
+         .postbird-contact-list row:selected { background: #e2ebfa; color: #181b20; }
+         .postbird-contact-list label { color: #181b20; }
+         .postbird-contact-list .postbird-contact-email { color: #515b6b; font-size: 0.9em; }",
     );
     gtk::style_context_add_provider_for_display(
         &display,
@@ -807,6 +817,7 @@ fn sidebar_folder_row(
             .label(&text)
             .xalign(0.0)
             .hexpand(true)
+            .css_classes(["postbird-sidebar-name"])
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build(),
     );
@@ -1153,7 +1164,7 @@ fn rebuild_sidebar(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             .label(&name)
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["heading"])
+            .css_classes(["postbird-sidebar-name"])
             .build();
         let parent = gtk::Expander::builder()
             .label_widget(&account_label)
@@ -2844,7 +2855,7 @@ fn connect_reply_button(
 ) {
     let widgets = widgets.clone();
     let state = state.clone();
-    button.clone().connect_clicked(move |_| {
+    button.clone().connect_clicked(move |button| {
         let index = widgets.account_picker.selected() as usize;
         let Some(email) = state.borrow().account_emails.get(index).cloned() else {
             return;
@@ -2859,7 +2870,7 @@ fn connect_reply_button(
             .cloned()
             .unwrap_or_default();
         let reply = reply_message(&original, &email, &aliases, reply_all);
-        present_compose(&widgets, email, Some(reply), Some(original), None);
+        present_response(&widgets, email, original, reply, true, button);
     });
 }
 
@@ -2885,13 +2896,44 @@ fn reply_message(
         } else {
             format!("Re: {subject}")
         },
-        body: String::new(),
-        html_body: None,
+        body: format!(
+            "\n\n{}\n{}",
+            reply_attribution(original),
+            original
+                .body_text()
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        html_body: Some(format!(
+            "<div><br></div><div><br></div><div>{}</div><blockquote>{}</blockquote>",
+            glib::markup_escape_text(&reply_attribution(original)),
+            quoted_html(original)
+        )),
         in_reply_to: Some(original.header("Message-ID").to_owned()),
         thread_id: Some(original.thread_id.clone()),
         attachments: Vec::new(),
         forwarded_attachments: Vec::new(),
     }
+}
+
+fn reply_attribution(original: &Message) -> String {
+    if original.header("Date").is_empty() {
+        format!("{} wrote:", original.header("From"))
+    } else {
+        format!(
+            "On {}, {} wrote:",
+            original.header("Date"),
+            original.header("From")
+        )
+    }
+}
+
+fn quoted_html(original: &Message) -> String {
+    original
+        .body_html()
+        .unwrap_or_else(|| crate::rich_editor::plain_html(&original.body_text()))
 }
 
 fn forward_message(original: &Message) -> ComposeMessage {
@@ -2919,7 +2961,22 @@ fn forward_message(original: &Message) -> ComposeMessage {
             },
             original.body_text()
         ),
-        html_body: None,
+        html_body: Some(format!(
+            "<div><br></div><div><br></div>{}<br>{}",
+            crate::rich_editor::plain_html(&format!(
+                "---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}{}",
+                original.header("From"),
+                original.header("Date"),
+                subject,
+                original.header("To"),
+                if original.header("Cc").is_empty() {
+                    String::new()
+                } else {
+                    format!("\nCc: {}", original.header("Cc"))
+                }
+            )),
+            quoted_html(original)
+        )),
         in_reply_to: None,
         thread_id: None,
         attachments: Vec::new(),
@@ -2947,18 +3004,35 @@ fn connect_forward(widgets: &Widgets, state: &Rc<RefCell<State>>) {
 }
 
 fn present_forward(widgets: &Widgets, email: String, original: Message, button: &gtk::Button) {
+    let forward = forward_message(&original);
+    present_response(widgets, email, original, forward, false, button);
+}
+
+fn present_response(
+    widgets: &Widgets,
+    email: String,
+    original: Message,
+    mut response: ComposeMessage,
+    replying: bool,
+    button: &gtk::Button,
+) {
     let widgets = widgets.clone();
     let button = button.clone();
     button.set_sensitive(false);
-    if !original.attachments().is_empty() {
-        show_message(&widgets, "Preparing forwarded attachments…");
-    }
     glib::MainContext::default().spawn_local(async move {
         let source_email = email.clone();
+        let source = original.clone();
         let result = gio::spawn_blocking(move || -> anyhow::Result<ComposeMessage> {
-            let mut forward = forward_message(&original);
             let mut client = None;
-            for part in original.attachments() {
+            for part in source.attachments() {
+                let content_id = part
+                    .headers
+                    .iter()
+                    .find(|header| header.name.eq_ignore_ascii_case("Content-ID"))
+                    .map(|header| header.value.trim().trim_matches(['<', '>']).to_owned());
+                if replying && (content_id.is_none() || !part.mime_type.starts_with("image/")) {
+                    continue;
+                }
                 let data = if let Some(data) = &part.body.data {
                     crate::gmail::decode_attachment_data(data)?
                 } else {
@@ -2971,25 +3045,31 @@ fn present_forward(widgets: &Widgets, email: String, original: Message, button: 
                     client
                         .as_mut()
                         .unwrap()
-                        .attachment(&original.id, &part.body)?
+                        .attachment(&source.id, &part.body)?
                 };
-                forward.forwarded_attachments.push(ForwardedAttachment {
-                    content_id: None,
+                response.forwarded_attachments.push(ForwardedAttachment {
+                    content_id,
                     filename: attachment_filename(part),
                     mime_type: part.mime_type.clone(),
                     data: data.into(),
                 });
             }
-            Ok(forward)
+            Ok(response)
         })
         .await;
         button.set_sensitive(true);
         match result {
-            Ok(Ok(forward)) => present_compose(&widgets, email, Some(forward), None, None),
+            Ok(Ok(response)) => present_compose(
+                &widgets,
+                email,
+                Some(response),
+                replying.then_some(original),
+                None,
+            ),
             Ok(Err(error)) => {
-                show_message(&widgets, &format!("Could not prepare forward: {error}"))
+                show_message(&widgets, &format!("Could not prepare message: {error}"))
             }
-            Err(_) => show_message(&widgets, "The forward preparation stopped unexpectedly"),
+            Err(_) => show_message(&widgets, "Message preparation stopped unexpectedly"),
         }
     });
 }
@@ -3142,17 +3222,11 @@ fn draft_compose_message(message: &Message) -> anyhow::Result<ComposeMessage> {
 fn edit_draft(
     widgets: &Widgets,
     state: &Rc<RefCell<State>>,
+    email: &str,
     message: &Message,
     button: &gtk::Button,
 ) {
-    let Some(email) = state
-        .borrow()
-        .account_emails
-        .get(widgets.account_picker.selected() as usize)
-        .cloned()
-    else {
-        return;
-    };
+    let email = email.to_owned();
     let widgets = widgets.clone();
     let state = state.clone();
     let message_id = message.id.clone();
@@ -3269,8 +3343,8 @@ fn present_compose_with_title(
     );
     let dialog = adw::Dialog::builder()
         .title(&title)
-        .content_width(900)
-        .content_height(720)
+        .content_width(1120)
+        .content_height(860)
         .build();
     dialog.add_css_class("postbird-compose");
     let toolbar = adw::ToolbarView::new();
@@ -3323,26 +3397,17 @@ fn present_compose_with_title(
     let cc = entry("Cc");
     let bcc = entry("Bcc");
     let subject = entry("Subject");
-    let body = crate::compose_history::editor();
-    body.set_vexpand(true);
-    body.set_wrap_mode(gtk::WrapMode::WordChar);
-    body.set_top_margin(12);
-    body.set_bottom_margin(12);
-    body.set_left_margin(12);
-    body.set_right_margin(12);
-    let formatting = rich_text_toolbar(&body);
-    let inline_images = InlineImages::default();
-    let restored_images = if let Some(initial) = &initial {
+    let recipient_fields =
+        crate::contacts::install(&[to.clone(), cc.clone(), bcc.clone()], &account_email);
+    let body = crate::rich_editor::RichEditor::new(initial.as_ref());
+    let formatting = body.toolbar();
+    if let Some(initial) = &initial {
         to.set_text(&initial.to);
         cc.set_text(&initial.cc);
         bcc.set_text(&initial.bcc);
         subject.set_text(&initial.subject);
-        inline_images.restore(&body, initial)
-    } else {
-        HashSet::new()
-    };
-    inline_images.connect_paste(&body, &dialog);
-    let attachments = AttachmentList::new(initial.as_ref(), &restored_images);
+    }
+    let attachments = AttachmentList::new(initial.as_ref(), &body.inline_ids());
     let parent_for_attachment = parent.downgrade();
     let dialog_for_attachment = dialog.downgrade();
     let files_for_attachment = attachments.clone();
@@ -3377,38 +3442,25 @@ fn present_compose_with_title(
             }
         });
     });
-    body.add_css_class("card");
-    for widget in [&to, &cc, &bcc, &subject] {
+    // Keep the inset outside the HTML document so email styles cannot reset it.
+    let editor_frame = gtk::Box::new(Orientation::Vertical, 0);
+    editor_frame.add_css_class("card");
+    editor_frame.set_vexpand(true);
+    body.view.set_margin_top(12);
+    body.view.set_margin_bottom(12);
+    body.view.set_margin_start(12);
+    body.view.set_margin_end(12);
+    editor_frame.append(&body.view);
+    for widget in &recipient_fields {
         form.append(widget);
     }
+    form.append(&subject);
     form.append(&attachments.widget);
     form.append(&formatting);
-    if initial
-        .as_ref()
-        .is_some_and(|message| message.html_body.is_some())
-    {
-        let note = gtk::Label::builder()
-            .label("Editing the body replaces its original formatting with Postbird formatting. Changing only recipients or the subject preserves the original HTML.")
-            .wrap(true).xalign(0.0).css_classes(["caption", "dim-label"]).build();
-        form.append(&note);
-    }
-    let body_scroll = gtk::ScrolledWindow::builder()
-        .vexpand(true)
-        .child(&body)
-        .build();
-    form.append(&body_scroll);
-    if let Some(message) = replying_to.as_ref() {
-        form.append(&reply_context(message));
-    }
+    form.append(&editor_frame);
     toolbar.set_content(Some(&form));
     dialog.set_child(Some(&toolbar));
 
-    let original_content = rich_text_content(&body, &inline_images);
-    let original_html = initial
-        .as_ref()
-        .and_then(|message| message.html_body.clone());
-    let content_for_send = original_content.clone();
-    let html_for_send = original_html.clone();
     let editing_for_send = editing.clone();
     let busy_controls: Vec<gtk::Widget> = vec![
         form.clone().upcast(),
@@ -3464,34 +3516,28 @@ fn present_compose_with_title(
     let from_send = from.clone();
     let body_send = body.clone();
     let attachments_send = attachments.clone();
-    let images_for_send = inline_images.clone();
+    let busy_for_send = set_busy.clone();
     let cancel_send = cancelled.clone();
     let reply_context_for_send = replying_to.clone();
     let title_for_send = title.clone();
     let send_started = Rc::new(Cell::new(false));
     send.connect_clicked(move |_| {
-        if images_for_send.is_pending() {
-            crate::compose::show_error(&dialog_for_send, "Wait for the pasted image to finish loading");
-            return;
-        }
         if send_started.replace(true) {
             return;
         }
         cancel_send.store(false, Ordering::Relaxed);
         let cancelled = cancel_send.clone();
         let editing = editing_for_send.clone();
-        let (plain_body, html_body) =
-            compose_body_content(&body_send, &content_for_send, html_for_send.as_deref(), &images_for_send);
-        let (paths, mut files) = attachments_send.contents();
-        files.extend(images_for_send.attachments(&body_send));
-        let message = ComposeMessage {
+        busy_for_send(true);
+        let (paths, files) = attachments_send.contents();
+        let mut message = ComposeMessage {
             from: compose_sender(&from_send),
             to: to_send.text().to_string(),
             cc: cc_send.text().to_string(),
             bcc: bcc_send.text().to_string(),
             subject: subject_send.text().to_string(),
-            body: plain_body,
-            html_body: Some(html_body),
+            body: String::new(),
+            html_body: None,
             in_reply_to: reply_reference.clone(),
             thread_id: reply_thread.clone(),
             attachments: paths,
@@ -3503,12 +3549,29 @@ fn present_compose_with_title(
         (widgets.invalidate_mailboxes)(&account_email);
         let reply_context = reply_context_for_send.clone();
         let compose_title = title_for_send.clone();
-        let sending_toast = adw::Toast::new("Sending…");
-        sending_toast.set_timeout(0);
-        sending_toast.set_priority(adw::ToastPriority::High);
-        widgets.sidebar_toast.add_toast(sending_toast.clone());
-        dialog.close();
+        let body = body_send.clone();
+        let set_busy = busy_for_send.clone();
+        let send_started = send_started.clone();
         glib::MainContext::default().spawn_local(async move {
+            match body.content().await {
+                Ok((plain, html, images)) => {
+                    message.body = plain;
+                    message.html_body = Some(html);
+                    message.forwarded_attachments.extend(images);
+                }
+                Err(error) => {
+                    set_busy(false);
+                    send_started.set(false);
+                    crate::compose::show_error(&dialog, error);
+                    return;
+                }
+            }
+            set_busy(false);
+            let sending_toast = adw::Toast::new("Sending…");
+            sending_toast.set_timeout(0);
+            sending_toast.set_priority(adw::ToastPriority::High);
+            widgets.sidebar_toast.add_toast(sending_toast.clone());
+            dialog.close();
             let target = editing
                 .as_ref()
                 .map(|draft| (draft.id.clone(), draft.message_id.clone()));
@@ -3575,33 +3638,19 @@ fn present_compose_with_title(
         .and_then(|message| message.thread_id.clone());
     let attachments_draft = attachments;
     save_draft.connect_clicked(move |_| {
-        if inline_images.is_pending() {
-            crate::compose::show_error(
-                &dialog_for_draft,
-                "Wait for the pasted image to finish loading",
-            );
-            return;
-        }
         cancelled.store(false, Ordering::Relaxed);
         let cancelled = cancelled.clone();
         set_busy(true);
         let editing = editing.clone();
-        let (plain_body, html_body) = compose_body_content(
-            &body,
-            &original_content,
-            original_html.as_deref(),
-            &inline_images,
-        );
-        let (paths, mut files) = attachments_draft.contents();
-        files.extend(inline_images.attachments(&body));
-        let message = ComposeMessage {
+        let (paths, files) = attachments_draft.contents();
+        let mut message = ComposeMessage {
             from: compose_sender(&from),
             to: to.text().to_string(),
             cc: cc.text().to_string(),
             bcc: bcc.text().to_string(),
             subject: subject.text().to_string(),
-            body: plain_body,
-            html_body: Some(html_body),
+            body: String::new(),
+            html_body: None,
             in_reply_to: reply_reference.clone(),
             thread_id: reply_thread.clone(),
             attachments: paths,
@@ -3612,7 +3661,20 @@ fn present_compose_with_title(
         let account_email = account_for_draft.clone();
         (widgets.invalidate_mailboxes)(&account_email);
         let set_busy = set_busy.clone();
+        let body = body.clone();
         glib::MainContext::default().spawn_local(async move {
+            match body.content().await {
+                Ok((plain, html, images)) => {
+                    message.body = plain;
+                    message.html_body = Some(html);
+                    message.forwarded_attachments.extend(images);
+                }
+                Err(error) => {
+                    set_busy(false);
+                    crate::compose::show_error(&dialog, error);
+                    return;
+                }
+            }
             let target = editing
                 .as_ref()
                 .map(|draft| (draft.id.clone(), draft.message_id.clone()));
@@ -3665,202 +3727,6 @@ fn compose_dialog_title(
             "New message"
         })
         .to_owned()
-}
-
-fn reply_context(message: &Message) -> gtk::Expander {
-    let sender = sender_name(message.header("From"));
-    let subject = message.header("Subject");
-    let heading = if subject.trim().is_empty() {
-        format!("Replying to {sender}")
-    } else {
-        format!("Replying to {sender} — {subject}")
-    };
-    let details = gtk::Label::builder()
-        .label(format!(
-            "From: {}\nDate: {}",
-            message.header("From"),
-            message.header("Date")
-        ))
-        .halign(Align::Start)
-        .xalign(0.0)
-        .selectable(true)
-        .css_classes(["caption", "dim-label"])
-        .build();
-    let preview = gtk::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .top_margin(10)
-        .bottom_margin(10)
-        .left_margin(10)
-        .right_margin(10)
-        .build();
-    preview.buffer().set_text(&message.body_text());
-    preview.add_css_class("card");
-    let content = gtk::Box::new(Orientation::Vertical, 6);
-    content.append(&details);
-    content.append(
-        &gtk::ScrolledWindow::builder()
-            .height_request(160)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .child(&preview)
-            .build(),
-    );
-    gtk::Expander::builder()
-        .label(heading)
-        .expanded(true)
-        .child(&content)
-        .build()
-}
-
-const RICH_TAGS: [(&str, &str, &str); 4] = [
-    ("postbird-bold", "<strong>", "</strong>"),
-    ("postbird-italic", "<em>", "</em>"),
-    ("postbird-underline", "<u>", "</u>"),
-    ("postbird-strike", "<s>", "</s>"),
-];
-
-fn rich_text_toolbar(editor: &gtk::TextView) -> gtk::Box {
-    let buffer = editor.buffer();
-    for tag in [
-        gtk::TextTag::builder()
-            .name(RICH_TAGS[0].0)
-            .weight(700)
-            .build(),
-        gtk::TextTag::builder()
-            .name(RICH_TAGS[1].0)
-            .style(gtk::pango::Style::Italic)
-            .build(),
-        gtk::TextTag::builder()
-            .name(RICH_TAGS[2].0)
-            .underline(gtk::pango::Underline::Single)
-            .build(),
-        gtk::TextTag::builder()
-            .name(RICH_TAGS[3].0)
-            .strikethrough(true)
-            .build(),
-    ] {
-        buffer.tag_table().add(&tag);
-    }
-    let toolbar = gtk::Box::new(Orientation::Horizontal, 4);
-    for (label, tooltip, tag_name) in [
-        ("B", "Bold selected text", RICH_TAGS[0].0),
-        ("I", "Italicize selected text", RICH_TAGS[1].0),
-        ("U", "Underline selected text", RICH_TAGS[2].0),
-        ("S", "Strikethrough selected text", RICH_TAGS[3].0),
-    ] {
-        let button = gtk::Button::builder()
-            .label(label)
-            .tooltip_text(tooltip)
-            .css_classes(["flat"])
-            .build();
-        let buffer = buffer.clone();
-        button.connect_clicked(move |_| toggle_selected_tag(&buffer, tag_name));
-        toolbar.append(&button);
-    }
-    let clear = gtk::Button::builder()
-        .label("Clear formatting")
-        .tooltip_text("Remove formatting from selected text")
-        .css_classes(["flat"])
-        .build();
-    clear.connect_clicked(move |_| {
-        if let Some((start, end)) = buffer.selection_bounds() {
-            buffer.begin_user_action();
-            buffer.remove_all_tags(&start, &end);
-            buffer.end_user_action();
-        }
-    });
-    toolbar.append(&clear);
-    toolbar
-}
-
-fn toggle_selected_tag(buffer: &gtk::TextBuffer, tag_name: &str) {
-    let Some((start, end)) = buffer.selection_bounds() else {
-        return;
-    };
-    let Some(tag) = buffer.tag_table().lookup(tag_name) else {
-        return;
-    };
-    buffer.begin_user_action();
-    if start.has_tag(&tag) {
-        buffer.remove_tag(&tag, &start, &end);
-    } else {
-        buffer.apply_tag(&tag, &start, &end);
-    }
-    buffer.end_user_action();
-}
-
-fn compose_body_content(
-    editor: &gtk::TextView,
-    original: &(String, String),
-    original_html: Option<&str>,
-    images: &InlineImages,
-) -> (String, String) {
-    let content = rich_text_content(editor, images);
-    if &content == original
-        && let Some(html) = original_html
-    {
-        (content.0, html.to_owned())
-    } else {
-        content
-    }
-}
-
-fn rich_text_content(editor: &gtk::TextView, images: &InlineImages) -> (String, String) {
-    let buffer = editor.buffer();
-    let mut plain = String::new();
-    let tags = RICH_TAGS.map(|(name, _, _)| buffer.tag_table().lookup(name));
-    let mut html = String::from(
-        "<div style=\"font-family:system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.5\">",
-    );
-    let mut active = [false; 4];
-    let mut iter = buffer.start_iter();
-    let end = buffer.end_iter();
-    while iter.offset() < end.offset() {
-        let next =
-            std::array::from_fn(|index| tags[index].as_ref().is_some_and(|tag| iter.has_tag(tag)));
-        if next != active {
-            for index in (0..RICH_TAGS.len()).rev() {
-                if active[index] {
-                    html.push_str(RICH_TAGS[index].2);
-                }
-            }
-            for index in 0..RICH_TAGS.len() {
-                if next[index] {
-                    html.push_str(RICH_TAGS[index].1);
-                }
-            }
-            active = next;
-        }
-        if let Some(image) = images.at(&iter) {
-            let cid = glib::markup_escape_text(image.content_id.as_deref().unwrap_or_default());
-            let name = glib::markup_escape_text(&image.filename);
-            let width = iter
-                .paintable()
-                .map_or(520, |paintable| paintable.intrinsic_width());
-            html.push_str(&format!("<img src=\"cid:{cid}\" alt=\"{name}\" width=\"{width}\" style=\"max-width:100%;height:auto\">"));
-            plain.push_str(&format!("[Image: {}]", image.filename));
-            iter.forward_char();
-            continue;
-        }
-        plain.push(iter.char());
-        match iter.char() {
-            '&' => html.push_str("&amp;"),
-            '<' => html.push_str("&lt;"),
-            '>' => html.push_str("&gt;"),
-            '"' => html.push_str("&quot;"),
-            '\n' => html.push_str("<br>\n"),
-            character => html.push(character),
-        }
-        iter.forward_char();
-    }
-    for index in (0..RICH_TAGS.len()).rev() {
-        if active[index] {
-            html.push_str(RICH_TAGS[index].2);
-        }
-    }
-    html.push_str("</div>");
-    (plain, html)
 }
 
 fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
@@ -3918,6 +3784,14 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let email = state.borrow().account_emails[0].clone();
         load_inbox(widgets, state, email, None, false);
         for email in state.borrow().account_emails.clone() {
+            let index_email = email.clone();
+            gio::spawn_blocking(move || {
+                if let Err(error) = MailCache::open()
+                    .and_then(|mut cache| cache.index_cached_contacts(&index_email))
+                {
+                    eprintln!("could not index contacts: {error:#}");
+                }
+            });
             load_labels(widgets, state, email);
         }
     } else {
@@ -5188,6 +5062,184 @@ fn save_attachment(
     });
 }
 
+fn message_action_button(icon: &str, title: &str) -> gtk::Button {
+    let image = gtk::Image::from_icon_name(icon);
+    image.set_pixel_size(16);
+    let button = gtk::Button::builder()
+        .child(&image)
+        .tooltip_text(title)
+        .valign(Align::Center)
+        .css_classes(["flat", "postbird-message-action"])
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label(title)]);
+    button
+}
+
+fn message_draft_actions(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    email: &str,
+    message: &Message,
+) -> gtk::Box {
+    let actions = gtk::Box::new(Orientation::Horizontal, 6);
+    actions.append(&draft_indicator());
+    let edit = message_action_button("postbird-pencil-line-symbolic", "Edit Draft");
+    let delete = message_action_button("postbird-trash-symbolic", "Delete Draft");
+    let edit_widgets = widgets.clone();
+    let edit_state = state.clone();
+    let edit_email = email.to_owned();
+    let edit_message = message.clone();
+    edit.connect_clicked(move |button| {
+        edit_draft(
+            &edit_widgets,
+            &edit_state,
+            &edit_email,
+            &edit_message,
+            button,
+        )
+    });
+    let widgets = widgets.clone();
+    let state = state.clone();
+    let email = email.to_owned();
+    let message = message.clone();
+    let controls = actions.downgrade();
+    delete.connect_clicked(move |_| {
+        let Some(controls) = controls.upgrade() else {
+            return;
+        };
+        controls.set_sensitive(false);
+        let widgets = widgets.clone();
+        let state = state.clone();
+        let email = email.clone();
+        let message = message.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let subject = message.header("Subject");
+            let subject = if subject.trim().is_empty() {
+                "Untitled draft"
+            } else {
+                subject
+            };
+            let confirmation = adw::AlertDialog::builder()
+                .heading("Delete Draft?")
+                .body(format!(
+                    "Move “{subject}” to Trash? Other messages in this conversation will be kept."
+                ))
+                .default_response("cancel")
+                .close_response("cancel")
+                .build();
+            confirmation.add_responses(&[("cancel", "Cancel"), ("delete", "Delete Draft")]);
+            confirmation.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+            if confirmation.choose_future(Some(&widgets.window)).await != "delete" {
+                controls.set_sensitive(true);
+                return;
+            }
+            let same_account = || {
+                state
+                    .borrow()
+                    .account_emails
+                    .get(widgets.account_picker.selected() as usize)
+                    == Some(&email)
+            };
+            if same_account() {
+                cancel_active_refresh(&widgets, &state);
+            }
+            state.borrow_mut().mailbox_sync.invalidate_account(&email);
+            let request_email = email.clone();
+            let message_id = message.id.clone();
+            let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
+                MailClient::for_account(AccountStore::open()?, &request_email)?
+                    .delete_draft(&message_id)?;
+                if let Err(error) = MailCache::open().and_then(|mut cache| {
+                    cache.remove_messages_everywhere(&request_email, &[message_id])
+                }) {
+                    eprintln!("Could not remove the deleted draft from the cache: {error}");
+                }
+                Ok(())
+            })
+            .await;
+            controls.set_sensitive(true);
+            state.borrow_mut().mailbox_sync.invalidate_account(&email);
+            match result {
+                Ok(Ok(())) => {
+                    if same_account() {
+                        cancel_active_refresh(&widgets, &state);
+                        remove_deleted_draft(&widgets, &state, &message);
+                    }
+                    refresh_favorite_counts_for_account(&widgets, &state, &email);
+                    show_message(&widgets, "Draft moved to Trash");
+                }
+                Ok(Err(error)) => show_error(&widgets, error),
+                Err(_) => show_message(
+                    &widgets,
+                    "Could not delete the draft. Refresh the mailbox before trying again.",
+                ),
+            }
+        });
+    });
+    actions.append(&edit);
+    actions.append(&delete);
+    actions
+}
+
+fn remove_deleted_draft(widgets: &Widgets, state: &Rc<RefCell<State>>, draft: &Message) {
+    let row = state
+        .borrow()
+        .conversations
+        .iter()
+        .position(|conversation| conversation.iter().any(|message| message.id == draft.id));
+    if let Some(index) = row {
+        let remaining = state.borrow().conversations[index]
+            .iter()
+            .filter(|message| message.id != draft.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let remove_row = remaining.is_empty()
+            || (state.borrow().current_label == "DRAFT"
+                && !remaining
+                    .iter()
+                    .any(|message| message.label_ids.iter().any(|label| label == "DRAFT")));
+        if remove_row {
+            remove_conversation(widgets, state, &draft.thread_id);
+        } else {
+            state.borrow_mut().conversations[index] = remaining;
+            update_conversation_row(widgets, state, &draft.thread_id);
+        }
+    }
+    let conversation = {
+        let mut state = state.borrow_mut();
+        if !state
+            .selected_conversation
+            .iter()
+            .any(|message| message.id == draft.id)
+        {
+            return;
+        }
+        state
+            .selected_conversation
+            .retain(|message| message.id != draft.id);
+        state.selected = state.selected_conversation.first().cloned();
+        state.selected_conversation.clone()
+    };
+    if conversation.is_empty() {
+        clear_reader_view(widgets, state);
+    } else {
+        widgets
+            .message_title
+            .set_text(conversation[0].header("Subject"));
+        widgets.message_sender.set_text(&format!(
+            "{} message{} in this conversation",
+            conversation.len(),
+            if conversation.len() == 1 { "" } else { "s" }
+        ));
+        display_conversation(
+            widgets,
+            state,
+            &conversation,
+            widgets.preferences.borrow().load_remote_images,
+        );
+    }
+}
+
 fn message_reply_actions(widgets: &Widgets, email: &str, message: &Message) -> gtk::Box {
     let actions = gtk::Box::new(Orientation::Horizontal, 6);
     for (icon, title, reply_all) in [
@@ -5195,15 +5247,7 @@ fn message_reply_actions(widgets: &Widgets, email: &str, message: &Message) -> g
         ("postbird-reply-all-symbolic", "Reply All", Some(true)),
         ("postbird-forward-symbolic", "Forward", None),
     ] {
-        let image = gtk::Image::from_icon_name(icon);
-        image.set_pixel_size(16);
-        let button = gtk::Button::builder()
-            .child(&image)
-            .tooltip_text(title)
-            .valign(Align::Center)
-            .css_classes(["flat", "postbird-message-action"])
-            .build();
-        button.update_property(&[gtk::accessible::Property::Label(title)]);
+        let button = message_action_button(icon, title);
         let widgets = widgets.clone();
         let email = email.to_owned();
         // Capture this message and its account, independently of the reader's
@@ -5218,12 +5262,13 @@ fn message_reply_actions(widgets: &Widgets, email: &str, message: &Message) -> g
                     .cloned()
                     .unwrap_or_default();
                 let reply = reply_message(&original, &email, &aliases, reply_all);
-                present_compose(
+                present_response(
                     &widgets,
                     email.clone(),
-                    Some(reply),
-                    Some(original.clone()),
-                    None,
+                    original.clone(),
+                    reply,
+                    true,
+                    button,
                 );
             } else {
                 present_forward(&widgets, email.clone(), original.clone(), button);
@@ -5323,6 +5368,9 @@ fn display_conversation(
             ) {
                 heading_line.append(&control);
             }
+            if message.label_ids.iter().any(|label| label == "DRAFT") {
+                heading_line.append(&message_draft_actions(widgets, state, email, message));
+            }
             heading_line.append(&message_reply_actions(widgets, email, message));
         }
         heading_line.append(&date);
@@ -5344,16 +5392,6 @@ fn display_conversation(
             header_details.append(full_headers);
         }
         heading_row.append(&header_details);
-        if message.label_ids.iter().any(|label| label == "DRAFT") {
-            heading_row.append(&draft_indicator());
-            let edit = gtk::Button::with_label("Edit Draft");
-            edit.set_valign(Align::Center);
-            let widgets = widgets.clone();
-            let state = state.clone();
-            let message = message.clone();
-            edit.connect_clicked(move |button| edit_draft(&widgets, &state, &message, button));
-            heading_row.append(&edit);
-        }
         let body = gtk::Box::new(Orientation::Vertical, 6);
         body.set_hexpand(true);
         let expanded_content = gtk::Box::new(Orientation::Vertical, 6);
@@ -6479,139 +6517,25 @@ mod tests {
             "Run this clipboard test on an isolated Broadway display"
         );
         install_visual_style();
-        let editor = crate::compose_history::editor();
-        let _toolbar = rich_text_toolbar(&editor);
-        let images = InlineImages::default();
-        let dialog = adw::Dialog::new();
-        let window = gtk::Window::builder()
-            .default_width(800)
-            .default_height(600)
-            .child(&editor)
-            .build();
-        window.add_css_class("postbird-compose");
-        window.present();
-        let buffer = editor.buffer();
-        buffer.set_text("Before REPLACE after");
-        images.connect_paste(&editor, &dialog);
-        buffer.select_range(&buffer.iter_at_offset(7), &buffer.iter_at_offset(14));
-        let pixbuf =
-            gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, true, 8, 1000, 600)
-                .unwrap();
-        pixbuf.fill(0x315c9eff);
-        let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
-        editor.clipboard().set_texture(&texture);
-        editor.emit_by_name::<()>("paste-clipboard", &[]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while images.is_pending() && std::time::Instant::now() < deadline {
-            glib::MainContext::default().iteration(false);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(!images.is_pending());
-        let (plain, html) = rich_text_content(&editor, &images);
-        assert_eq!(plain, "Before [Image: Screenshot-1.png] after");
-        assert!(html.contains("<img src=\"cid:postbird-"));
-        let image = &images.attachments(&editor)[0];
-        let saved_texture =
-            gtk::gdk::Texture::from_bytes(&glib::Bytes::from(&*image.data)).unwrap();
-        assert_eq!((saved_texture.width(), saved_texture.height()), (1000, 600));
-        assert!(
-            buffer
-                .iter_at_offset(7)
-                .paintable()
-                .unwrap()
-                .intrinsic_width()
-                <= 520
-        );
-
-        buffer.begin_user_action();
-        buffer.delete(&mut buffer.iter_at_offset(7), &mut buffer.iter_at_offset(8));
-        buffer.end_user_action();
-        assert!(
-            images.attachments(&editor).is_empty(),
-            "deleted images must not be sent"
-        );
-        editor.activate_action("text.undo", None).unwrap();
-        assert_eq!(
-            images.attachments(&editor).len(),
-            1,
-            "undo restores the inline image"
-        );
-        editor.activate_action("text.undo", None).unwrap();
-        assert_eq!(
-            rich_text_content(&editor, &images).0,
-            "Before REPLACE after"
-        );
-        editor.activate_action("text.redo", None).unwrap();
-        assert_eq!(
-            images.attachments(&editor).len(),
-            1,
-            "redo restores a pasted image"
-        );
-        editor.activate_action("text.redo", None).unwrap();
-        assert!(images.attachments(&editor).is_empty());
-        editor.activate_action("text.undo", None).unwrap();
-        assert_eq!(images.attachments(&editor).len(), 1);
-
-        buffer.place_cursor(&buffer.end_iter());
-        editor.clipboard().set_text(" pasted text");
-        editor.emit_by_name::<()>("paste-clipboard", &[]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !rich_text_content(&editor, &images)
-            .0
-            .ends_with(" pasted text")
-            && std::time::Instant::now() < deadline
-        {
-            glib::MainContext::default().iteration(false);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            rich_text_content(&editor, &images)
-                .0
-                .ends_with(" pasted text")
-        );
-        assert_eq!(images.attachments(&editor).len(), 1);
-        buffer.select_range(&buffer.start_iter(), &buffer.iter_at_offset(6));
-        toggle_selected_tag(&buffer, RICH_TAGS[0].0);
-        assert!(
-            rich_text_content(&editor, &images)
-                .1
-                .contains("<strong>Before</strong>")
-        );
-        editor.activate_action("text.undo", None).unwrap();
-        assert!(!rich_text_content(&editor, &images).1.contains("<strong>"));
-        editor.activate_action("text.undo", None).unwrap();
-        assert_eq!(rich_text_content(&editor, &images).0, plain);
-        assert_eq!(images.attachments(&editor).len(), 1);
-
         let message = ComposeMessage {
             from: None,
             to: "reader@example.com".into(),
             cc: String::new(),
             bcc: String::new(),
             subject: "Screenshot".into(),
-            body: plain.clone(),
-            html_body: Some(html.clone()),
+            body: "Before image after".into(),
+            html_body: Some("<p>Before <img src=\"cid:logo\"> after</p>".into()),
             in_reply_to: None,
             thread_id: None,
             attachments: Vec::new(),
-            forwarded_attachments: images.attachments(&editor),
+            forwarded_attachments: vec![ForwardedAttachment {
+                content_id: Some("logo".into()),
+                filename: "logo.png".into(),
+                mime_type: "image/png".into(),
+                data: vec![1, 2, 3].into(),
+            }],
         };
-        let reopened = gtk::TextView::new();
-        let _toolbar = rich_text_toolbar(&reopened);
-        let restored = InlineImages::default();
-        let restored_ids = restored.restore(&reopened, &message);
-        assert_eq!(restored_ids.len(), 1);
-        assert_eq!(rich_text_content(&reopened, &restored).0, plain);
-        assert_eq!(
-            restored.attachments(&reopened)[0].data,
-            message.forwarded_attachments[0].data
-        );
-        let original = rich_text_content(&reopened, &restored);
-        assert_eq!(
-            compose_body_content(&reopened, &original, Some(&html), &restored).1,
-            html
-        );
-
+        let restored_ids = HashSet::from(["logo".into()]);
         let directory =
             std::env::temp_dir().join(format!("postbird-compose-test-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -6651,12 +6575,6 @@ mod tests {
             .unwrap()
             .emit_clicked();
         assert_eq!(attachments.contents().0, vec![second]);
-        assert!(
-            editor.color().red() < 0.2,
-            "the editor stays dark text on its light surface"
-        );
-        window.destroy();
-
         // Exercise the real compose dialog under a forced dark application theme.
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
         let window = adw::ApplicationWindow::builder()
@@ -6714,7 +6632,23 @@ mod tests {
             }
             checked
         }
-        assert_eq!(check_editor_colors(&dialog.child().unwrap()), 6);
+        assert!(check_editor_colors(&dialog.child().unwrap()) >= 5);
+        if let Ok(path) = std::env::var("POSTBIRD_COMPOSE_SCREENSHOT") {
+            let snapshot = gtk::Snapshot::new();
+            gtk::WidgetPaintable::new(Some(&window)).snapshot(
+                &snapshot,
+                f64::from(window.width()),
+                f64::from(window.height()),
+            );
+            if let Some(node) = snapshot.to_node() {
+                window
+                    .renderer()
+                    .unwrap()
+                    .render_texture(&node, None)
+                    .save_to_png(path)
+                    .unwrap();
+            }
+        }
         let picker = compose_sender_picker("kent@otron.net", &["kent@otron.com".into()], None);
         assert_eq!(compose_sender(&picker).as_deref(), Some("kent@otron.net"));
         picker.set_selected(1);
@@ -6857,17 +6791,20 @@ mod tests {
                 field("Cc"),
                 if index == 1 { "carol@example.com" } else { "" }
             );
-            let bodies = content
+            let view = content
                 .iter()
-                .filter_map(|widget| widget.downcast_ref::<gtk::TextView>())
-                .map(|view| {
-                    let buffer = view.buffer();
-                    buffer
-                        .text(&buffer.start_iter(), &buffer.end_iter(), true)
-                        .to_string()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+                .find_map(|widget| widget.downcast_ref::<webkit6::WebView>())
+                .unwrap();
+            wait_until(|| !view.is_loading());
+            let bodies = glib::MainContext::default()
+                .block_on(view.evaluate_javascript_future(
+                    "document.body.innerText",
+                    Some("postbird-compose"),
+                    None,
+                ))
+                .unwrap()
+                .to_str()
+                .to_string();
             assert!(bodies.contains("Old body"));
             assert!(!bodies.contains("New body"));
             if index == 2 {
@@ -6884,40 +6821,109 @@ mod tests {
         let mut draft = message("phone-draft", "conversation", 20);
         draft.label_ids.push("DRAFT".into());
         let sent = message("sent-message", "conversation", 30);
-        display_conversation(widgets, &state, &[sent, draft], false);
+        display_conversation(widgets, &state, &[sent.clone(), draft.clone()], false);
         let draft_row = widgets.conversation_body.first_child().unwrap();
         let has_edit_button = |row: &gtk::Widget| {
             descendants(row).iter().any(|widget| {
                 widget
                     .downcast_ref::<gtk::Button>()
-                    .is_some_and(|button| button.label().as_deref() == Some("Edit Draft"))
+                    .is_some_and(|button| button.tooltip_text().as_deref() == Some("Edit Draft"))
             })
         };
         assert!(has_edit_button(&draft_row));
         assert!(!has_edit_button(&draft_row.next_sibling().unwrap()));
+        let buttons = descendants(&draft_row)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .filter(|button| button.has_css_class("postbird-message-action"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            buttons
+                .iter()
+                .map(|button| button.tooltip_text().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            [
+                "Edit Draft",
+                "Delete Draft",
+                "Reply",
+                "Reply All",
+                "Forward"
+            ]
+        );
+        assert!(
+            buttons[0].label().is_none(),
+            "edit is an icon, not a wide text button"
+        );
+        assert_eq!(
+            buttons[0]
+                .child()
+                .unwrap()
+                .downcast::<gtk::Image>()
+                .unwrap()
+                .icon_name()
+                .as_deref(),
+            Some("postbird-pencil-line-symbolic")
+        );
+        let draft_actions = buttons[0].parent().unwrap();
+        assert_eq!(
+            draft_actions
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Label>()
+                .unwrap()
+                .text(),
+            "Draft"
+        );
+        let heading_line = draft_actions.parent().unwrap();
+        assert!(
+            heading_line.last_child().unwrap().has_css_class("caption"),
+            "timestamp is the rightmost header item"
+        );
+        buttons[1].emit_clicked();
+        wait_until(|| widgets.window.visible_dialog().is_some());
+        let confirmation = widgets
+            .window
+            .visible_dialog()
+            .unwrap()
+            .downcast::<adw::AlertDialog>()
+            .unwrap();
+        assert_eq!(confirmation.heading().as_deref(), Some("Delete Draft?"));
+        assert_eq!(confirmation.default_response().as_deref(), Some("cancel"));
+        assert_eq!(confirmation.close_response(), "cancel");
+        confirmation.close();
+        wait_until(|| widgets.window.visible_dialog().is_none() && draft_actions.is_sensitive());
+        assert!(
+            has_edit_button(&draft_row),
+            "cancelling keeps the draft in place"
+        );
+
+        let mut other_draft = draft.clone();
+        other_draft.id = "another-draft".into();
+        let conversation = vec![sent, draft.clone(), other_draft];
+        display_messages(widgets, &state, conversation.clone());
+        state.borrow_mut().selected_conversation = conversation.clone();
+        state.borrow_mut().selected = conversation.first().cloned();
+        remove_deleted_draft(widgets, &state, &draft);
+        assert_eq!(
+            state
+                .borrow()
+                .selected_conversation
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["sent-message", "another-draft"]
+        );
+        assert_eq!(
+            state.borrow().conversations[0].len(),
+            2,
+            "only the requested draft is removed"
+        );
     }
 
     #[test]
     #[ignore = "requires a graphical session; uses only synthetic messages"]
     fn message_body_lifecycle() {
         gtk::init().expect("GTK display connection");
-        let editor = gtk::TextView::new();
-        let _toolbar = rich_text_toolbar(&editor);
-        editor.buffer().set_text("Hello");
-        let images = InlineImages::default();
-        let original = rich_text_content(&editor, &images);
-        let html = "<p><b>Hello</b><img src='cid:image-1'></p>";
-        assert_eq!(
-            compose_body_content(&editor, &original, Some(html), &images).1,
-            html
-        );
-        editor
-            .buffer()
-            .insert(&mut editor.buffer().end_iter(), " edited");
-        let changed = compose_body_content(&editor, &original, Some(html), &images);
-        assert_eq!(changed.0, "Hello edited");
-        assert!(changed.1.contains("Hello edited"));
-        assert_ne!(changed.1, html);
         let mut message: Message = serde_json::from_value(serde_json::json!({
             "id": "synthetic-draft",
             "threadId": "synthetic-thread",
@@ -7299,6 +7305,35 @@ mod tests {
             reply_all_recipients(&original, "kent@example.com", &["kent@otron.com".into()]);
         assert_eq!(to, "Alice <alice@example.com>, Bob <bob@example.com>");
         assert_eq!(cc, "Carol <carol@example.com>");
+    }
+
+    #[test]
+    fn replies_and_forwards_keep_the_original_html_and_quote_plain_text() {
+        let original: Message = serde_json::from_value(serde_json::json!({
+            "id":"original", "threadId":"thread", "payload": {
+                "mimeType":"text/html", "body":{"data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("<table><tr><td><b>Original body</b></td></tr></table>")},
+                "headers":[{"name":"From", "value":"Alice <alice@example.com>"}, {"name":"Date", "value":"Yesterday"}]
+            }
+        })).unwrap();
+        for all in [false, true] {
+            let reply = reply_message(&original, "me@example.com", &[], all);
+            assert!(
+                reply
+                    .body
+                    .starts_with("\n\nOn Yesterday, Alice <alice@example.com> wrote:")
+            );
+            assert!(reply.body.contains("> "));
+            let html = reply.html_body.unwrap();
+            assert!(html.contains("<blockquote><table>"));
+            assert!(html.contains("<b>Original body</b>"));
+            assert!(html.contains("Alice &lt;alice@example.com&gt;"));
+        }
+        assert!(
+            forward_message(&original)
+                .html_body
+                .unwrap()
+                .contains("<b>Original body</b>")
+        );
     }
 
     #[test]

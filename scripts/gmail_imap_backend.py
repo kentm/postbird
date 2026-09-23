@@ -615,6 +615,17 @@ def create_draft(connection, request):
     return None
 
 
+def delete_draft(connection, request):
+    # Search only Drafts: a sent/replaced message must never be deleted by a
+    # stale reader action. MOVE targets one UID and avoids a global EXPUNGE.
+    select(connection, mailbox_name(connection, "DRAFT"), readonly=False)
+    found = ids(connection, "X-GM-MSGID", request["id"])
+    if len(found) != 1:
+        raise RuntimeError("This draft changed elsewhere; refresh the mailbox before deleting it")
+    require_ok(connection.uid("MOVE", found[0], quoted(mailbox_name(connection, "TRASH"))), "MOVE draft to Trash")
+    return None
+
+
 def existing_draft(connection, request):
     draft_box = mailbox_name(connection, "DRAFT")
     select(connection, draft_box, readonly=False)
@@ -707,6 +718,8 @@ def dispatch_once(request):
             return create_draft(connection, request)
         if operation == "write_existing_draft":
             return existing_draft(connection, request)
+        if operation == "delete_draft":
+            return delete_draft(connection, request)
         if operation == "archive_thread":
             select(connection, mailbox_name(connection, "ALL"), readonly=False)
             found = ids(connection, "X-GM-THRID", request["id"])

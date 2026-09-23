@@ -239,7 +239,7 @@ class GmailImapBackendTests(unittest.TestCase):
     @patch("gmail_imap_backend.dispatch_once")
     def test_writes_are_never_replayed_after_an_abort(self, dispatch_once):
         dispatch_once.side_effect = imaplib.IMAP4.abort("lost acknowledgement")
-        for operation in ("send", "create_draft", "write_existing_draft", "trash",
+        for operation in ("send", "create_draft", "write_existing_draft", "delete_draft", "trash",
                           "archive_thread", "set_unread", "set_unread_many", "set_starred"):
             with self.subTest(operation=operation):
                 dispatch_once.reset_mock()
@@ -649,6 +649,40 @@ class GmailImapBackendTests(unittest.TestCase):
             connection.uid.call_args_list[1].args,
             ("STORE", "12,13", "-X-GM-LABELS", "(\\Inbox)"),
         )
+
+    @patch("gmail_imap_backend.mailbox_name", side_effect=lambda _connection, label: f"[Gmail]/{label}")
+    def test_delete_draft_moves_only_the_requested_draft_to_trash(self, _mailbox_name):
+        connection = MagicMock()
+        connection.select.return_value = ("OK", [b"3"])
+        connection.uid.side_effect = [("OK", [b"77"]), ("OK", [b""])]
+        with patch("gmail_imap_backend.connect_imap", return_value=connection):
+            backend.dispatch({"operation": "delete_draft", "id": "123"})
+        connection.select.assert_called_once_with("[Gmail]/DRAFT", readonly=False)
+        self.assertEqual(connection.uid.call_args_list[0].args, ("SEARCH", None, "X-GM-MSGID", "123"))
+        self.assertEqual(connection.uid.call_args_list[1].args, ("MOVE", b"77", '\"[Gmail]/TRASH\"'))
+        self.assertEqual(connection.uid.call_count, 2)
+        connection.expunge.assert_not_called()
+        connection.logout.assert_called_once()
+
+    @patch("gmail_imap_backend.mailbox_name", return_value="[Gmail]/Drafts")
+    def test_delete_draft_rejects_missing_or_ambiguous_drafts(self, _mailbox_name):
+        for found in (b"", b"77 78"):
+            connection = MagicMock()
+            connection.select.return_value = ("OK", [b"3"])
+            connection.uid.return_value = ("OK", [found])
+            with self.assertRaisesRegex(RuntimeError, "changed elsewhere"):
+                backend.delete_draft(connection, {"id": "123"})
+            connection.uid.assert_called_once_with("SEARCH", None, "X-GM-MSGID", "123")
+            connection.expunge.assert_not_called()
+
+    @patch("gmail_imap_backend.mailbox_name", side_effect=lambda _connection, label: label)
+    def test_delete_draft_reports_move_failure(self, _mailbox_name):
+        connection = MagicMock()
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [("OK", [b"77"]), ("NO", [b"Could not move"])]
+        with self.assertRaisesRegex(RuntimeError, "MOVE draft to Trash"):
+            backend.delete_draft(connection, {"id": "123"})
+        self.assertEqual(connection.uid.call_count, 2)
 
     @patch("gmail_imap_backend.mailbox_name")
     def test_draft_replacement_moves_only_expected_old_draft(self, mailbox_name):
