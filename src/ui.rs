@@ -3974,14 +3974,18 @@ fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
 }
 
 fn mailbox_changed(state: &Rc<RefCell<State>>, messages: &[Message]) -> bool {
+    let state = state.borrow();
     let mut visible = state
-        .borrow()
         .conversations
         .iter()
         .flatten()
         .map(message_snapshot)
         .collect::<Vec<_>>();
-    let mut refreshed = messages.iter().map(message_snapshot).collect::<Vec<_>>();
+    let mut refreshed = messages
+        .iter()
+        .filter(|message| message_visible_in_mailbox(message, &state.current_label))
+        .map(message_snapshot)
+        .collect::<Vec<_>>();
     visible.sort();
     refreshed.sort();
     visible != refreshed
@@ -4662,7 +4666,7 @@ fn archive_is_hidden(state: &State, email: &str, conversation: &[Message]) -> bo
 
 fn display_messages(widgets: &Widgets, state: &Rc<RefCell<State>>, messages: Vec<Message>) {
     clear_list(&widgets.messages);
-    let mut conversations = group_conversations(messages);
+    let mut conversations = group_conversations(messages, &state.borrow().current_label);
     {
         let state = state.borrow();
         if let Some(email) = state
@@ -4842,9 +4846,16 @@ fn message_preview(snippet: &str) -> String {
         .join(" ")
 }
 
-fn group_conversations(messages: Vec<Message>) -> Vec<Vec<Message>> {
+fn message_visible_in_mailbox(message: &Message, mailbox: &str) -> bool {
+    mailbox == "TRASH" || !message.label_ids.iter().any(|label| label == "TRASH")
+}
+
+fn group_conversations(messages: Vec<Message>, mailbox: &str) -> Vec<Vec<Message>> {
     let mut by_thread: HashMap<String, Vec<Message>> = HashMap::new();
-    for message in messages {
+    for message in messages
+        .into_iter()
+        .filter(|message| message_visible_in_mailbox(message, mailbox))
+    {
         by_thread
             .entry(message.thread_id.clone())
             .or_default()
@@ -7241,15 +7252,52 @@ mod tests {
 
     #[test]
     fn groups_threads_with_newest_conversation_and_message_first() {
-        let grouped = group_conversations(vec![
-            message("older", "one", 10),
-            message("newest", "one", 30),
-            message("middle", "two", 20),
-        ]);
+        let grouped = group_conversations(
+            vec![
+                message("older", "one", 10),
+                message("newest", "one", 30),
+                message("middle", "two", 20),
+            ],
+            "INBOX",
+        );
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0][0].id, "newest");
         assert_eq!(grouped[0][1].id, "older");
         assert_eq!(grouped[1][0].id, "middle");
+    }
+
+    #[test]
+    fn trashed_messages_only_appear_when_viewing_trash() {
+        let original = message("original", "thread", 10);
+        let other = message("other", "other-thread", 20);
+        let mut deleted = message("deleted-draft", "thread", 30);
+        deleted.label_ids = vec!["TRASH".into(), "DRAFT".into(), "UNREAD".into()];
+        let mut deleted_only = message("deleted-only", "deleted-thread", 40);
+        deleted_only.label_ids = vec!["TRASH".into()];
+        let messages = vec![original, other, deleted, deleted_only];
+
+        for mailbox in ["INBOX", "ALL", "SENT", "DRAFT", "STARRED", "custom-label"] {
+            let grouped = group_conversations(messages.clone(), mailbox);
+            assert_eq!(grouped.len(), 2);
+            assert_eq!(grouped[0][0].id, "other");
+            assert_eq!(grouped[1].len(), 1);
+            assert_eq!(grouped[1][0].id, "original");
+            let state = Rc::new(RefCell::new(State {
+                current_label: mailbox.into(),
+                conversations: grouped,
+                ..State::default()
+            }));
+            assert!(!mailbox_changed(&state, &messages));
+            let mut restored = messages.clone();
+            restored[2].label_ids.retain(|label| label != "TRASH");
+            assert!(mailbox_changed(&state, &restored));
+        }
+
+        let trash = group_conversations(messages, "TRASH");
+        assert_eq!(trash.len(), 3);
+        assert_eq!(trash[0][0].id, "deleted-only");
+        assert_eq!(trash[1][0].id, "deleted-draft");
+        assert_eq!(trash[1][1].id, "original");
     }
 
     #[test]

@@ -352,9 +352,9 @@ def fetch_messages(connection, uid_set, inline_attachments=False, mailbox_label=
             message = message_from_row(row, inline_attachments)
             # Gmail can omit the selected mailbox from X-GM-LABELS. Drafts
             # saved by other clients may also lack the IMAP \\Draft flag.
-            # Membership in the actual Drafts mailbox is authoritative.
-            if mailbox_label == "DRAFT" and "DRAFT" not in message["labelIds"]:
-                message["labelIds"].append("DRAFT")
+            # Membership in the actual Drafts or Trash mailbox is authoritative.
+            if mailbox_label in ("DRAFT", "TRASH") and mailbox_label not in message["labelIds"]:
+                message["labelIds"].append(mailbox_label)
             results.append(message)
     return sorted(results, key=lambda item: int(item["internalDate"]))
 

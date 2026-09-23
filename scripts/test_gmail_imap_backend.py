@@ -478,6 +478,31 @@ class GmailImapBackendTests(unittest.TestCase):
         message = backend.fetch_messages(MagicMock(), [b"7"], mailbox_label="DRAFT")[0]
         self.assertEqual(message["labelIds"], ["DRAFT"])
 
+    @patch("gmail_imap_backend.mailbox_name", side_effect=lambda _connection, label: label)
+    def test_deleted_reply_is_identified_by_trash_membership_without_a_label(self, _mailbox_name):
+        connection = MagicMock()
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [
+            ("OK", [b"7"]),
+            ("OK", [(b"1 (X-GM-MSGID 123 X-GM-THRID 456 FLAGS (\\Seen) X-GM-LABELS (\\Inbox))",
+                     b"Subject: Original\r\n\r\nOriginal message")]),
+            ("OK", [b""]),  # Drafts is now empty.
+            ("OK", [b"8"]),
+            ("OK", [(b"1 (X-GM-MSGID 124 X-GM-THRID 456 FLAGS (\\Seen) X-GM-LABELS ())",
+                     b"Subject: Re: Original\r\n\r\nDeleted reply")]),
+        ]
+        messages = backend.threads(connection, ["456"])[0]["messages"]
+        self.assertEqual(
+            {message["id"]: message["labelIds"] for message in messages},
+            {"123": ["INBOX"], "124": ["TRASH"]},
+        )
+
+    @patch("gmail_imap_backend.fetch_rows")
+    def test_trash_mailbox_does_not_duplicate_an_explicit_trash_label(self, fetch_rows):
+        fetch_rows.return_value = [(b"1 (X-GM-MSGID 123 X-GM-THRID 456 FLAGS (\\Seen) X-GM-LABELS (\\Trash))", b"\r\nDeleted")]
+        message = backend.fetch_messages(MagicMock(), [b"7"], mailbox_label="TRASH")[0]
+        self.assertEqual(message["labelIds"], ["TRASH"])
+
     def test_inline_image_without_filename_stays_downloadable(self):
         part = email.message_from_string(
             "Content-Type: image/png\nContent-Disposition: inline\n\nimage"
