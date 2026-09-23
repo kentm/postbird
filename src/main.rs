@@ -1,5 +1,7 @@
 mod accounts;
 mod cache;
+mod compose;
+mod compose_history;
 mod gmail;
 mod mail;
 mod preferences;
@@ -13,6 +15,12 @@ const APP_ID: &str = "io.github.postbird.Mail";
 fn main() -> adw::glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| theme::install_omarchy_integration());
-    app.connect_activate(ui::build);
+    app.connect_activate(|app| {
+        if let Some(window) = app.active_window() {
+            window.present();
+        } else {
+            ui::build(app);
+        }
+    });
     app.run()
 }

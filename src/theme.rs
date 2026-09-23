@@ -104,6 +104,33 @@ fn valid_color(value: &str) -> bool {
             .all(|character| character.is_ascii_hexdigit())
 }
 
+fn contrasting_text_color(background: &str) -> &'static str {
+    let channels = if background.len() == 4 {
+        [1, 2, 3]
+            .map(|index| u8::from_str_radix(&background[index..=index].repeat(2), 16).unwrap_or(0))
+    } else {
+        [1, 3, 5].map(|index| u8::from_str_radix(&background[index..index + 2], 16).unwrap_or(0))
+    };
+    let luminance = channels
+        .map(|channel| {
+            let value = f64::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        })
+        .into_iter()
+        .zip([0.2126, 0.7152, 0.0722])
+        .map(|(channel, weight)| channel * weight)
+        .sum::<f64>();
+    if luminance > 0.179 {
+        "#000000"
+    } else {
+        "#ffffff"
+    }
+}
+
 fn palette_css(palette: &Palette) -> String {
     format!(
         r#"
@@ -124,7 +151,7 @@ fn palette_css(palette: &Palette) -> String {
   --dialog-fg-color: {foreground};
   --accent-color: {accent};
   --accent-bg-color: {accent};
-  --accent-fg-color: {darker_background};
+  --accent-fg-color: {accent_foreground};
   --destructive-color: {red};
   --destructive-bg-color: {red};
   --success-color: {green};
@@ -148,6 +175,7 @@ window.background, .background {{
         foreground = palette.foreground,
         muted = palette.muted,
         accent = palette.accent,
+        accent_foreground = contrasting_text_color(&palette.accent),
         selection = palette.selection,
         red = palette.red,
         green = palette.green,
@@ -179,6 +207,8 @@ yellow = "#459451"
         .unwrap();
         assert_eq!(palette.background, "#111c18");
         assert!(palette_css(&palette).contains("--accent-color: #509475"));
+        assert_eq!(contrasting_text_color("#56949f"), "#000000");
+        assert_eq!(contrasting_text_color("#315c9e"), "#ffffff");
         assert!(parse_palette("background = \"red; window { color: red; }\"").is_none());
     }
 }

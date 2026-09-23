@@ -16,6 +16,7 @@ on your computer apart from requests to Google.
 - Gmail search and offline mailbox cache
 - Read, archive, star, mark unread, and trash messages
 - Compose, reply, save drafts, and send messages
+- Always-light message editor with formatting, file attachments, and pasted inline images
 
 ## Gmail app-password setup
 
@@ -54,7 +55,7 @@ its account profiles.
 On Arch Linux:
 
 ```sh
-sudo pacman -S --needed rust gtk4 libadwaita webkitgtk-6.0
+sudo pacman -S --needed rust gtk4 libadwaita webkitgtk-6.0 librsvg
 cargo run
 ```
 
@@ -76,7 +77,8 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 This installs the release binary under `~/.local/bin` and registers Postbird in
-the desktop application menu.
+the desktop application menu. The installer uses `rsvg-convert` from `librsvg`
+to prepare the Lucide icons in GTK's symbolic PNG format at several sizes.
 
 ## Local data
 

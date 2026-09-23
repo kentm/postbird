@@ -9,11 +9,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::{
     accounts::{AccountKind, AccountStore},
+    cache::MailCache,
     gmail::{Body, ComposeMessage, Draft, Label, Thread, ThreadPage, ThreadRef, encode_message},
 };
 
@@ -39,6 +40,26 @@ pub struct GoaAccount {
     pub email: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MailCursor {
+    pub uidvalidity: u64,
+    pub uidnext: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct IncomingMail {
+    pub id: String,
+    pub thread_id: String,
+    pub sender: String,
+    pub subject: String,
+}
+
+#[derive(Deserialize)]
+pub struct IncomingMailPoll {
+    pub cursor: MailCursor,
+    pub messages: Vec<IncomingMail>,
+}
+
 #[derive(Deserialize)]
 pub struct BatchUpdateResult {
     pub updated: Vec<String>,
@@ -50,6 +71,18 @@ struct HelperResponse {
     ok: bool,
     result: Option<Value>,
     error: Option<String>,
+    error_kind: Option<String>,
+}
+
+fn imap_pause_message(email: &str, retry_at: i64) -> String {
+    let until = chrono::DateTime::from_timestamp(retry_at, 0)
+        .unwrap_or_default()
+        .with_timezone(&chrono::Local)
+        .format("%H:%M")
+        .to_string();
+    format!(
+        "Gmail is limiting IMAP access for {email}. Requests are paused until {until}; cached mail remains available."
+    )
 }
 
 impl ImapClient {
@@ -94,6 +127,16 @@ impl ImapClient {
         operation: &str,
         fields: Value,
     ) -> Result<T> {
+        // Persist the cooldown so closing/reopening Postbird doesn't hammer an
+        // account that Gmail has already limited. SMTP-only sends are separate.
+        let cache = (!email.is_empty() && operation != "send")
+            .then(MailCache::open)
+            .transpose()?;
+        if let Some(cache) = &cache
+            && let Some(retry_at) = cache.imap_retry_at(email, chrono::Utc::now().timestamp())?
+        {
+            bail!("{}", imap_pause_message(email, retry_at));
+        }
         let mut request = json!({
             "operation": operation,
             "email": email,
@@ -124,6 +167,25 @@ impl ImapClient {
         }
         let response: HelperResponse = serde_json::from_slice(&output.stdout)
             .context("mail helper returned an invalid response")?;
+        let mut response = response;
+        let partial_quota = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("error_kind"))
+            .and_then(Value::as_str)
+            == Some("rate_limited");
+        if response.error_kind.as_deref() == Some("rate_limited") || partial_quota {
+            let retry_at = chrono::Utc::now().timestamp() + 15 * 60;
+            if let Some(cache) = &cache {
+                cache.pause_imap(email, retry_at)?;
+            }
+            let message = imap_pause_message(email, retry_at);
+            if partial_quota {
+                response.result.as_mut().unwrap()["error"] = json!(message);
+            } else {
+                response.error = Some(message);
+            }
+        }
         if !response.ok {
             bail!(
                 "{}",
@@ -172,6 +234,10 @@ impl ImapClient {
 
     pub fn unread_counts(&mut self, labels: &[String]) -> Result<Vec<u32>> {
         self.call("unread_counts", json!({"labels": labels}))
+    }
+
+    pub fn poll_new_mail(&mut self, cursor: Option<&MailCursor>) -> Result<IncomingMailPoll> {
+        self.call("poll_new_mail", json!({"cursor": cursor}))
     }
 
     pub fn list_threads(

@@ -1,5 +1,8 @@
 import email
 import email.policy
+import imaplib
+import io
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -8,6 +11,109 @@ import gmail_imap_backend as backend
 
 
 class GmailImapBackendTests(unittest.TestCase):
+    @patch("gmail_imap_backend.dispatch_once")
+    def test_gmail_overquota_is_recognized_without_reconnecting(self, dispatch_once):
+        dispatch_once.side_effect = imaplib.IMAP4.abort(
+            "command: EXAMINE => [OVERQUOTA] Account exceeded command or bandwidth limits. secret-token"
+        )
+        output = io.StringIO()
+        with patch("sys.stdin", io.StringIO('{"operation": "list_threads"}')), patch("sys.stdout", output):
+            backend.main()
+        dispatch_once.assert_called_once()
+        result = json.loads(output.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_kind"], "rate_limited")
+        self.assertIn("OVERQUOTA", result["error"])
+        self.assertNotIn("secret-token", output.getvalue())
+
+    def test_overquota_no_reply_has_the_same_classification(self):
+        with self.assertRaises(backend.MailQuotaError):
+            backend.require_ok(("NO", [b"[OVERQUOTA] Too much bandwidth"]), "FETCH")
+
+    @patch("gmail_imap_backend.mailbox_name", side_effect=lambda _connection, label: label)
+    def test_read_status_update_preserves_partial_progress_when_limited(self, _mailbox_name):
+        connection = MagicMock()
+        connection.select.side_effect = [
+            ("OK", [b"1"]),
+            imaplib.IMAP4.abort("[OVERQUOTA] Account exceeded command or bandwidth limits."),
+        ]
+        connection.uid.side_effect = [("OK", [b"7"]), ("OK", [b""]), ("OK", [b""])]
+        result = backend.set_unread_many(connection, {"ids": ["first", "second"], "value": False})
+        self.assertEqual(result["updated"], ["first"])
+        self.assertEqual(result["error_kind"], "rate_limited")
+        self.assertIn("OVERQUOTA", result["error"])
+
+    @patch("gmail_imap_backend.connect_imap")
+    def test_refresh_reconnects_and_restarts_after_an_imap_abort(self, connect_imap):
+        interrupted, recovered = MagicMock(), MagicMock()
+        connect_imap.side_effect = [interrupted, recovered]
+        interrupted.select.return_value = ("OK", [b"2"])
+        interrupted.fetch.side_effect = imaplib.IMAP4.abort("socket error: EOF")
+        # A deletion happened between attempts; the new session must reselect
+        # the mailbox and use its current message count.
+        recovered.select.return_value = ("OK", [b"1"])
+        recovered.fetch.return_value = ("OK", [b"1 (X-GM-THRID 456)"])
+        result = backend.dispatch({"operation": "list_threads", "label": "INBOX"})
+        self.assertEqual(result, {"threads": [{"id": "456"}]})
+        self.assertEqual(connect_imap.call_count, 2)
+        interrupted.fetch.assert_called_once_with("1:2", "(X-GM-THRID)")
+        interrupted.shutdown.assert_called_once()
+        interrupted.logout.assert_not_called()
+        recovered.select.assert_called_once_with("INBOX", readonly=True)
+        recovered.fetch.assert_called_once_with("1:1", "(X-GM-THRID)")
+        recovered.logout.assert_called_once()
+
+    @patch("gmail_imap_backend.dispatch_once")
+    def test_read_reconnect_is_bounded_and_reports_no_server_secrets(self, dispatch_once):
+        dispatch_once.side_effect = imaplib.IMAP4.abort("server echoed secret-token")
+        output = io.StringIO()
+        with patch("sys.stdin", io.StringIO('{"operation": "threads"}')), patch("sys.stdout", output):
+            backend.main()
+        self.assertEqual(dispatch_once.call_count, 2)
+        result = json.loads(output.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertIn("loading conversations", result["error"])
+        self.assertIn("reconnect", result["error"])
+        self.assertNotIn("authentication", result["error"])
+        self.assertNotIn("secret-token", output.getvalue())
+
+    @patch("gmail_imap_backend.dispatch_once")
+    def test_authentication_errors_are_not_retried(self, dispatch_once):
+        dispatch_once.side_effect = imaplib.IMAP4.error("authentication failed")
+        with self.assertRaises(imaplib.IMAP4.error):
+            backend.dispatch({"operation": "list_threads"})
+        dispatch_once.assert_called_once()
+
+    @patch("gmail_imap_backend.dispatch_once")
+    def test_writes_are_never_replayed_after_an_abort(self, dispatch_once):
+        dispatch_once.side_effect = imaplib.IMAP4.abort("lost acknowledgement")
+        for operation in ("send", "create_draft", "write_existing_draft", "trash",
+                          "archive_thread", "set_unread", "set_unread_many", "set_starred"):
+            with self.subTest(operation=operation):
+                dispatch_once.reset_mock()
+                with self.assertRaises(imaplib.IMAP4.abort):
+                    backend.dispatch({"operation": operation})
+                dispatch_once.assert_called_once()
+
+    @patch("gmail_imap_backend.mailbox_name", side_effect=lambda _connection, label: label)
+    def test_thread_refresh_keeps_surviving_messages_when_a_searched_uid_disappears(self, _mailbox_name):
+        connection = MagicMock()
+        connection.select.return_value = ("OK", [b"2"])
+        connection.uid.side_effect = [
+            ("OK", [b"7 8"]),
+            # UID 7 was deleted after SEARCH; FETCH returns only the survivor.
+            ("OK", [
+                (b'1 (UID 8 X-GM-MSGID 108 X-GM-THRID 456 FLAGS (\\Seen) INTERNALDATE "23-Sep-2026 09:00:00 +0000" BODY[] {40}',
+                 b"Subject: Survivor\r\nContent-Type: text/plain\r\n\r\nRemaining body"),
+                b")",
+            ]),
+            ("OK", [b""]),  # Drafts
+            ("OK", [b""]),  # Trash (permanently deleted message)
+        ]
+        result = backend.threads(connection, ["456"])
+        self.assertEqual([message["id"] for message in result[0]["messages"]], ["108"])
+        self.assertEqual(result[0]["messages"][0]["snippet"], "Remaining body")
+
     def test_goa_lists_only_google_accounts_with_mail_and_xoauth2(self):
         def proxy(**values):
             result = MagicMock()
@@ -79,6 +185,47 @@ class GmailImapBackendTests(unittest.TestCase):
         connection.select.assert_not_called()
         connection.fetch.assert_not_called()
 
+    def test_new_mail_poll_baselines_without_alerting_for_existing_mail(self):
+        connection = MagicMock()
+        connection.status.return_value = ("OK", [b'"INBOX" (UIDVALIDITY 9 UIDNEXT 12)'])
+        self.assertEqual(
+            backend.poll_new_mail(connection, {}),
+            {"cursor": {"uidvalidity": 9, "uidnext": 12}, "messages": []},
+        )
+        connection.select.assert_not_called()
+        connection.uid.assert_not_called()
+
+    def test_new_mail_poll_fetches_only_new_unread_headers(self):
+        connection = MagicMock()
+        connection.status.return_value = ("OK", [b'"INBOX" (UIDVALIDITY 9 UIDNEXT 12)'])
+        connection.select.return_value = ("OK", [b"12"])
+        connection.uid.side_effect = [
+            ("OK", [b"10 11"]),
+            ("OK", [
+                (b"1 (UID 10 X-GM-MSGID 101 X-GM-THRID 201 FLAGS ())",
+                 b"From: Ada <ada@example.com>\r\nSubject: Hello\r\n\r\n"),
+                (b"2 (UID 11 X-GM-MSGID 102 X-GM-THRID 202 FLAGS (\\Seen))",
+                 b"From: Read <read@example.com>\r\nSubject: Already read\r\n\r\n"),
+            ]),
+        ]
+        result = backend.poll_new_mail(connection, {"cursor": {"uidvalidity": 9, "uidnext": 10}})
+        self.assertEqual(result, {
+            "cursor": {"uidvalidity": 9, "uidnext": 12},
+            "messages": [{"id": "101", "thread_id": "201", "sender": "Ada <ada@example.com>", "subject": "Hello"}],
+        })
+        self.assertEqual(connection.uid.call_args_list[0].args,
+                         ("SEARCH", None, "UNSEEN", "UID", "10:11"))
+        self.assertIn("BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]",
+                      connection.uid.call_args_list[1].args[2])
+
+    def test_new_mail_poll_rebaselines_when_uidvalidity_changes(self):
+        connection = MagicMock()
+        connection.status.return_value = ("OK", [b'"INBOX" (UIDVALIDITY 10 UIDNEXT 500)'])
+        result = backend.poll_new_mail(connection, {"cursor": {"uidvalidity": 9, "uidnext": 10}})
+        self.assertEqual(result["messages"], [])
+        self.assertEqual(result["cursor"], {"uidvalidity": 10, "uidnext": 500})
+        connection.uid.assert_not_called()
+
     @patch("gmail_imap_backend.mailbox_name", return_value="[Gmail]/All Mail")
     def test_all_mail_unread_count_uses_its_mailbox(self, mailbox_name):
         connection = MagicMock()
@@ -149,6 +296,21 @@ class GmailImapBackendTests(unittest.TestCase):
         )
         self.assertTrue(backend.is_attachment(part))
         self.assertEqual(backend.payload(part)["body"]["attachmentId"], "")
+
+    def test_new_mail_retains_embedded_images_with_the_cached_body(self):
+        raw = (
+            b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=part\r\n\r\n"
+            b"--part\r\nContent-Type: text/html\r\n\r\n<p>Hello</p><img src=\"cid:logo\">\r\n"
+            b"--part\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\n"
+            b"Content-Disposition: inline; filename=logo.png\r\n"
+            b"Content-Transfer-Encoding: base64\r\n\r\nAQID\r\n--part--\r\n"
+        )
+        meta = b'1 (X-GM-MSGID 123 X-GM-THRID 456 FLAGS () INTERNALDATE "17-Jul-2026 02:44:25 +0000")'
+        message = backend.message_from_row((meta, raw))
+        html, image = message["payload"]["parts"]
+        self.assertIn(b"<p>Hello</p>", backend.decoded(html["body"]["data"]))
+        self.assertEqual(backend.decoded(image["body"]["data"]), b"\x01\x02\x03")
+        self.assertIsNone(image["body"]["attachmentId"])
 
     @patch("gmail_imap_backend.locate", return_value=b"7")
     @patch("gmail_imap_backend.fetch_rows")

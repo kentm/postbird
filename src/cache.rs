@@ -1,11 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
+
+const CACHE_SCHEMA_VERSION: i64 = 1;
+static CACHE_SCHEMA_LOCK: Mutex<()> = Mutex::new(());
 
 use crate::gmail::Message;
 
@@ -35,9 +40,21 @@ impl MailCache {
     }
 
     fn at(path: &Path) -> Result<Self> {
+        // Startup launches several cache users together. Serialize setup inside
+        // this process, and let SQLite arbitrate with any other process.
+        let _schema_guard = CACHE_SCHEMA_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cache initialization lock was poisoned"))?;
         let mut connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version >= CACHE_SCHEMA_VERSION {
+            return Ok(Self { connection });
+        }
         connection.execute_batch("PRAGMA journal_mode=WAL;")?;
-        let transaction = connection.transaction()?;
+        // Deferred read-then-write transactions can fail immediately with
+        // SQLITE_BUSY_SNAPSHOT even when a busy timeout is configured.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS mailbox_messages (
                  account TEXT NOT NULL,
@@ -46,6 +63,17 @@ impl MailCache {
                  internal_date INTEGER NOT NULL DEFAULT 0,
                  message_json TEXT NOT NULL,
                  PRIMARY KEY(account, mailbox, id)
+             );
+             CREATE TABLE IF NOT EXISTS message_images (
+                 account TEXT NOT NULL,
+                 message_id TEXT NOT NULL,
+                 part_id TEXT NOT NULL,
+                 data BLOB NOT NULL,
+                 PRIMARY KEY(account, message_id, part_id)
+             );
+             CREATE TABLE IF NOT EXISTS imap_backoff (
+                 account TEXT PRIMARY KEY,
+                 retry_at INTEGER NOT NULL
              );",
         )?;
         let has_legacy_inbox = transaction.query_row(
@@ -61,6 +89,7 @@ impl MailCache {
             )?;
             transaction.execute("DROP TABLE messages", [])?;
         }
+        transaction.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION)?;
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -71,7 +100,15 @@ impl MailCache {
         mailbox: &str,
         messages: &[Message],
     ) -> Result<()> {
-        let transaction = self.connection.transaction()?;
+        // Encoding embedded images can be expensive; do it before taking the
+        // write lock so other accounts can continue using the cache.
+        let serialized = messages
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "DELETE FROM mailbox_messages WHERE account = ?1 AND mailbox = ?2",
             params![account, mailbox],
@@ -80,13 +117,13 @@ impl MailCache {
             let mut statement = transaction.prepare(
                 "INSERT INTO mailbox_messages(account, mailbox, id, internal_date, message_json) VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
-            for message in messages {
+            for (message, json) in messages.iter().zip(serialized) {
                 statement.execute(params![
                     account,
                     mailbox,
                     message.id,
                     message.internal_date.parse::<i64>().unwrap_or_default(),
-                    serde_json::to_string(message)?,
+                    json,
                 ])?;
             }
         }
@@ -112,6 +149,41 @@ impl MailCache {
         self.set_label(account, message_ids, "UNREAD", false)
     }
 
+    pub fn inline_images(
+        &self,
+        account: &str,
+        message_id: &str,
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT part_id, data FROM message_images WHERE account = ?1 AND message_id = ?2",
+        )?;
+        Ok(statement
+            .query_map(params![account, message_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn store_inline_images(
+        &mut self,
+        account: &str,
+        message_id: &str,
+        images: &HashMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (part_id, data) in images {
+            transaction.execute(
+                "INSERT OR REPLACE INTO message_images(account, message_id, part_id, data)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![account, message_id, part_id, data],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn set_label(
         &mut self,
         account: &str,
@@ -120,7 +192,9 @@ impl MailCache {
         enabled: bool,
     ) -> Result<()> {
         let ids = message_ids.iter().collect::<HashSet<_>>();
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows = {
             let mut statement = transaction.prepare(
                 "SELECT mailbox, id, message_json FROM mailbox_messages WHERE account = ?1",
@@ -172,24 +246,13 @@ impl MailCache {
     }
 
     pub fn remove_messages(&mut self, account: &str, message_ids: &[String]) -> Result<()> {
-        let ids = message_ids.iter().collect::<HashSet<_>>();
-        let messages = self
-            .messages(account, "INBOX")?
-            .into_iter()
-            .filter(|message| !ids.contains(&message.id))
-            .collect::<Vec<_>>();
-        self.replace_mailbox(account, "INBOX", &messages)
-    }
-
-    pub fn remove_messages_everywhere(
-        &mut self,
-        account: &str,
-        message_ids: &[String],
-    ) -> Result<()> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
-            let mut delete = transaction
-                .prepare("DELETE FROM mailbox_messages WHERE account = ?1 AND id = ?2")?;
+            let mut delete = transaction.prepare(
+                "DELETE FROM mailbox_messages WHERE account = ?1 AND mailbox = 'INBOX' AND id = ?2",
+            )?;
             for id in message_ids {
                 delete.execute(params![account, id])?;
             }
@@ -198,9 +261,58 @@ impl MailCache {
         Ok(())
     }
 
+    pub fn remove_messages_everywhere(
+        &mut self,
+        account: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut delete = transaction
+                .prepare("DELETE FROM mailbox_messages WHERE account = ?1 AND id = ?2")?;
+            for id in message_ids {
+                delete.execute(params![account, id])?;
+                transaction.execute(
+                    "DELETE FROM message_images WHERE account = ?1 AND message_id = ?2",
+                    params![account, id],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn imap_retry_at(&self, account: &str, now: i64) -> Result<Option<i64>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT retry_at FROM imap_backoff WHERE account = ?1 AND retry_at > ?2",
+                params![account, now],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn pause_imap(&self, account: &str, retry_at: i64) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO imap_backoff(account, retry_at) VALUES (?1, ?2)
+             ON CONFLICT(account) DO UPDATE SET retry_at = MAX(retry_at, excluded.retry_at)",
+            params![account, retry_at],
+        )?;
+        Ok(())
+    }
+
     pub fn remove_account(&mut self, account: &str) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM mailbox_messages WHERE account = ?1", [account])?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM mailbox_messages WHERE account = ?1", [account])?;
+        transaction.execute("DELETE FROM message_images WHERE account = ?1", [account])?;
+        transaction.execute("DELETE FROM imap_backoff WHERE account = ?1", [account])?;
+        transaction.commit()?;
         Ok(())
     }
 }
@@ -210,12 +322,204 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn opening_an_initialized_cache_does_not_need_the_write_lock() {
+        let directory = std::env::temp_dir().join(format!(
+            "postbird-cache-reader-{}",
+            gtk::glib::uuid_string_random()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("mail.db");
+        let mut writer = MailCache::at(&path).unwrap();
+        let transaction = writer
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO imap_backoff(account, retry_at) VALUES ('account', 1000)",
+                [],
+            )
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let read_result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let result =
+                    MailCache::at(&path).and_then(|cache| cache.imap_retry_at("account", 999));
+                sender.send(result).unwrap();
+            });
+            // The reader must finish while the write is still uncommitted.
+            let result = receiver.recv_timeout(Duration::from_secs(2));
+            transaction.commit().unwrap();
+            result
+        });
+        assert_eq!(read_result.unwrap().unwrap(), None);
+        assert_eq!(writer.imap_retry_at("account", 999).unwrap(), Some(1000));
+        drop(writer);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_startup_and_cache_updates_do_not_lock_each_other_out() {
+        let directory = std::env::temp_dir().join(format!(
+            "postbird-concurrent-{}",
+            gtk::glib::uuid_string_random()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("mail.db");
+        let barrier = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|index| {
+                    let path = &path;
+                    let barrier = &barrier;
+                    scope.spawn(move || -> Result<()> {
+                        barrier.wait();
+                        let account = format!("account-{index}@example.com");
+                        for _ in 0..12 {
+                            let mut cache = MailCache::at(path)?;
+                            cache.replace_mailbox(&account, "INBOX", &[test_message()])?;
+                            cache.mark_read(&account, &["one".into()])?;
+                            cache.set_label(&account, &["one".into()], "STARRED", true)?;
+                            cache.pause_imap(&account, 1000)?;
+                            assert_eq!(cache.imap_retry_at(&account, 999)?, Some(1000));
+                            let messages = cache.messages(&account, "INBOX")?;
+                            assert_eq!(messages.len(), 1);
+                            assert!(!messages[0].label_ids.contains(&"UNREAD".into()));
+                            assert!(messages[0].label_ids.contains(&"STARRED".into()));
+                        }
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        std::fs::remove_dir_all(directory).unwrap();
+        for result in results {
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    fn imap_pause_survives_reopening_and_only_blocks_the_limited_account() {
+        let path = std::env::temp_dir().join(format!(
+            "postbird-backoff-{}.db",
+            gtk::glib::uuid_string_random()
+        ));
+        {
+            let cache = MailCache::at(&path).unwrap();
+            cache.pause_imap("limited@example.com", 1000).unwrap();
+            cache.pause_imap("limited@example.com", 900).unwrap();
+        }
+        {
+            let mut cache = MailCache::at(&path).unwrap();
+            assert_eq!(
+                cache.imap_retry_at("limited@example.com", 999).unwrap(),
+                Some(1000)
+            );
+            assert_eq!(cache.imap_retry_at("other@example.com", 999).unwrap(), None);
+            assert_eq!(
+                cache.imap_retry_at("limited@example.com", 1000).unwrap(),
+                None
+            );
+            cache.remove_account("limited@example.com").unwrap();
+            assert_eq!(
+                cache.imap_retry_at("limited@example.com", 999).unwrap(),
+                None
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn test_message() -> Message {
         serde_json::from_value(json!({
             "id": "one", "threadId": "thread", "internalDate": "42",
             "labelIds": ["INBOX", "UNREAD"], "snippet": "preview", "payload": {}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn body_and_embedded_images_survive_cache_reopening() {
+        let path = std::env::temp_dir().join(format!(
+            "postbird-image-cache-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let message: Message = serde_json::from_value(json!({
+            "id": "one", "threadId": "thread", "payload": {
+                "mimeType": "multipart/related", "parts": [
+                    {"mimeType": "text/html", "body": {"data": "PGI-SGVsbG88L2I-"}},
+                    {"mimeType": "image/png", "headers": [{"name": "Content-ID", "value": "<logo>"}],
+                     "body": {"data": "AQID"}}
+                ]
+            }
+        })).unwrap();
+        let images = HashMap::from([("1".to_owned(), vec![1, 2, 3])]);
+        {
+            let mut cache = MailCache::at(&path).unwrap();
+            cache
+                .replace_mailbox("one@example.com", "INBOX", &[message])
+                .unwrap();
+            cache
+                .store_inline_images("one@example.com", "older", &images)
+                .unwrap();
+            cache
+                .store_inline_images("two@example.com", "older", &images)
+                .unwrap();
+        }
+        let mut cache = MailCache::at(&path).unwrap();
+        let message = &cache.messages("one@example.com", "INBOX").unwrap()[0];
+        assert_eq!(message.body_html().as_deref(), Some("<b>Hello</b>"));
+        assert_eq!(
+            message.inline_image_parts()[0].0.body.data.as_deref(),
+            Some("AQID")
+        );
+        assert_eq!(
+            cache.inline_images("one@example.com", "older").unwrap(),
+            images
+        );
+        assert!(
+            cache
+                .inline_images("missing@example.com", "older")
+                .unwrap()
+                .is_empty()
+        );
+        cache
+            .replace_mailbox("one@example.com", "INBOX", &[])
+            .unwrap();
+        assert_eq!(
+            cache.inline_images("one@example.com", "older").unwrap(),
+            images
+        );
+        cache.remove_account("one@example.com").unwrap();
+        assert!(
+            cache
+                .inline_images("one@example.com", "older")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cache.inline_images("two@example.com", "older").unwrap(),
+            images
+        );
+        cache
+            .remove_messages_everywhere("two@example.com", &["older".to_owned()])
+            .unwrap();
+        assert!(
+            cache
+                .inline_images("two@example.com", "older")
+                .unwrap()
+                .is_empty()
+        );
+        drop(cache);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

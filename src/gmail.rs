@@ -160,11 +160,32 @@ pub(crate) fn encode_message(email: &str, message: &ComposeMessage) -> Result<St
     if let Some(reference) = &message.in_reply_to {
         builder = builder.in_reply_to(reference.clone());
     }
-    let content = message
-        .html_body
-        .as_ref()
-        .map(|html| MultiPart::alternative_plain_html(message.body.clone(), html.clone()));
-    let mime = if message.attachments.is_empty() && message.forwarded_attachments.is_empty() {
+    let content = if let Some(html) = &message.html_body {
+        let alternative =
+            MultiPart::alternative().singlepart(SinglePart::plain(message.body.clone()));
+        let images = message
+            .forwarded_attachments
+            .iter()
+            .filter(|file| file.content_id.is_some())
+            .collect::<Vec<_>>();
+        Some(if images.is_empty() {
+            alternative.singlepart(SinglePart::html(html.clone()))
+        } else {
+            let mut related = MultiPart::related().singlepart(SinglePart::html(html.clone()));
+            for image in images {
+                related = related.singlepart(image.mime_part()?);
+            }
+            alternative.multipart(related)
+        })
+    } else {
+        None
+    };
+    let files = message
+        .forwarded_attachments
+        .iter()
+        .filter(|file| file.content_id.is_none() || message.html_body.is_none())
+        .collect::<Vec<_>>();
+    let mime = if message.attachments.is_empty() && files.is_empty() {
         if let Some(content) = content {
             builder.multipart(content)?
         } else {
@@ -190,7 +211,7 @@ pub(crate) fn encode_message(email: &str, message: &ComposeMessage) -> Result<St
                 ),
             );
         }
-        for attachment in &message.forwarded_attachments {
+        for attachment in files {
             multipart = multipart.singlepart(attachment.mime_part()?);
         }
         builder.multipart(multipart)?
@@ -488,6 +509,73 @@ mod tests {
         assert!(raw.contains("Bcc: hidden@example.com"));
         assert!(raw.contains("Content-ID: <image-1>"));
         assert!(raw.contains("inline"));
+        assert!(raw.contains("multipart/related"));
+    }
+
+    #[test]
+    fn inline_images_and_file_attachments_have_distinct_mime_parts() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let path =
+            std::env::temp_dir().join(format!("postbird-attachment-{}.txt", std::process::id()));
+        std::fs::write(&path, b"selected file bytes").unwrap();
+        let message = ComposeMessage {
+            to: "reader@example.com".into(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Images and files".into(),
+            body: "Before [Image: Screenshot.png] after".into(),
+            html_body: Some(
+                "<p>Before<img src=\"cid:screenshot\" alt=\"Screenshot.png\"> after</p>".into(),
+            ),
+            in_reply_to: None,
+            thread_id: None,
+            attachments: vec![path.clone()],
+            forwarded_attachments: vec![ForwardedAttachment {
+                content_id: Some("screenshot".into()),
+                filename: "Screenshot.png".into(),
+                mime_type: "image/png".into(),
+                data: (&b"original image bytes"[..]).into(),
+            }],
+        };
+        let raw = decode_attachment_data(&encode_message("sender@example.com", &message).unwrap())
+            .unwrap();
+        // Parse independently with the same standard MIME parser used by the IMAP backend.
+        let mut parser = Command::new("python3").args(["-c", r#"
+import email, email.policy, json, sys
+message = email.message_from_bytes(sys.stdin.buffer.read(), policy=email.policy.default)
+alternative, file = list(message.iter_parts())
+plain, related = list(alternative.iter_parts())
+html, image = list(related.iter_parts())
+print(json.dumps({
+    'structure': [message.get_content_type(), alternative.get_content_type(), related.get_content_type()],
+    'plain': plain.get_content().strip(), 'html': html.get_content().strip(),
+    'image_id': str(image['Content-ID']), 'image_disposition': image.get_content_disposition(),
+    'image_bytes': image.get_payload(decode=True).decode(),
+    'file_disposition': file.get_content_disposition(), 'file_bytes': file.get_payload(decode=True).decode()
+}))
+"#]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        parser.stdin.take().unwrap().write_all(&raw).unwrap();
+        let output = parser.wait_with_output().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(output.status.success());
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            parsed["structure"],
+            json!([
+                "multipart/mixed",
+                "multipart/alternative",
+                "multipart/related"
+            ])
+        );
+        assert_eq!(parsed["plain"], message.body);
+        assert_eq!(parsed["html"], message.html_body.unwrap());
+        assert_eq!(parsed["image_id"], "<screenshot>");
+        assert_eq!(parsed["image_disposition"], "inline");
+        assert_eq!(parsed["image_bytes"], "original image bytes");
+        assert_eq!(parsed["file_disposition"], "attachment");
+        assert_eq!(parsed["file_bytes"], "selected file bytes");
     }
 
     #[test]

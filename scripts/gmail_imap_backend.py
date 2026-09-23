@@ -27,6 +27,34 @@ SPECIAL = {
     "ALL": "[Gmail]/All Mail",
 }
 
+# Only reads may be replayed after losing a connection. A write might already
+# have reached Gmail even if its acknowledgement never reached us.
+RETRYABLE_READS = {
+    "labels": "loading folders",
+    "unread_counts": "checking unread counts",
+    "poll_new_mail": "checking for new mail",
+    "list_threads": "refreshing the mailbox",
+    "thread": "loading a conversation",
+    "threads": "loading conversations",
+    "attachment": "downloading an attachment",
+    "inline_images": "loading embedded images",
+    "draft_for_message": "opening a draft",
+}
+
+
+class MailQuotaError(RuntimeError):
+    def __init__(self):
+        super().__init__("Gmail is limiting this account's IMAP commands or bandwidth (OVERQUOTA)")
+
+
+def over_quota(value):
+    # Inspect only the response code. Never copy arbitrary server text into errors.
+    return "[OVERQUOTA]" in str(value).upper()
+
+
+def quota_failure():
+    return {"error": str(MailQuotaError()), "error_kind": "rate_limited"}
+
 
 def encoded(data):
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
@@ -70,6 +98,8 @@ def decode_mailbox(value):
 def require_ok(reply, operation):
     status, data = reply
     if status != "OK":
+        if over_quota(data):
+            raise MailQuotaError()
         raise RuntimeError(f"IMAP {operation} failed")
     return data
 
@@ -239,7 +269,10 @@ def payload(part, path="", inline_attachments=False):
             for index, child in enumerate(part.iter_parts())
         ]
     else:
-        if is_attachment(part) and not inline_attachments:
+        # BODY.PEEK[] already downloaded these bytes. Keep CID images with the
+        # body so opening a cached message does not fetch the whole email again.
+        embedded_image = part.get_content_maintype() == "image" and bool(part.get("Content-ID"))
+        if is_attachment(part) and not inline_attachments and not embedded_image:
             body["attachmentId"] = path
         else:
             content = part.get_payload(decode=True) or (part.as_bytes() if part.is_multipart() else b"")
@@ -420,6 +453,49 @@ def unread_counts(connection, labels):
     return counts
 
 
+def poll_new_mail(connection, request):
+    status = b" ".join(require_ok(connection.status('"INBOX"', "(UIDVALIDITY UIDNEXT)"), "STATUS") or [])
+    validity = metadata(status, b"UIDVALIDITY")
+    next_uid = metadata(status, b"UIDNEXT")
+    if not validity or not next_uid:
+        raise RuntimeError("IMAP STATUS did not include Inbox UID information")
+    cursor = {"uidvalidity": int(validity), "uidnext": int(next_uid)}
+    previous = request.get("cursor")
+    if (
+        not previous
+        or previous.get("uidvalidity") != cursor["uidvalidity"]
+        or previous.get("uidnext", 0) >= cursor["uidnext"]
+    ):
+        return {"cursor": cursor, "messages": []}
+
+    select(connection, "INBOX")
+    new_uids = ids(connection, "UNSEEN", "UID", f'{previous["uidnext"]}:{cursor["uidnext"] - 1}')
+    recent_uids = sorted(new_uids, key=int)[-20:]
+    rows = fetch_rows(
+        connection,
+        recent_uids,
+        "(UID X-GM-MSGID X-GM-THRID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])",
+    )
+    messages = []
+    for meta, raw in rows:
+        flags = re.search(rb"\bFLAGS\s+\(([^)]*)\)", meta, re.I)
+        if flags and b"\\seen" in flags.group(1).lower().split():
+            continue
+        message_id = metadata(meta, b"X-GM-MSGID")
+        thread_id = metadata(meta, b"X-GM-THRID")
+        uid = metadata(meta, b"UID")
+        if not message_id or not thread_id or not uid:
+            raise RuntimeError("Gmail IMAP message identifiers are unavailable")
+        headers = email.message_from_bytes(raw, policy=email.policy.default)
+        messages.append((int(uid), {
+            "id": message_id,
+            "thread_id": thread_id,
+            "sender": " ".join(str(headers.get("From", "")).split()),
+            "subject": " ".join(str(headers.get("Subject", "")).split()),
+        }))
+    return {"cursor": cursor, "messages": [message for _, message in sorted(messages)]}
+
+
 def set_unread_many(connection, request):
     remaining = list(dict.fromkeys(request["ids"]))
     updated = []
@@ -440,7 +516,13 @@ def set_unread_many(connection, request):
                 updated.extend(message_id for message_id, _ in found)
                 found_ids = {message_id for message_id, _ in found}
                 remaining = [message_id for message_id in remaining if message_id not in found_ids]
+        except MailQuotaError:
+            return {"updated": updated, **quota_failure()}
         except imaplib.IMAP4.error as error:
+            if over_quota(error):
+                return {"updated": updated, **quota_failure()}
+            if isinstance(error, imaplib.IMAP4.abort):
+                return {"updated": updated, "error": "Mail connection interrupted while updating read status"}
             return {"updated": updated, "error": f"Mail authentication or protocol error ({type(error).__name__})"}
         except OSError as error:
             return {"updated": updated, "error": f"Mail network error ({type(error).__name__})"}
@@ -540,6 +622,20 @@ def existing_draft(connection, request):
 
 
 def dispatch(request):
+    attempts = 2 if request["operation"] in RETRYABLE_READS else 1
+    for attempt in range(attempts):
+        try:
+            return dispatch_once(request)
+        except imaplib.IMAP4.error as error:
+            if over_quota(error):
+                raise MailQuotaError() from None
+            # An abort invalidates the IMAP session. Restart the entire read so
+            # mailbox selection, searches and UIDs all belong to a fresh session.
+            if not isinstance(error, imaplib.IMAP4.abort) or attempt + 1 == attempts:
+                raise
+
+
+def dispatch_once(request):
     operation = request["operation"]
     if operation == "goa_accounts":
         return goa_accounts()
@@ -566,6 +662,8 @@ def dispatch(request):
             return list_labels(connection)
         if operation == "unread_counts":
             return unread_counts(connection, request["labels"])
+        if operation == "poll_new_mail":
+            return poll_new_mail(connection, request)
         if operation == "set_unread_many":
             return set_unread_many(connection, request)
         if operation == "list_threads":
@@ -606,18 +704,38 @@ def dispatch(request):
                 require_ok(connection.uid("STORE", uid, action, f"({flag})"), operation)
             return None
         raise RuntimeError("Unsupported mail operation")
-    finally:
+    except imaplib.IMAP4.abort:
+        # Do not wait for LOGOUT on an already broken protocol connection.
         try:
-            connection.logout()
-        except (imaplib.IMAP4.error, OSError):
+            connection.shutdown()
+        except OSError:
             pass
+        connection = None
+        raise
+    finally:
+        if connection is not None:
+            try:
+                connection.logout()
+            except (imaplib.IMAP4.error, OSError):
+                pass
 
 
 def main():
+    request = {}
     try:
         request = json.load(sys.stdin)
         result = dispatch(request)
         json.dump({"ok": True, "result": result}, sys.stdout)
+    except MailQuotaError:
+        json.dump({"ok": False, **quota_failure()}, sys.stdout)
+    except imaplib.IMAP4.abort:
+        # Keep server responses (which can echo credentials) out of the UI.
+        action = RETRYABLE_READS.get(request.get("operation"))
+        message = (
+            f"Mail connection interrupted while {action}; automatic reconnect also failed"
+            if action else "Mail connection interrupted; completion could not be confirmed"
+        )
+        json.dump({"ok": False, "error": message}, sys.stdout)
     except (imaplib.IMAP4.error, smtplib.SMTPException) as error:
         # Authentication failures may echo server text; do not forward it.
         json.dump({"ok": False, "error": f"Mail authentication or protocol error ({type(error).__name__})"}, sys.stdout)

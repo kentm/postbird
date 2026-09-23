@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     path::PathBuf,
+    process::{Command, Stdio},
     rc::Rc,
     sync::{
         Arc,
@@ -13,6 +14,7 @@ use std::{
 use adw::prelude::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Datelike, Local};
+use glib::variant::ToVariant;
 use gtk::{Align, Orientation, gio, glib};
 use lettre::message::{Mailbox, Mailboxes};
 use webkit6::prelude::*;
@@ -20,8 +22,9 @@ use webkit6::prelude::*;
 use crate::{
     accounts::{Account, AccountKind, AccountStore},
     cache::MailCache,
+    compose::{AttachmentList, InlineImages},
     gmail::{ComposeMessage, ForwardedAttachment, Message, Payload, ThreadRef},
-    mail::{ImapClient, MailClient},
+    mail::{ImapClient, IncomingMail, MailClient, MailCursor},
     preferences::{FavoriteFolder, UiPreferences},
 };
 
@@ -30,11 +33,11 @@ struct Widgets {
     window: adw::ApplicationWindow,
     toast: adw::ToastOverlay,
     sidebar_toast: adw::ToastOverlay,
+    activity: gtk::StringList,
     accounts: gtk::StringList,
     account_picker: gtk::DropDown,
     messages: gtk::ListBox,
     sidebar_navigation: gtk::Box,
-    mailbox_title: gtk::Label,
     mailbox_spinner: gtk::Spinner,
     message_title: gtk::Label,
     message_sender: gtk::Label,
@@ -49,9 +52,8 @@ struct Widgets {
     reply: gtk::Button,
     reply_all: gtk::Button,
     forward: gtk::Button,
-    search: gtk::SearchEntry,
+    search: gtk::Entry,
     preferences: Rc<RefCell<UiPreferences>>,
-    load_images: gtk::Button,
 }
 
 struct State {
@@ -62,6 +64,11 @@ struct State {
     unread_refresh_generation: HashMap<String, u64>,
     favorite_refresh_inflight: HashSet<String>,
     favorite_refresh_pending: HashSet<String>,
+    notification_cursors: HashMap<String, MailCursor>,
+    notification_poll_inflight: HashSet<String>,
+    notification_generation: u64,
+    last_notification_sound: Option<std::time::Instant>,
+    pending_notification_thread: Option<(String, String)>,
     mark_read_inflight: HashMap<String, usize>,
     collapsed_accounts: HashSet<String>,
     accounts_loaded: bool,
@@ -90,6 +97,11 @@ impl Default for State {
             unread_refresh_generation: HashMap::new(),
             favorite_refresh_inflight: HashSet::new(),
             favorite_refresh_pending: HashSet::new(),
+            notification_cursors: HashMap::new(),
+            notification_poll_inflight: HashSet::new(),
+            notification_generation: 0,
+            last_notification_sound: None,
+            pending_notification_thread: None,
             mark_read_inflight: HashMap::new(),
             collapsed_accounts: HashSet::new(),
             accounts_loaded: false,
@@ -125,23 +137,27 @@ pub fn build(app: &adw::Application) {
     let preferences = Rc::new(RefCell::new(UiPreferences::load()));
 
     let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.set_top_bar_style(adw::ToolbarStyle::Flat);
     let header = adw::HeaderBar::new();
+    header.add_css_class("postbird-header");
+    header.add_css_class("flat");
+    header.set_hexpand(true);
     let compose = gtk::Button::builder()
-        .label("Compose")
         .css_classes(["suggested-action"])
         .build();
-    let add_account = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text("Add mail account")
+    set_labeled_icon(&compose, "postbird-mail-plus-symbolic", "Compose");
+    let settings = gtk::Button::builder()
+        .icon_name("postbird-settings-symbolic")
+        .tooltip_text("Settings")
+        .css_classes(["flat", "postbird-settings-button"])
         .build();
-    let remove_account = gtk::Button::builder()
-        .icon_name("edit-delete-symbolic")
-        .tooltip_text("Remove current account")
-        .build();
+    settings.update_property(&[gtk::accessible::Property::Label("Settings")]);
     header.pack_start(&compose);
-    header.pack_end(&add_account);
-    header.pack_end(&remove_account);
-    toolbar_view.add_top_bar(&header);
+    header.pack_end(&settings);
+    let header_surface = gtk::Box::new(Orientation::Horizontal, 0);
+    header_surface.add_css_class("postbird-header-surface");
+    header_surface.append(&header);
+    toolbar_view.add_top_bar(&header_surface);
 
     let accounts = gtk::StringList::new(&[]);
     let account_picker = gtk::DropDown::builder()
@@ -152,10 +168,7 @@ pub fn build(app: &adw::Application) {
     messages.add_css_class("navigation-sidebar");
     messages.set_selection_mode(gtk::SelectionMode::Single);
     let sidebar_navigation = gtk::Box::new(Orientation::Vertical, 5);
-    let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search mail")
-        .build();
-    let mailbox_title = detail_label("Inbox", "title-2");
+    let search = mail_search_entry();
     let mailbox_spinner = gtk::Spinner::builder()
         .width_request(18)
         .height_request(18)
@@ -176,14 +189,13 @@ pub fn build(app: &adw::Application) {
     message_content.append(&message_sender);
     message_content.append(&conversation_scroll);
 
-    let archive = action_button("mail-archive-symbolic", "Archive");
-    let star = action_button("starred-symbolic", "Star");
-    let trash = action_button("user-trash-symbolic", "Move to Trash");
-    let unread = action_button("mail-mark-unread-symbolic", "Mark Unread");
-    let reply = action_button("mail-reply-sender-symbolic", "Reply");
-    let forward = action_button("mail-forward-symbolic", "Forward");
-    let reply_all = action_button("mail-reply-all-symbolic", "Reply All");
-    let load_images = action_button("image-x-generic-symbolic", "Always load remote images");
+    let archive = action_button("postbird-archive-symbolic", "Archive");
+    let star = action_button("postbird-star-check-symbolic", "Star");
+    let trash = action_button("postbird-trash-symbolic", "Move to Trash");
+    let unread = action_button("postbird-mail-check-symbolic", "Mark Unread");
+    let reply = action_button("postbird-reply-symbolic", "Reply");
+    let forward = action_button("postbird-forward-symbolic", "Forward");
+    let reply_all = action_button("postbird-reply-all-symbolic", "Reply All");
     let detail_actions = gtk::Box::new(Orientation::Horizontal, 6);
     detail_actions.add_css_class("postbird-actions");
     let organise_actions = gtk::Box::new(Orientation::Horizontal, 0);
@@ -198,10 +210,8 @@ pub fn build(app: &adw::Application) {
         button.add_css_class("flat");
         reply_actions.append(button);
     }
-    load_images.add_css_class("flat");
     detail_actions.append(&organise_actions);
     detail_actions.append(&reply_actions);
-    detail_actions.append(&load_images);
     message_content.prepend(&detail_actions);
 
     let message_status = adw::StatusPage::builder()
@@ -220,11 +230,11 @@ pub fn build(app: &adw::Application) {
         window: window.clone(),
         toast: toast.clone(),
         sidebar_toast,
+        activity: gtk::StringList::new(&[]),
         accounts,
         account_picker,
         messages,
         sidebar_navigation,
-        mailbox_title,
         mailbox_spinner,
         message_title,
         message_sender,
@@ -241,20 +251,40 @@ pub fn build(app: &adw::Application) {
         forward,
         search,
         preferences: preferences.clone(),
-        load_images,
     };
-    if preferences.borrow().load_remote_images {
-        widgets.load_images.set_sensitive(false);
-        widgets
-            .load_images
-            .set_tooltip_text(Some("Remote images enabled"));
-    }
+    let open_action = gio::SimpleAction::new("open-mail", Some(glib::VariantTy::STRING));
+    let action_widgets = widgets.clone();
+    let action_state = state.clone();
+    open_action.connect_activate(move |_, parameter| {
+        let Some((email, thread_id)) = parameter
+            .and_then(|value| value.str())
+            .and_then(|value| serde_json::from_str::<(String, String)>(value).ok())
+        else {
+            return;
+        };
+        if account_index(&action_state, &email).is_none() {
+            return;
+        }
+        select_mailbox(&action_widgets, &action_state, &email, "INBOX");
+        if !thread_id.is_empty() {
+            action_state.borrow_mut().pending_notification_thread = Some((email, thread_id));
+        }
+        action_widgets.window.present();
+    });
+    app.add_action(&open_action);
+    let state_for_shutdown = state.clone();
+    app.connect_shutdown(move |app| {
+        for email in &state_for_shutdown.borrow().account_emails {
+            app.withdraw_notification(&new_mail_notification_id(email));
+        }
+    });
 
     let message_split = gtk::Paned::new(Orientation::Horizontal);
+    message_split.add_css_class("postbird-message-split");
     message_split.set_start_child(Some(&message_list_panel(&widgets, &state)));
     message_split.set_end_child(Some(&detail_stack));
     message_split.set_position(preferences.borrow().message_split);
-    message_split.set_wide_handle(true);
+    message_split.set_wide_handle(false);
     message_split.set_resize_start_child(false);
     message_split.set_resize_end_child(true);
     message_split.set_shrink_start_child(false);
@@ -262,10 +292,11 @@ pub fn build(app: &adw::Application) {
     message_split.set_hexpand(true);
 
     let mailbox_split = gtk::Paned::new(Orientation::Horizontal);
+    mailbox_split.add_css_class("postbird-mailbox-split");
     mailbox_split.set_start_child(Some(&mailbox_sidebar(&widgets, &state)));
     mailbox_split.set_end_child(Some(&message_split));
     mailbox_split.set_position(preferences.borrow().mailbox_split.max(245));
-    mailbox_split.set_wide_handle(true);
+    mailbox_split.set_wide_handle(false);
     mailbox_split.set_resize_start_child(false);
     mailbox_split.set_resize_end_child(true);
     mailbox_split.set_shrink_start_child(false);
@@ -278,13 +309,11 @@ pub fn build(app: &adw::Application) {
 
     connect_selection(&widgets, &state, &detail_stack);
     connect_account_picker(&widgets, &state);
-    connect_add_account(&widgets, &state, &add_account);
-    connect_remove_account(&widgets, &state, &remove_account);
+    connect_settings(&widgets, &state, &settings);
     connect_search(&widgets, &state);
     connect_message_actions(&widgets, &state);
     connect_reply(&widgets, &state);
     connect_forward(&widgets, &state);
-    connect_remote_images(&widgets, &state);
     connect_compose(&widgets, &state, &compose);
     load_accounts(&widgets, &state);
     connect_background_sync(&widgets, &state);
@@ -312,11 +341,19 @@ fn install_visual_style() {
     };
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
-        "window.postbird-window { font-size: 0.92em; }
+        "window.postbird-window { font-size: 0.92em;
+             --headerbar-bg-color: #202633; --headerbar-fg-color: #eff3fb; }
+         .postbird-header-surface { background: #202633; }
+         .postbird-header, .postbird-header:backdrop {
+             background: transparent; color: #eff3fb; }
+         .postbird-header .postbird-settings-button { color: #eff3fb; }
          .postbird-sidebar { background: #202633; color: #eff3fb; }
+         .postbird-sidebar scrolledwindow, .postbird-sidebar viewport {
+             background: #202633; }
          .postbird-sidebar label, .postbird-sidebar image { color: #eff3fb; }
          .postbird-sidebar .dim-label, .postbird-sidebar-heading { color: #aeb8c9; }
          .postbird-sidebar-heading { margin: 4px 4px 1px; letter-spacing: 0.08em; }
+         .postbird-sidebar spinner { color: #aeb8c9; }
          .postbird-sidebar separator { background: #485062; margin: 5px 2px; }
          .postbird-sidebar expander { color: #eff3fb; }
          .postbird-account { margin-top: 2px; }
@@ -329,12 +366,24 @@ fn install_visual_style() {
          .postbird-favorite { min-width: 24px; padding: 0; opacity: 0.72; }
          .postbird-sidebar .postbird-unread-badge { background: #7daaff; color: #15243d;
              border-radius: 99px; padding: 1px 6px; font-weight: bold; font-size: 0.85em; }
-         .postbird-list-panel { background: #25282e; color: #edf0f5; }
+         .postbird-mailbox-split { background: #202633; }
+         .postbird-mailbox-split > separator { min-width: 3px; background: #394252;
+             border: 0; box-shadow: none; background-image: none; }
+         .postbird-message-split { background: #25282e; }
+         .postbird-message-split > separator { min-width: 3px; background: #3a4353;
+             border: 0; box-shadow: none; background-image: none; }
+         .postbird-list-panel { --sidebar-bg-color: #25282e;
+             --sidebar-fg-color: #edf0f5; }
+         .postbird-list-panel, .postbird-list-panel scrolledwindow,
+         .postbird-list-panel viewport, .postbird-list-panel list,
+         .postbird-list-panel .navigation-sidebar {
+             background: #25282e; color: #edf0f5; }
          .postbird-list-panel label, .postbird-list-panel image { color: #edf0f5; }
          .postbird-list-panel .dim-label { color: #afb4bd; }
-         .postbird-list-panel listbox, .postbird-list-panel row { background: transparent; }
+         .postbird-list-panel row { background: transparent; }
          .postbird-list-panel row:hover { background: #343b49; }
          .postbird-list-panel row:selected { background: #185bb4; }
+         .postbird-list-panel row:selected .dim-label { color: #dbe8ff; }
          .postbird-list-panel .postbird-unread-dot { min-width: 11px;
              color: #8db6ff; font-size: 11px; }
          .postbird-list-panel row.accent .postbird-row-subject { font-weight: 700; }
@@ -346,6 +395,8 @@ fn install_visual_style() {
          .postbird-reader .postbird-part-trigger { min-width: 20px; min-height: 0; padding: 0; }
          .postbird-reader .postbird-part-trigger > button { min-width: 0; min-height: 0;
              padding: 0; border: 0; box-shadow: none; background: transparent; }
+         .postbird-reader .postbird-message-action { min-width: 20px; min-height: 0;
+             padding: 0; border: 0; box-shadow: none; }
          .postbird-reader .message-section { background: #ffffff; color: #181b20;
              border: 0; border-bottom: 1px solid #e3e7ed; border-radius: 0; box-shadow: none; }
          .postbird-reader .postbird-history-toggle { background: #f0f4fa; border-radius: 12px;
@@ -353,7 +404,28 @@ fn install_visual_style() {
          .postbird-reader .postbird-history-toggle label { color: #315c9e; }
          .postbird-action-group { background: #f2f4f7; border-radius: 12px; padding: 2px; }
          .postbird-action-group button { min-width: 34px; min-height: 30px; }
-         .postbird-actions { margin-bottom: 11px; }",
+         .postbird-actions { margin-bottom: 11px; }
+         .postbird-compose {
+             --window-bg-color: #ffffff; --window-fg-color: #181b20;
+             --view-bg-color: #ffffff; --view-fg-color: #181b20;
+             --dialog-bg-color: #ffffff; --dialog-fg-color: #181b20;
+             --headerbar-bg-color: #f2f4f7; --headerbar-fg-color: #181b20;
+             --headerbar-backdrop-color: #f2f4f7;
+             --card-bg-color: #ffffff; --card-fg-color: #181b20;
+             --popover-bg-color: #ffffff; --popover-fg-color: #181b20;
+             --border-color: #d9dde4;
+             --accent-bg-color: #315c9e; --accent-fg-color: #ffffff;
+             --accent-color: #315c9e;
+             color: #181b20;
+         }
+         .postbird-compose textview, .postbird-compose textview text {
+             background: #ffffff; color: #181b20; caret-color: #181b20;
+         }
+         .postbird-compose entry { background: #f2f4f7; color: #181b20; caret-color: #181b20; }
+         .postbird-compose textview text selection, .postbird-compose entry selection {
+             background: #315c9e; color: #ffffff;
+         }
+         .postbird-compose .dim-label { color: #626975; }",
     );
     gtk::style_context_add_provider_for_display(
         &display,
@@ -368,7 +440,149 @@ fn connect_background_sync(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     glib::timeout_add_seconds_local(60, move || {
         sync_recent_inbox(&widgets, &state);
         refresh_favorite_counts(&widgets, &state);
+        poll_new_mail_all(&widgets, &state);
         glib::ControlFlow::Continue
+    });
+}
+
+fn poll_new_mail_all(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    let preferences = widgets.preferences.borrow();
+    if !preferences.notify_new_mail && !preferences.play_new_mail_sound {
+        return;
+    }
+    drop(preferences);
+    let emails = state.borrow().account_emails.clone();
+    for email in emails {
+        poll_new_mail_account(widgets, state, email);
+    }
+}
+
+fn poll_new_mail_account(widgets: &Widgets, state: &Rc<RefCell<State>>, email: String) {
+    let (cursor, generation) = {
+        let mut state = state.borrow_mut();
+        if !state.account_emails.contains(&email)
+            || !state.notification_poll_inflight.insert(email.clone())
+        {
+            return;
+        }
+        (
+            state.notification_cursors.get(&email).cloned(),
+            state.notification_generation,
+        )
+    };
+    let had_cursor = cursor.is_some();
+    let widgets = widgets.clone();
+    let state = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let request_email = email.clone();
+        let result = gio::spawn_blocking(move || {
+            MailClient::for_account(AccountStore::open()?, &request_email)?
+                .poll_new_mail(cursor.as_ref())
+        })
+        .await;
+        {
+            let mut current = state.borrow_mut();
+            current.notification_poll_inflight.remove(&email);
+            if current.notification_generation != generation {
+                drop(current);
+                poll_new_mail_all(&widgets, &state);
+                return;
+            }
+            if !current.account_emails.contains(&email) {
+                return;
+            }
+        }
+        match result {
+            Ok(Ok(poll)) => {
+                state
+                    .borrow_mut()
+                    .notification_cursors
+                    .insert(email.clone(), poll.cursor);
+                if had_cursor && !poll.messages.is_empty() {
+                    alert_new_mail(&widgets, &state, &email, &poll.messages);
+                }
+            }
+            Ok(Err(error)) => {
+                record_activity(
+                    &widgets,
+                    &format!("Could not check new mail for {email}: {error}"),
+                );
+            }
+            Err(_) => eprintln!("New mail check stopped unexpectedly for {email}"),
+        }
+    });
+}
+
+fn new_mail_notification_id(email: &str) -> String {
+    format!("new-mail:{email}")
+}
+
+fn alert_new_mail(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    email: &str,
+    messages: &[IncomingMail],
+) {
+    let preferences = widgets.preferences.borrow();
+    let show_banner = preferences.notify_new_mail;
+    let play_sound = preferences.play_new_mail_sound;
+    drop(preferences);
+    let distinct_count = messages
+        .iter()
+        .map(|message| message.id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    if show_banner && let Some(app) = widgets.window.application() {
+        let notification = gio::Notification::new(&format!("New mail · {email}"));
+        let body = if distinct_count == 1 {
+            let message = &messages[0];
+            let subject = if message.subject.is_empty() {
+                "(No subject)"
+            } else {
+                &message.subject
+            };
+            format!("{} — {subject}", message.sender)
+        } else {
+            format!("{distinct_count} new messages")
+        };
+        notification.set_body(Some(&body.chars().take(180).collect::<String>()));
+        notification.set_category(Some("email.arrived"));
+        let thread_id = if distinct_count == 1 {
+            messages[0].thread_id.as_str()
+        } else {
+            ""
+        };
+        if let Ok(target) = serde_json::to_string(&(email, thread_id)) {
+            notification
+                .set_default_action_and_target_value("app.open-mail", Some(&target.to_variant()));
+        }
+        app.send_notification(Some(&new_mail_notification_id(email)), &notification);
+    }
+    if play_sound {
+        let mut state = state.borrow_mut();
+        let can_play = state
+            .last_notification_sound
+            .is_none_or(|played| played.elapsed() >= std::time::Duration::from_secs(10));
+        if can_play {
+            state.last_notification_sound = Some(std::time::Instant::now());
+            play_new_mail_sound();
+        }
+    }
+}
+
+fn play_new_mail_sound() {
+    std::thread::spawn(|| {
+        for event in ["message-new-email", "message-new-instant"] {
+            let result = Command::new("canberra-gtk-play")
+                .args(["-i", event, "-d", "New mail"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if result.is_ok_and(|status| status.success()) {
+                return;
+            }
+        }
+        eprintln!("Could not play the system new-mail sound");
     });
 }
 
@@ -412,8 +626,8 @@ fn mailbox_sidebar(widgets: &Widgets, state: &Rc<RefCell<State>>) -> gtk::Widget
 fn sidebar_folders(state: &State, email: &str) -> Vec<(String, String, &'static str)> {
     let mut folders = [
         ("INBOX", "Inbox", "mail-unread-symbolic"),
-        ("STARRED", "Starred", "starred-symbolic"),
-        ("SENT", "Sent", "document-send-symbolic"),
+        ("STARRED", "Starred", "postbird-star-check-symbolic"),
+        ("SENT", "Sent", "postbird-send-symbolic"),
         ("DRAFT", "Drafts", "document-edit-symbolic"),
         ("", "All Mail", "mail-archive-symbolic"),
         ("TRASH", "Trash", "user-trash-symbolic"),
@@ -523,14 +737,12 @@ fn sidebar_folder_row(
     let state_for_select = state.clone();
     let selected_email = email.to_owned();
     let selected_label = label_id.to_owned();
-    let selected_title = title.to_owned();
     button.connect_clicked(move |_| {
         select_mailbox(
             &widgets_for_select,
             &state_for_select,
             &selected_email,
             &selected_label,
-            &selected_title,
         );
     });
     row.append(&button);
@@ -541,7 +753,7 @@ fn sidebar_folder_row(
 
     if account_name.is_some() {
         let rename = gtk::Button::builder()
-            .icon_name("document-edit-symbolic")
+            .icon_name("postbird-pencil-line-symbolic")
             .tooltip_text("Rename favourite")
             .css_classes(["flat", "postbird-favorite"])
             .build();
@@ -591,9 +803,9 @@ fn sidebar_folder_row(
     let favorite = widgets.preferences.borrow().is_favorite(email, label_id);
     let star = gtk::Button::builder()
         .icon_name(if favorite {
-            "starred-symbolic"
+            "postbird-star-check-symbolic"
         } else {
-            "non-starred-symbolic"
+            "postbird-star-symbolic"
         })
         .tooltip_text(if favorite {
             "Remove from Favourites"
@@ -805,7 +1017,17 @@ fn rebuild_sidebar(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         );
     }
     navigation.append(&gtk::Separator::new(Orientation::Horizontal));
-    navigation.append(&sidebar_heading("ACCOUNTS"));
+    let accounts_heading = gtk::Box::new(Orientation::Horizontal, 0);
+    let accounts_label = sidebar_heading("ACCOUNTS");
+    accounts_label.set_hexpand(true);
+    accounts_heading.append(&accounts_label);
+    let spinner_slot = gtk::Box::new(Orientation::Horizontal, 0);
+    spinner_slot.set_width_request(18);
+    spinner_slot.set_height_request(18);
+    spinner_slot.set_valign(Align::Center);
+    spinner_slot.append(&widgets.mailbox_spinner);
+    accounts_heading.append(&spinner_slot);
+    navigation.append(&accounts_heading);
     for (email, name, folders, collapsed) in accounts {
         let folder_list = gtk::Box::new(Orientation::Vertical, 2);
         folder_list.add_css_class("postbird-account-folders");
@@ -980,13 +1202,7 @@ fn refresh_favorite_counts_for_account(widgets: &Widgets, state: &Rc<RefCell<Sta
     });
 }
 
-fn select_mailbox(
-    widgets: &Widgets,
-    state: &Rc<RefCell<State>>,
-    email: &str,
-    label_id: &str,
-    title: &str,
-) {
+fn select_mailbox(widgets: &Widgets, state: &Rc<RefCell<State>>, email: &str, label_id: &str) {
     let Some(index) = state
         .borrow()
         .account_emails
@@ -999,10 +1215,8 @@ fn select_mailbox(
         let mut state = state.borrow_mut();
         state.current_label = label_id.to_owned();
         state.active_query = None;
+        state.pending_notification_thread = None;
     }
-    widgets
-        .mailbox_title
-        .set_text(&format!("{title} · {email}"));
     widgets.search.set_text("");
     if widgets.account_picker.selected() != index as u32 {
         widgets.account_picker.set_selected(index as u32);
@@ -1016,22 +1230,17 @@ fn message_list_panel(widgets: &Widgets, state: &Rc<RefCell<State>>) -> gtk::Wid
     let panel = gtk::Box::new(Orientation::Vertical, 5);
     panel.add_css_class("postbird-list-panel");
     panel.set_size_request(300, -1);
-    panel.set_margin_top(6);
-    panel.set_margin_bottom(6);
-    panel.set_margin_start(6);
-    panel.set_margin_end(6);
-    let title_row = gtk::Box::new(Orientation::Horizontal, 6);
-    widgets.mailbox_title.set_hexpand(true);
-    title_row.append(&widgets.mailbox_title);
-    title_row.append(&widgets.mailbox_spinner);
-    panel.append(&title_row);
     let search_row = gtk::Box::new(Orientation::Horizontal, 5);
+    search_row.set_margin_top(6);
+    search_row.set_margin_start(6);
+    search_row.set_margin_end(6);
     widgets.search.set_hexpand(true);
     search_row.append(&widgets.search);
     let unread_filter = gtk::Button::builder()
-        .label("Unread")
+        .icon_name("postbird-mail-symbolic")
         .tooltip_text("Find unread mail in this folder, including older messages")
         .build();
+    unread_filter.update_property(&[gtk::accessible::Property::Label("Unread mail")]);
     let widgets_for_unread = widgets.clone();
     let state_for_unread = state.clone();
     unread_filter.connect_clicked(move |_| {
@@ -1049,6 +1258,35 @@ fn message_list_panel(widgets: &Widgets, state: &Rc<RefCell<State>>) -> gtk::Wid
         );
     });
     search_row.append(&unread_filter);
+    let refresh = gtk::Button::builder()
+        .icon_name("postbird-refresh-symbolic")
+        .tooltip_text("Refresh this folder")
+        .build();
+    refresh.update_property(&[gtk::accessible::Property::Label("Refresh this folder")]);
+    let widgets_for_refresh = widgets.clone();
+    let state_for_refresh = state.clone();
+    refresh.connect_clicked(move |_| {
+        let index = widgets_for_refresh.account_picker.selected() as usize;
+        let Some(email) = state_for_refresh
+            .borrow()
+            .account_emails
+            .get(index)
+            .cloned()
+        else {
+            return;
+        };
+        let query = widgets_for_refresh.search.text().trim().to_owned();
+        let query = (!query.is_empty()).then_some(query);
+        load_inbox(
+            &widgets_for_refresh,
+            &state_for_refresh,
+            email.clone(),
+            query,
+            false,
+        );
+        refresh_favorite_counts_for_account(&widgets_for_refresh, &state_for_refresh, &email);
+    });
+    search_row.append(&refresh);
     panel.append(&search_row);
     panel.append(
         &gtk::ScrolledWindow::builder()
@@ -1338,18 +1576,8 @@ fn connect_account_picker(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             let index = picker.selected() as usize;
             let email = { state.borrow().account_emails.get(index).cloned() };
             if let Some(email) = email {
-                let title = {
-                    let state = state.borrow();
-                    sidebar_folders(&state, &email)
-                        .into_iter()
-                        .find(|(id, _, _)| id == &state.current_label)
-                        .map(|(_, title, _)| title)
-                        .unwrap_or_else(|| "Mail".to_owned())
-                };
-                widgets
-                    .mailbox_title
-                    .set_text(&format!("{title} · {email}"));
                 state.borrow_mut().active_query = None;
+                state.borrow_mut().pending_notification_thread = None;
                 widgets.search.set_text("");
                 load_inbox(&widgets, &state, email, None, true);
                 rebuild_sidebar(&widgets, &state);
@@ -1357,34 +1585,323 @@ fn connect_account_picker(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         });
 }
 
-fn connect_add_account(widgets: &Widgets, state: &Rc<RefCell<State>>, button: &gtk::Button) {
+fn connect_settings(widgets: &Widgets, state: &Rc<RefCell<State>>, button: &gtk::Button) {
     let widgets = widgets.clone();
     let state = state.clone();
     button.connect_clicked(move |_| {
-        let widgets = widgets.clone();
-        let state = state.clone();
-        glib::MainContext::default().spawn_local(async move {
-            let choice = adw::AlertDialog::builder()
-                .heading("Add an account")
-                .body("Choose how Postbird connects to Gmail.")
-                .close_response("cancel")
-                .default_response("app-password")
-                .build();
-            choice.add_responses(&[
-                ("cancel", "Cancel"),
-                ("app-password", "Gmail app password"),
-                ("goa", "GNOME Online Accounts"),
-            ]);
-            match choice.choose_future(Some(&widgets.window)).await.as_str() {
-                "app-password" => add_app_password_account(&widgets, &state).await,
-                "goa" => add_goa_account(&widgets, &state).await,
-                _ => {}
+        let dialog = adw::PreferencesDialog::builder()
+            .title("Settings")
+            .search_enabled(false)
+            .build();
+        dialog.set_content_width(520);
+        dialog.set_content_height(settings_height_for_accounts(0));
+        let accounts_page = adw::PreferencesPage::builder()
+            .title("Accounts")
+            .icon_name("system-users-symbolic")
+            .build();
+        let accounts_group = adw::PreferencesGroup::builder()
+            .title("Connected accounts")
+            .build();
+        let add_account = gtk::Button::builder()
+            .label("Add account")
+            .valign(Align::Center)
+            .css_classes(["suggested-action"])
+            .build();
+        accounts_group.set_header_suffix(Some(&add_account));
+        accounts_page.add(&accounts_group);
+        dialog.add(&accounts_page);
+        add_reading_settings(&dialog, &widgets, &state);
+        add_notification_settings(&dialog, &widgets, &state);
+        let activity_page = adw::PreferencesPage::builder()
+            .title("Activity")
+            .icon_name("document-open-recent-symbolic")
+            .build();
+        let activity_group = adw::PreferencesGroup::builder()
+            .title("Recent messages")
+            .description("The latest 100 notices from this session, newest first. Select text to copy it.")
+            .build();
+        let activity_text = gtk::Label::builder()
+            .selectable(true).wrap(true).xalign(0.0).yalign(0.0)
+            .margin_top(12).margin_bottom(12).margin_start(12).margin_end(12)
+            .build();
+        let update_activity = |label: &gtk::Label, activity: &gtk::StringList| {
+            let text = (0..activity.n_items()).filter_map(|index| activity.string(index))
+                .collect::<Vec<_>>().join("\n\n");
+            label.set_text(if text.is_empty() { "No messages yet." } else { &text });
+        };
+        update_activity(&activity_text, &widgets.activity);
+        let activity_weak = activity_text.downgrade();
+        let activity_changed = widgets.activity.connect_items_changed(move |activity, _, _, _| {
+            if let Some(label) = activity_weak.upgrade() {
+                update_activity(&label, activity);
             }
         });
+        let activity = widgets.activity.clone();
+        let activity_changed = RefCell::new(Some(activity_changed));
+        dialog.connect_closed(move |_| {
+            if let Some(handler) = activity_changed.borrow_mut().take() {
+                activity.disconnect(handler);
+            }
+        });
+        activity_group.add(&gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_height(240).max_content_height(400)
+            .propagate_natural_height(true).child(&activity_text).build());
+        activity_page.add(&activity_group);
+        dialog.add(&activity_page);
+        let about_page = adw::PreferencesPage::builder()
+            .title("About")
+            .icon_name("help-about-symbolic")
+            .build();
+        let icons_group = adw::PreferencesGroup::builder()
+            .title("Icons")
+            .description("Button icons by Lucide Icons and Contributors. Used under the ISC license; the trash icon also includes Feather artwork under the MIT license.")
+            .build();
+        let icons_row = adw::ActionRow::builder().title("Lucide Icons").build();
+        icons_row.add_suffix(&gtk::LinkButton::builder()
+            .uri("https://lucide.dev/icons/")
+            .label("View icons")
+            .valign(Align::Center)
+            .build());
+        icons_group.add(&icons_row);
+        about_page.add(&icons_group);
+        dialog.add(&about_page);
+        let rows = Rc::new(RefCell::new(Vec::<adw::ActionRow>::new()));
+
+        let dialog_weak = dialog.downgrade();
+        let group_weak = accounts_group.downgrade();
+        let rows_for_add = rows.clone();
+        let widgets_for_add = widgets.clone();
+        let state_for_add = state.clone();
+        add_account.connect_clicked(move |button| {
+            let (Some(dialog), Some(group)) = (dialog_weak.upgrade(), group_weak.upgrade()) else {
+                return;
+            };
+            let rows = rows_for_add.clone();
+            button.set_sensitive(false);
+            let button = button.clone();
+            let widgets = widgets_for_add.clone();
+            let state = state_for_add.clone();
+            glib::MainContext::default().spawn_local(async move {
+                add_account_from_settings(&widgets, &state, &dialog).await;
+                refresh_settings_accounts(&widgets, &state, &dialog, &group, &rows);
+                button.set_sensitive(true);
+            });
+        });
+
+        dialog.present(Some(&widgets.window));
+        refresh_settings_accounts(&widgets, &state, &dialog, &accounts_group, &rows);
     });
 }
 
-async fn add_app_password_account(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+fn add_notification_settings(
+    dialog: &adw::PreferencesDialog,
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+) {
+    let page = adw::PreferencesPage::builder()
+        .title("Notifications")
+        .icon_name("preferences-system-notifications-symbolic")
+        .build();
+    let group = adw::PreferencesGroup::builder()
+        .title("New mail")
+        .description("Alerts are checked only while Postbird is running.")
+        .build();
+    let preferences = widgets.preferences.borrow();
+    let banner = adw::SwitchRow::builder()
+        .title("Desktop notification")
+        .subtitle("Show a banner with the sender and subject")
+        .active(preferences.notify_new_mail)
+        .build();
+    let sound = adw::SwitchRow::builder()
+        .title("System sound")
+        .subtitle(
+            if glib::find_program_in_path("canberra-gtk-play").is_some() {
+                "Play the system mail sound, with or without a banner"
+            } else {
+                "Install canberra-gtk-play to use the system sound"
+            },
+        )
+        .active(preferences.play_new_mail_sound)
+        .build();
+    sound.set_sensitive(glib::find_program_in_path("canberra-gtk-play").is_some());
+    drop(preferences);
+    group.add(&banner);
+    group.add(&sound);
+    page.add(&group);
+    dialog.add(&page);
+
+    let banner_widgets = widgets.clone();
+    let banner_state = state.clone();
+    let dialog_weak = dialog.downgrade();
+    banner.connect_active_notify(move |row| {
+        let mut preferences = banner_widgets.preferences.borrow_mut();
+        let previously_enabled = preferences.notify_new_mail || preferences.play_new_mail_sound;
+        preferences.notify_new_mail = row.is_active();
+        let result = preferences.save();
+        let now_enabled = preferences.notify_new_mail || preferences.play_new_mail_sound;
+        drop(preferences);
+        if let Err(error) = result
+            && let Some(dialog) = dialog_weak.upgrade()
+        {
+            show_settings_error(&dialog, error);
+        }
+        if !row.is_active()
+            && let Some(app) = banner_widgets.window.application()
+        {
+            for email in &banner_state.borrow().account_emails {
+                app.withdraw_notification(&new_mail_notification_id(email));
+            }
+        }
+        if !previously_enabled && now_enabled {
+            let mut state = banner_state.borrow_mut();
+            state.notification_cursors.clear();
+            state.notification_generation += 1;
+            drop(state);
+            poll_new_mail_all(&banner_widgets, &banner_state);
+        }
+    });
+
+    let sound_widgets = widgets.clone();
+    let sound_state = state.clone();
+    let dialog_weak = dialog.downgrade();
+    sound.connect_active_notify(move |row| {
+        let mut preferences = sound_widgets.preferences.borrow_mut();
+        let previously_enabled = preferences.notify_new_mail || preferences.play_new_mail_sound;
+        preferences.play_new_mail_sound = row.is_active();
+        let result = preferences.save();
+        let now_enabled = preferences.notify_new_mail || preferences.play_new_mail_sound;
+        drop(preferences);
+        if let Err(error) = result
+            && let Some(dialog) = dialog_weak.upgrade()
+        {
+            show_settings_error(&dialog, error);
+        }
+        if !previously_enabled && now_enabled {
+            let mut state = sound_state.borrow_mut();
+            state.notification_cursors.clear();
+            state.notification_generation += 1;
+            drop(state);
+            poll_new_mail_all(&sound_widgets, &sound_state);
+        }
+    });
+}
+
+async fn add_account_from_settings(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    settings: &adw::PreferencesDialog,
+) {
+    let choice = adw::AlertDialog::builder()
+        .heading("Add an account")
+        .body("Choose how Postbird connects to Gmail.")
+        .close_response("cancel")
+        .default_response("app-password")
+        .build();
+    choice.add_responses(&[
+        ("cancel", "Cancel"),
+        ("app-password", "Gmail app password"),
+        ("goa", "GNOME Online Accounts"),
+    ]);
+    match choice.choose_future(Some(settings)).await.as_str() {
+        "app-password" => add_app_password_account(widgets, state, settings).await,
+        "goa" => add_goa_account(widgets, state, settings).await,
+        _ => {}
+    }
+}
+
+fn refresh_settings_accounts(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    settings: &adw::PreferencesDialog,
+    group: &adw::PreferencesGroup,
+    rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+) {
+    let accounts = match AccountStore::open().and_then(|store| store.accounts()) {
+        Ok(accounts) => accounts,
+        Err(error) => return show_settings_error(settings, error),
+    };
+    settings.set_content_height(settings_height_for_accounts(accounts.len()));
+    for row in rows.borrow_mut().drain(..) {
+        group.remove(&row);
+    }
+    group.set_description(if accounts.is_empty() {
+        Some("No accounts connected yet.")
+    } else {
+        None
+    });
+    for account in accounts {
+        let method = match account.kind {
+            AccountKind::GmailAppPassword => "Gmail app password",
+            AccountKind::GnomeOnlineAccounts => "GNOME Online Accounts",
+        };
+        let row = adw::ActionRow::builder()
+            .title(&account.email)
+            .subtitle(method)
+            .build();
+        let remove = gtk::Button::builder()
+            .label("Remove")
+            .tooltip_text(format!("Remove {} from Postbird", account.email))
+            .valign(Align::Center)
+            .css_classes(["flat", "destructive-action"])
+            .build();
+        row.add_suffix(&remove);
+        let email = account.email;
+        let dialog_weak = settings.downgrade();
+        let group_weak = group.downgrade();
+        let rows_weak = Rc::downgrade(rows);
+        let widgets = widgets.clone();
+        let state = state.clone();
+        remove.connect_clicked(move |button| {
+            let (Some(dialog), Some(group), Some(rows)) = (
+                dialog_weak.upgrade(),
+                group_weak.upgrade(),
+                rows_weak.upgrade(),
+            ) else {
+                return;
+            };
+            button.set_sensitive(false);
+            let button = button.clone();
+            let widgets = widgets.clone();
+            let state = state.clone();
+            let email = email.clone();
+            glib::MainContext::default().spawn_local(async move {
+                if remove_account_from_settings(&widgets, &state, &dialog, email).await {
+                    refresh_settings_accounts(&widgets, &state, &dialog, &group, &rows);
+                } else {
+                    button.set_sensitive(true);
+                }
+            });
+        });
+        group.add(&row);
+        rows.borrow_mut().push(row);
+    }
+}
+
+fn settings_height_for_accounts(count: usize) -> i32 {
+    // Keep the Notifications page comfortable even when no accounts are connected.
+    // The Accounts page scrolls when its list is longer than the dialog.
+    (200 + 56 * count.min(7) as i32).clamp(300, 560)
+}
+
+fn show_settings_message(settings: &adw::PreferencesDialog, message: &str) {
+    settings.add_toast(adw::Toast::new(message));
+}
+
+fn show_settings_error(settings: &adw::PreferencesDialog, error: impl std::fmt::Display) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Postbird could not complete that action")
+        .body(error.to_string())
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.present(Some(settings));
+}
+
+async fn add_app_password_account(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    settings: &adw::PreferencesDialog,
+) {
     let address = gtk::Entry::builder()
         .placeholder_text("you@gmail.com")
         .input_purpose(gtk::InputPurpose::Email)
@@ -1408,7 +1925,7 @@ async fn add_app_password_account(widgets: &Widgets, state: &Rc<RefCell<State>>)
         .default_response("connect")
         .build();
     dialog.add_responses(&[("cancel", "Cancel"), ("connect", "Connect")]);
-    if dialog.choose_future(Some(&widgets.window)).await != "connect" {
+    if dialog.choose_future(Some(settings)).await != "connect" {
         return;
     }
     let email = address.text().trim().to_owned();
@@ -1418,9 +1935,9 @@ async fn add_app_password_account(widgets: &Widgets, state: &Rc<RefCell<State>>)
         || email.chars().any(char::is_whitespace)
         || secret.is_empty()
     {
-        return show_message(widgets, "Enter a full email address and app password");
+        return show_settings_message(settings, "Enter a full email address and app password");
     }
-    show_message(widgets, "Checking Gmail IMAP and SMTP…");
+    show_settings_message(settings, "Checking Gmail IMAP and SMTP…");
     let result = gio::spawn_blocking(move || -> anyhow::Result<Account> {
         ImapClient::probe_credentials(&email, &secret)?;
         let store = AccountStore::open()?;
@@ -1440,13 +1957,18 @@ async fn add_app_password_account(widgets: &Widgets, state: &Rc<RefCell<State>>)
             if let Some(index) = account_index(state, &account.email) {
                 widgets.account_picker.set_selected(index);
             }
+            show_settings_message(settings, "Account connected");
         }
-        Ok(Err(error)) => show_error(widgets, error),
-        Err(_) => show_message(widgets, "The connection check stopped unexpectedly"),
+        Ok(Err(error)) => show_settings_error(settings, error),
+        Err(_) => show_settings_message(settings, "The connection check stopped unexpectedly"),
     }
 }
 
-async fn add_goa_account(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+async fn add_goa_account(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    settings: &adw::PreferencesDialog,
+) {
     let accounts = loop {
         let result = gio::spawn_blocking(ImapClient::goa_accounts).await;
         let issue = match result {
@@ -1457,10 +1979,10 @@ async fn add_goa_account(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                 GoaSetupIssue::Unavailable("The Online Accounts check stopped unexpectedly".into())
             }
         };
-        match goa_setup_dialog(widgets, &issue).await.as_str() {
+        match goa_setup_dialog(settings, &issue).await.as_str() {
             "retry" => continue,
             "app-password" => {
-                add_app_password_account(widgets, state).await;
+                add_app_password_account(widgets, state, settings).await;
                 return;
             }
             _ => return,
@@ -1479,13 +2001,13 @@ async fn add_goa_account(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         .default_response("connect")
         .build();
     dialog.add_responses(&[("cancel", "Cancel"), ("connect", "Connect")]);
-    if dialog.choose_future(Some(&widgets.window)).await != "connect" {
+    if dialog.choose_future(Some(settings)).await != "connect" {
         return;
     }
     let Some(selected) = accounts.get(picker.selected() as usize).cloned() else {
-        return show_message(widgets, "Choose an Online Account");
+        return show_settings_message(settings, "Choose an Online Account");
     };
-    show_message(widgets, "Checking GOA Gmail IMAP and SMTP…");
+    show_settings_message(settings, "Checking GOA Gmail IMAP and SMTP…");
     let result = gio::spawn_blocking(move || -> anyhow::Result<Account> {
         ImapClient::probe_goa(&selected.email, &selected.id)?;
         let account = Account {
@@ -1504,9 +2026,10 @@ async fn add_goa_account(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             if let Some(index) = account_index(state, &account.email) {
                 widgets.account_picker.set_selected(index);
             }
+            show_settings_message(settings, "Account connected");
         }
-        Ok(Err(error)) => show_error(widgets, error),
-        Err(_) => show_message(widgets, "The Online Accounts check stopped unexpectedly"),
+        Ok(Err(error)) => show_settings_error(settings, error),
+        Err(_) => show_settings_message(settings, "The Online Accounts check stopped unexpectedly"),
     }
 }
 
@@ -1558,7 +2081,10 @@ fn open_online_accounts_settings(path: &std::path::Path, args: &[&str]) -> anyho
     Ok(())
 }
 
-async fn goa_setup_dialog(widgets: &Widgets, issue: &GoaSetupIssue) -> String {
+async fn goa_setup_dialog(
+    settings_dialog: &adw::PreferencesDialog,
+    issue: &GoaSetupIssue,
+) -> String {
     let (heading, body) = issue.guidance();
     let settings = online_accounts_settings_command();
     let dialog = adw::AlertDialog::builder()
@@ -1575,16 +2101,19 @@ async fn goa_setup_dialog(widgets: &Widgets, issue: &GoaSetupIssue) -> String {
     if settings.is_some() {
         dialog.add_response("open-settings", "Open Online Accounts");
     }
-    let response = dialog.choose_future(Some(&widgets.window)).await;
+    let response = dialog.choose_future(Some(settings_dialog)).await;
     if response == "open-settings"
         && let Some((path, args)) = settings
     {
         match open_online_accounts_settings(&path, args) {
-            Ok(()) => show_message(
-                widgets,
+            Ok(()) => show_settings_message(
+                settings_dialog,
                 "Enable Mail in Online Accounts, then choose GOA in Postbird again",
             ),
-            Err(error) => show_error(widgets, format!("Could not open Online Accounts: {error}")),
+            Err(error) => show_settings_error(
+                settings_dialog,
+                format!("Could not open Online Accounts: {error}"),
+            ),
         }
     }
     response.to_string()
@@ -1599,27 +2128,70 @@ fn account_index(state: &Rc<RefCell<State>>, email: &str) -> Option<u32> {
         .map(|index| index as u32)
 }
 
+fn mail_search_entry() -> gtk::Entry {
+    let search = gtk::Entry::builder()
+        .placeholder_text("Search mail")
+        .primary_icon_name("system-search-symbolic")
+        .primary_icon_activatable(false)
+        .secondary_icon_tooltip_text("Clear search")
+        .accessible_role(gtk::AccessibleRole::SearchBox)
+        .css_classes(["search"])
+        .build();
+    search.update_property(&[gtk::accessible::Property::Label("Search mail")]);
+    search.connect_changed(|search| {
+        search.set_secondary_icon_name(
+            (!search.text().is_empty()).then_some("postbird-circle-x-symbolic"),
+        );
+    });
+    search.connect_icon_release(|search, position| {
+        if position == gtk::EntryIconPosition::Secondary {
+            search.set_text("");
+            search.grab_focus();
+        }
+    });
+    let keyboard = gtk::EventControllerKey::new();
+    let search_weak = search.downgrade();
+    keyboard.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape
+            && let Some(search) = search_weak.upgrade()
+            && !search.text().is_empty()
+        {
+            search.set_text("");
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    search.add_controller(keyboard);
+    search
+}
+
 fn connect_search(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     let widgets = widgets.clone();
     let state = state.clone();
     let widgets_for_clear = widgets.clone();
     let state_for_clear = state.clone();
-    widgets
-        .search
-        .clone()
-        .connect_search_changed(move |search| {
+    widgets.search.clone().connect_changed(move |search| {
+        if !search.text().is_empty() {
+            return;
+        }
+        // A text replacement briefly emits an empty value. Wait until it
+        // finishes before deciding whether the folder needs reloading.
+        let widgets = widgets_for_clear.clone();
+        let state = state_for_clear.clone();
+        glib::idle_add_local_once(move || {
             if !search_clear_needs_reload(
-                state_for_clear.borrow().active_query.as_deref(),
-                search.text().as_str(),
+                state.borrow().active_query.as_deref(),
+                widgets.search.text().as_str(),
             ) {
                 return;
             }
-            let index = widgets_for_clear.account_picker.selected() as usize;
-            let Some(email) = state_for_clear.borrow().account_emails.get(index).cloned() else {
+            let index = widgets.account_picker.selected() as usize;
+            let Some(email) = state.borrow().account_emails.get(index).cloned() else {
                 return;
             };
-            load_inbox(&widgets_for_clear, &state_for_clear, email, None, true);
+            load_inbox(&widgets, &state, email, None, true);
         });
+    });
     widgets.search.clone().connect_activate(move |search| {
         let index = widgets.account_picker.selected() as usize;
         let Some(email) = state.borrow().account_emails.get(index).cloned() else {
@@ -1640,66 +2212,72 @@ fn search_clear_needs_reload(active_query: Option<&str>, text: &str) -> bool {
     active_query.is_some() && text.is_empty()
 }
 
-fn connect_remove_account(widgets: &Widgets, state: &Rc<RefCell<State>>, button: &gtk::Button) {
-    let widgets = widgets.clone();
-    let state = state.clone();
-    button.connect_clicked(move |_| {
-        let index = widgets.account_picker.selected() as usize;
-        let Some(email) = state.borrow().account_emails.get(index).cloned() else {
-            return;
-        };
-        let widgets = widgets.clone();
-        let state = state.clone();
-        glib::MainContext::default().spawn_local(async move {
-            let dialog = adw::AlertDialog::builder()
-                .heading("Remove this account?")
-                .body(format!(
-                    "Remove {email} and its cached mail from Postbird? Any Postbird-stored sign-in secret will be removed. This does not remove a GNOME Online Account or delete Gmail messages."
-                ))
-                .close_response("cancel")
-                .default_response("cancel")
-                .build();
-            dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove Account")]);
-            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
-            if dialog.choose_future(Some(&widgets.window)).await != "remove" {
-                return;
+async fn remove_account_from_settings(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    settings: &adw::PreferencesDialog,
+    email: String,
+) -> bool {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Remove this account?")
+        .body(format!(
+            "Remove {email} and its cached mail from Postbird? Any Postbird-stored sign-in secret will be removed. This does not remove a GNOME Online Account or delete Gmail messages."
+        ))
+        .close_response("cancel")
+        .default_response("cancel")
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove Account")]);
+    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    if dialog.choose_future(Some(settings)).await != "remove" {
+        return false;
+    }
+    let removing_email = email.clone();
+    let result =
+        gio::spawn_blocking(move || AccountStore::open()?.remove_account(&removing_email)).await;
+    match result {
+        Ok(Ok(())) => {
+            {
+                let mut state = state.borrow_mut();
+                state.load_generation += 1;
+                state.load_cancel.store(true, Ordering::Relaxed);
+                state
+                    .pending_archives
+                    .retain(|(account, _)| account != &email);
+                state
+                    .archived_messages
+                    .retain(|(account, _), _| account != &email);
+                *state
+                    .unread_refresh_generation
+                    .entry(email.clone())
+                    .or_default() += 1;
+                state.favorite_refresh_pending.remove(&email);
+                state.current_label = "INBOX".to_owned();
             }
-            let removing_email = email.clone();
-            let result = gio::spawn_blocking(move || {
-                AccountStore::open()?.remove_account(&removing_email)
-            })
-            .await;
-            match result {
-                Ok(Ok(())) => {
-                    {
-                        let mut state = state.borrow_mut();
-                        state.load_generation += 1;
-                        state.load_cancel.store(true, Ordering::Relaxed);
-                        state.pending_archives.retain(|(account, _)| account != &email);
-                        state.archived_messages.retain(|(account, _), _| account != &email);
-                        *state
-                            .unread_refresh_generation
-                            .entry(email.clone())
-                            .or_default() += 1;
-                        state.favorite_refresh_pending.remove(&email);
-                        state.current_label = "INBOX".to_owned();
-                    }
-                    reset_reader(&widgets, &state);
-                    widgets.search.set_text("");
-                    {
-                        let mut preferences = widgets.preferences.borrow_mut();
-                        preferences.remove_account(&email);
-                        if let Err(error) = preferences.save() {
-                            show_message(&widgets, &format!("Could not save Favourites: {error}"));
-                        }
-                    }
-                    load_accounts(&widgets, &state);
+            reset_reader(widgets, state);
+            widgets.search.set_text("");
+            {
+                let mut preferences = widgets.preferences.borrow_mut();
+                preferences.remove_account(&email);
+                if let Err(error) = preferences.save() {
+                    show_settings_message(settings, &format!("Could not save Favourites: {error}"));
                 }
-                Ok(Err(error)) => show_error(&widgets, error),
-                Err(_) => show_message(&widgets, "The account removal task stopped unexpectedly"),
             }
-        });
-    });
+            load_accounts(widgets, state);
+            if let Some(app) = widgets.window.application() {
+                app.withdraw_notification(&new_mail_notification_id(&email));
+            }
+            show_settings_message(settings, "Account removed");
+            true
+        }
+        Ok(Err(error)) => {
+            show_settings_error(settings, error);
+            false
+        }
+        Err(_) => {
+            show_settings_message(settings, "The account removal task stopped unexpectedly");
+            false
+        }
+    }
 }
 
 fn connect_archive(widgets: &Widgets, state: &Rc<RefCell<State>>) {
@@ -2021,30 +2599,34 @@ fn connect_reply_button(
         let Some(original) = state.borrow().selected.clone() else {
             return;
         };
-        let subject = original.header("Subject");
-        let (to, cc) = if reply_all {
-            reply_all_recipients(&original, &email)
-        } else {
-            (reply_target(&original), String::new())
-        };
-        let reply = ComposeMessage {
-            to,
-            cc,
-            bcc: String::new(),
-            subject: if subject.to_lowercase().starts_with("re:") {
-                subject.to_owned()
-            } else {
-                format!("Re: {subject}")
-            },
-            body: String::new(),
-            html_body: None,
-            in_reply_to: Some(original.header("Message-ID").to_owned()),
-            thread_id: Some(original.thread_id.clone()),
-            attachments: Vec::new(),
-            forwarded_attachments: Vec::new(),
-        };
+        let reply = reply_message(&original, &email, reply_all);
         present_compose(&widgets, email, Some(reply), Some(original), None);
     });
+}
+
+fn reply_message(original: &Message, email: &str, reply_all: bool) -> ComposeMessage {
+    let subject = original.header("Subject");
+    let (to, cc) = if reply_all {
+        reply_all_recipients(original, email)
+    } else {
+        (reply_target(original), String::new())
+    };
+    ComposeMessage {
+        to,
+        cc,
+        bcc: String::new(),
+        subject: if subject.to_lowercase().starts_with("re:") {
+            subject.to_owned()
+        } else {
+            format!("Re: {subject}")
+        },
+        body: String::new(),
+        html_body: None,
+        in_reply_to: Some(original.header("Message-ID").to_owned()),
+        thread_id: Some(original.thread_id.clone()),
+        attachments: Vec::new(),
+        forwarded_attachments: Vec::new(),
+    }
 }
 
 fn forward_message(original: &Message) -> ComposeMessage {
@@ -2094,72 +2676,101 @@ fn connect_forward(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let Some(original) = state.borrow().selected.clone() else {
             return;
         };
-        let widgets = widgets.clone();
-        let button = button.clone();
-        button.set_sensitive(false);
-        if !original.attachments().is_empty() {
-            show_message(&widgets, "Preparing forwarded attachments…");
-        }
-        glib::MainContext::default().spawn_local(async move {
-            let source_email = email.clone();
-            let result = gio::spawn_blocking(move || -> anyhow::Result<ComposeMessage> {
-                let mut forward = forward_message(&original);
-                let mut client = None;
-                for part in original.attachments() {
-                    let data = if let Some(data) = &part.body.data {
-                        crate::gmail::decode_attachment_data(data)?
-                    } else {
-                        if client.is_none() {
-                            client = Some(MailClient::for_account(
-                                AccountStore::open()?,
-                                &source_email,
-                            )?);
-                        }
-                        client
-                            .as_mut()
-                            .unwrap()
-                            .attachment(&original.id, &part.body)?
-                    };
-                    forward.forwarded_attachments.push(ForwardedAttachment {
-                        content_id: None,
-                        filename: attachment_filename(part),
-                        mime_type: part.mime_type.clone(),
-                        data: data.into(),
-                    });
-                }
-                Ok(forward)
-            })
-            .await;
-            button.set_sensitive(true);
-            match result {
-                Ok(Ok(forward)) => present_compose(&widgets, email, Some(forward), None, None),
-                Ok(Err(error)) => {
-                    show_message(&widgets, &format!("Could not prepare forward: {error}"))
-                }
-                Err(_) => show_message(&widgets, "The forward preparation stopped unexpectedly"),
-            }
-        });
+        present_forward(&widgets, email, original, button);
     });
 }
 
-fn connect_remote_images(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+fn present_forward(widgets: &Widgets, email: String, original: Message, button: &gtk::Button) {
+    let widgets = widgets.clone();
+    let button = button.clone();
+    button.set_sensitive(false);
+    if !original.attachments().is_empty() {
+        show_message(&widgets, "Preparing forwarded attachments…");
+    }
+    glib::MainContext::default().spawn_local(async move {
+        let source_email = email.clone();
+        let result = gio::spawn_blocking(move || -> anyhow::Result<ComposeMessage> {
+            let mut forward = forward_message(&original);
+            let mut client = None;
+            for part in original.attachments() {
+                let data = if let Some(data) = &part.body.data {
+                    crate::gmail::decode_attachment_data(data)?
+                } else {
+                    if client.is_none() {
+                        client = Some(MailClient::for_account(
+                            AccountStore::open()?,
+                            &source_email,
+                        )?);
+                    }
+                    client
+                        .as_mut()
+                        .unwrap()
+                        .attachment(&original.id, &part.body)?
+                };
+                forward.forwarded_attachments.push(ForwardedAttachment {
+                    content_id: None,
+                    filename: attachment_filename(part),
+                    mime_type: part.mime_type.clone(),
+                    data: data.into(),
+                });
+            }
+            Ok(forward)
+        })
+        .await;
+        button.set_sensitive(true);
+        match result {
+            Ok(Ok(forward)) => present_compose(&widgets, email, Some(forward), None, None),
+            Ok(Err(error)) => {
+                show_message(&widgets, &format!("Could not prepare forward: {error}"))
+            }
+            Err(_) => show_message(&widgets, "The forward preparation stopped unexpectedly"),
+        }
+    });
+}
+
+fn add_reading_settings(
+    dialog: &adw::PreferencesDialog,
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+) {
+    let page = adw::PreferencesPage::builder()
+        .title("Reading")
+        .icon_name("mail-read-symbolic")
+        .build();
+    let group = adw::PreferencesGroup::builder().title("Images").build();
+    let remote_images = adw::SwitchRow::builder()
+        .title("Remote Images")
+        .subtitle("Allow emails to load images from the internet")
+        .active(widgets.preferences.borrow().load_remote_images)
+        .build();
+    group.add(&remote_images);
+    page.add(&group);
+    dialog.add(&page);
+
     let widgets = widgets.clone();
     let state = state.clone();
-    widgets.load_images.clone().connect_clicked(move |button| {
+    let dialog_weak = dialog.downgrade();
+    remote_images.connect_active_notify(move |row| {
+        let enabled = row.is_active();
         let mut preferences = widgets.preferences.borrow_mut();
-        if !preferences.load_remote_images {
-            preferences.load_remote_images = true;
-            if let Err(error) = preferences.save() {
-                preferences.load_remote_images = false;
-                return show_error(&widgets, error);
+        let previous = preferences.load_remote_images;
+        if previous == enabled {
+            return;
+        }
+        preferences.load_remote_images = enabled;
+        if let Err(error) = preferences.save() {
+            preferences.load_remote_images = previous;
+            drop(preferences);
+            row.set_active(previous);
+            if let Some(dialog) = dialog_weak.upgrade() {
+                show_settings_error(&dialog, error);
             }
+            return;
         }
         drop(preferences);
-        button.set_sensitive(false);
-        button.set_tooltip_text(Some("Remote images enabled"));
         let conversation = state.borrow().selected_conversation.clone();
         if !conversation.is_empty() {
-            display_conversation(&widgets, &state, &conversation, true);
+            display_conversation(&widgets, &state, &conversation, enabled);
         }
     });
 }
@@ -2348,12 +2959,13 @@ fn present_compose_with_title(
         .content_width(900)
         .content_height(720)
         .build();
+    dialog.add_css_class("postbird-compose");
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     let send = gtk::Button::builder()
-        .label("Send")
         .css_classes(["suggested-action"])
         .build();
+    set_labeled_icon(&send, "postbird-send-symbolic", "Send");
     let save_draft = gtk::Button::builder().label("Save Draft").build();
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancel_wait = gtk::Button::builder()
@@ -2364,9 +2976,10 @@ fn present_compose_with_title(
     cancel_wait.connect_clicked(move |_| cancel_flag.store(true, Ordering::Relaxed));
     header.pack_end(&cancel_wait);
     let attach = gtk::Button::builder()
-        .icon_name("mail-attachment-symbolic")
-        .tooltip_text("Attach a file")
+        .icon_name("postbird-paperclip-symbolic")
+        .tooltip_text("Attach files")
         .build();
+    set_labeled_icon(&attach, "postbird-paperclip-symbolic", "Attach files");
     header.pack_end(&send);
     header.pack_end(&save_draft);
     header.pack_start(&attach);
@@ -2376,84 +2989,82 @@ fn present_compose_with_title(
     form.set_margin_bottom(12);
     form.set_margin_start(12);
     form.set_margin_end(12);
+    let from_row = gtk::Box::new(Orientation::Horizontal, 8);
+    let from_label = gtk::Label::new(Some("From"));
+    from_label.set_margin_start(8);
+    let from = gtk::Entry::builder()
+        .text(&account_email)
+        .editable(false)
+        .hexpand(true)
+        .tooltip_text("Sending account")
+        .build();
+    from.update_property(&[gtk::accessible::Property::Label("From")]);
+    from_row.append(&from_label);
+    from_row.append(&from);
+    form.append(&from_row);
     let to = entry("To");
     let cc = entry("Cc");
     let bcc = entry("Bcc");
     let subject = entry("Subject");
-    let body = gtk::TextView::builder()
-        .vexpand(true)
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .top_margin(12)
-        .bottom_margin(12)
-        .left_margin(12)
-        .right_margin(12)
-        .build();
+    let body = crate::compose_history::editor();
+    body.set_vexpand(true);
+    body.set_wrap_mode(gtk::WrapMode::WordChar);
+    body.set_top_margin(12);
+    body.set_bottom_margin(12);
+    body.set_left_margin(12);
+    body.set_right_margin(12);
     let formatting = rich_text_toolbar(&body);
-    let forwarded_attachments = initial
-        .as_ref()
-        .map(|message| message.forwarded_attachments.clone())
-        .unwrap_or_default();
-    let forwarded_names = forwarded_attachments
-        .iter()
-        .map(|attachment| attachment.filename.clone())
-        .collect::<Vec<_>>();
-    let attachment_paths = Rc::new(RefCell::new(
-        initial
-            .as_ref()
-            .map(|message| message.attachments.clone())
-            .unwrap_or_default(),
-    ));
-    let attachment_label = gtk::Label::builder()
-        .halign(Align::Start)
-        .css_classes(["dim-label"])
-        .build();
-    if !forwarded_names.is_empty() {
-        attachment_label.set_text(&format!("Attached: {}", forwarded_names.join(", ")));
-    }
-    attachment_label.set_wrap(true);
-    attachment_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    let parent_for_attachment = parent.clone();
-    let paths_for_attachment = attachment_paths.clone();
-    let label_for_attachment = attachment_label.clone();
-    attach.connect_clicked(move |_| {
-        let parent = parent_for_attachment.clone();
-        let paths = paths_for_attachment.clone();
-        let label = label_for_attachment.clone();
-        let forwarded_names = forwarded_names.clone();
-        glib::MainContext::default().spawn_local(async move {
-            let picker = gtk::FileDialog::builder().title("Attach a file").build();
-            match picker.open_future(Some(&parent)).await {
-                Ok(file) => {
-                    if let Some(path) = file.path() {
-                        paths.borrow_mut().push(path);
-                        let names = paths
-                            .borrow()
-                            .iter()
-                            .filter_map(|path| path.file_name())
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .chain(forwarded_names)
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        label.set_text(&format!("Attached: {names}"));
-                    }
-                }
-                Err(error) if error.matches(gtk::DialogError::Dismissed) => {}
-                Err(_) => label.set_text("Could not attach that file"),
-            }
-        });
-    });
-    if let Some(initial) = &initial {
+    let inline_images = InlineImages::default();
+    let restored_images = if let Some(initial) = &initial {
         to.set_text(&initial.to);
         cc.set_text(&initial.cc);
         bcc.set_text(&initial.bcc);
         subject.set_text(&initial.subject);
-        body.buffer().set_text(&initial.body);
-    }
+        inline_images.restore(&body, initial)
+    } else {
+        HashSet::new()
+    };
+    inline_images.connect_paste(&body, &dialog);
+    let attachments = AttachmentList::new(initial.as_ref(), &restored_images);
+    let parent_for_attachment = parent.downgrade();
+    let dialog_for_attachment = dialog.downgrade();
+    let files_for_attachment = attachments.clone();
+    attach.connect_clicked(move |button| {
+        let Some(parent) = parent_for_attachment.upgrade() else {
+            return;
+        };
+        let files = files_for_attachment.clone();
+        let dialog = dialog_for_attachment.clone();
+        button.set_sensitive(false);
+        let button = button.downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let picker = gtk::FileDialog::builder()
+                .title("Attach files")
+                .modal(true)
+                .build();
+            let result = picker.open_multiple_future(Some(&parent)).await;
+            if let Some(button) = button.upgrade() {
+                button.set_sensitive(true);
+            }
+            let Some(dialog) = dialog.upgrade().filter(|dialog| dialog.is_visible()) else {
+                return;
+            };
+            match result {
+                Ok(selected) => {
+                    if let Err(error) = files.add_files(&selected) {
+                        crate::compose::show_error(&dialog, error);
+                    }
+                }
+                Err(error) if error.matches(gtk::DialogError::Dismissed) => {}
+                Err(error) => crate::compose::show_error(&dialog, error),
+            }
+        });
+    });
     body.add_css_class("card");
     for widget in [&to, &cc, &bcc, &subject] {
         form.append(widget);
     }
-    form.append(&attachment_label);
+    form.append(&attachments.widget);
     form.append(&formatting);
     if initial
         .as_ref()
@@ -2475,7 +3086,7 @@ fn present_compose_with_title(
     toolbar.set_content(Some(&form));
     dialog.set_child(Some(&toolbar));
 
-    let original_content = rich_text_content(&body);
+    let original_content = rich_text_content(&body, &inline_images);
     let original_html = initial
         .as_ref()
         .and_then(|message| message.html_body.clone());
@@ -2534,13 +3145,17 @@ fn present_compose_with_title(
     let bcc_send = bcc.clone();
     let subject_send = subject.clone();
     let body_send = body.clone();
-    let attachments_send = attachment_paths.clone();
-    let forwarded_send = forwarded_attachments.clone();
+    let attachments_send = attachments.clone();
+    let images_for_send = inline_images.clone();
     let cancel_send = cancelled.clone();
     let reply_context_for_send = replying_to.clone();
     let title_for_send = title.clone();
     let send_started = Rc::new(Cell::new(false));
     send.connect_clicked(move |_| {
+        if images_for_send.is_pending() {
+            crate::compose::show_error(&dialog_for_send, "Wait for the pasted image to finish loading");
+            return;
+        }
         if send_started.replace(true) {
             return;
         }
@@ -2548,7 +3163,9 @@ fn present_compose_with_title(
         let cancelled = cancel_send.clone();
         let editing = editing_for_send.clone();
         let (plain_body, html_body) =
-            compose_body_content(&body_send, &content_for_send, html_for_send.as_deref());
+            compose_body_content(&body_send, &content_for_send, html_for_send.as_deref(), &images_for_send);
+        let (paths, mut files) = attachments_send.contents();
+        files.extend(images_for_send.attachments(&body_send));
         let message = ComposeMessage {
             to: to_send.text().to_string(),
             cc: cc_send.text().to_string(),
@@ -2558,8 +3175,8 @@ fn present_compose_with_title(
             html_body: Some(html_body),
             in_reply_to: reply_reference.clone(),
             thread_id: reply_thread.clone(),
-            attachments: attachments_send.borrow().clone(),
-            forwarded_attachments: forwarded_send.clone(),
+            attachments: paths,
+            forwarded_attachments: files,
         };
         let widgets = widgets_for_send.clone();
         let dialog = dialog_for_send.clone();
@@ -2635,14 +3252,27 @@ fn present_compose_with_title(
     let reply_thread = initial
         .as_ref()
         .and_then(|message| message.thread_id.clone());
-    let attachments_draft = attachment_paths;
+    let attachments_draft = attachments;
     save_draft.connect_clicked(move |_| {
+        if inline_images.is_pending() {
+            crate::compose::show_error(
+                &dialog_for_draft,
+                "Wait for the pasted image to finish loading",
+            );
+            return;
+        }
         cancelled.store(false, Ordering::Relaxed);
         let cancelled = cancelled.clone();
         set_busy(true);
         let editing = editing.clone();
-        let (plain_body, html_body) =
-            compose_body_content(&body, &original_content, original_html.as_deref());
+        let (plain_body, html_body) = compose_body_content(
+            &body,
+            &original_content,
+            original_html.as_deref(),
+            &inline_images,
+        );
+        let (paths, mut files) = attachments_draft.contents();
+        files.extend(inline_images.attachments(&body));
         let message = ComposeMessage {
             to: to.text().to_string(),
             cc: cc.text().to_string(),
@@ -2652,8 +3282,8 @@ fn present_compose_with_title(
             html_body: Some(html_body),
             in_reply_to: reply_reference.clone(),
             thread_id: reply_thread.clone(),
-            attachments: attachments_draft.borrow().clone(),
-            forwarded_attachments: forwarded_attachments.clone(),
+            attachments: paths,
+            forwarded_attachments: files,
         };
         let widgets = widgets_for_draft.clone();
         let dialog = dialog_for_draft.clone();
@@ -2810,7 +3440,9 @@ fn rich_text_toolbar(editor: &gtk::TextView) -> gtk::Box {
         .build();
     clear.connect_clicked(move |_| {
         if let Some((start, end)) = buffer.selection_bounds() {
+            buffer.begin_user_action();
             buffer.remove_all_tags(&start, &end);
+            buffer.end_user_action();
         }
     });
     toolbar.append(&clear);
@@ -2824,19 +3456,22 @@ fn toggle_selected_tag(buffer: &gtk::TextBuffer, tag_name: &str) {
     let Some(tag) = buffer.tag_table().lookup(tag_name) else {
         return;
     };
+    buffer.begin_user_action();
     if start.has_tag(&tag) {
         buffer.remove_tag(&tag, &start, &end);
     } else {
         buffer.apply_tag(&tag, &start, &end);
     }
+    buffer.end_user_action();
 }
 
 fn compose_body_content(
     editor: &gtk::TextView,
     original: &(String, String),
     original_html: Option<&str>,
+    images: &InlineImages,
 ) -> (String, String) {
-    let content = rich_text_content(editor);
+    let content = rich_text_content(editor, images);
     if &content == original
         && let Some(html) = original_html
     {
@@ -2846,11 +3481,9 @@ fn compose_body_content(
     }
 }
 
-fn rich_text_content(editor: &gtk::TextView) -> (String, String) {
+fn rich_text_content(editor: &gtk::TextView, images: &InlineImages) -> (String, String) {
     let buffer = editor.buffer();
-    let plain = buffer
-        .text(&buffer.start_iter(), &buffer.end_iter(), false)
-        .to_string();
+    let mut plain = String::new();
     let tags = RICH_TAGS.map(|(name, _, _)| buffer.tag_table().lookup(name));
     let mut html = String::from(
         "<div style=\"font-family:system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.5\">",
@@ -2874,6 +3507,18 @@ fn rich_text_content(editor: &gtk::TextView) -> (String, String) {
             }
             active = next;
         }
+        if let Some(image) = images.at(&iter) {
+            let cid = glib::markup_escape_text(image.content_id.as_deref().unwrap_or_default());
+            let name = glib::markup_escape_text(&image.filename);
+            let width = iter
+                .paintable()
+                .map_or(520, |paintable| paintable.intrinsic_width());
+            html.push_str(&format!("<img src=\"cid:{cid}\" alt=\"{name}\" width=\"{width}\" style=\"max-width:100%;height:auto\">"));
+            plain.push_str(&format!("[Image: {}]", image.filename));
+            iter.forward_char();
+            continue;
+        }
+        plain.push(iter.char());
         match iter.char() {
             '&' => html.push_str("&amp;"),
             '<' => html.push_str("&lt;"),
@@ -2894,6 +3539,7 @@ fn rich_text_content(editor: &gtk::TextView) -> (String, String) {
 }
 
 fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    let previous_accounts = state.borrow().account_emails.clone();
     let store = match AccountStore::open() {
         Ok(store) => store,
         Err(error) => return show_error(widgets, error),
@@ -2922,6 +3568,12 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let mut state = state.borrow_mut();
         initialize_account_collapse(&mut state, &widgets.preferences.borrow());
         let accounts = state.account_emails.iter().cloned().collect::<HashSet<_>>();
+        if state.account_emails != previous_accounts {
+            state.notification_generation += 1;
+        }
+        state
+            .notification_cursors
+            .retain(|email, _| accounts.contains(email));
         state
             .unread_counts
             .retain(|(email, _), _| accounts.contains(email));
@@ -2931,7 +3583,6 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     if has_accounts {
         widgets.account_picker.set_selected(0);
         let email = state.borrow().account_emails[0].clone();
-        widgets.mailbox_title.set_text(&format!("Inbox · {email}"));
         load_inbox(widgets, state, email, None, false);
         for email in state.borrow().account_emails.clone() {
             load_labels(widgets, state, email);
@@ -2941,11 +3592,12 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         add_status_row(
             &widgets.messages,
             "No account connected",
-            "Use the + button to add a Gmail account.",
+            "Open Settings to add a Gmail account.",
         );
     }
     rebuild_sidebar(widgets, state);
     refresh_favorite_counts(widgets, state);
+    poll_new_mail_all(widgets, state);
 }
 
 fn initialize_account_collapse(state: &mut State, preferences: &UiPreferences) {
@@ -3431,6 +4083,11 @@ fn show_loaded_mailbox(
     showing_messages: bool,
 ) {
     if !should_display_loaded_messages(showing_messages, mailbox_changed(state, &messages)) {
+        if select_pending_notification(widgets, state)
+            || state.borrow().pending_notification_thread.is_some()
+        {
+            return;
+        }
         if select_first && widgets.messages.selected_row().is_none() {
             select_first_conversation(widgets);
         }
@@ -3442,6 +4099,11 @@ fn show_loaded_mailbox(
         .as_ref()
         .map(|message| message.thread_id.clone());
     display_messages(widgets, state, messages);
+    if select_pending_notification(widgets, state)
+        || state.borrow().pending_notification_thread.is_some()
+    {
+        return;
+    }
     let selected_index = selected_thread.and_then(|thread_id| {
         state
             .borrow()
@@ -3461,6 +4123,31 @@ fn show_loaded_mailbox(
     } else {
         clear_reader_view(widgets, state);
     }
+}
+
+fn select_pending_notification(widgets: &Widgets, state: &Rc<RefCell<State>>) -> bool {
+    let Some((email, thread_id)) = state.borrow().pending_notification_thread.clone() else {
+        return false;
+    };
+    let index = widgets.account_picker.selected() as usize;
+    if state.borrow().account_emails.get(index) != Some(&email) {
+        return false;
+    }
+    let row_index = state
+        .borrow()
+        .conversations
+        .iter()
+        .position(|conversation| {
+            conversation
+                .first()
+                .is_some_and(|message| message.thread_id == thread_id)
+        });
+    let Some(row) = row_index.and_then(|index| widgets.messages.row_at_index(index as i32)) else {
+        return false;
+    };
+    state.borrow_mut().pending_notification_thread = None;
+    widgets.messages.select_row(Some(&row));
+    true
 }
 
 fn should_display_loaded_messages(showing_cached_messages: bool, mailbox_changed: bool) -> bool {
@@ -3795,7 +4482,7 @@ fn conversation_row_content(
         heading.append(&draft_indicator());
     }
     if starred {
-        heading.append(&gtk::Image::from_icon_name("starred-symbolic"));
+        heading.append(&gtk::Image::from_icon_name("postbird-star-check-symbolic"));
     }
     heading.append(&date);
 
@@ -3994,7 +4681,8 @@ fn attachment_control(
             .label(attachment_filename(part))
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(48)
+            .max_width_chars(64)
+            .hexpand(true)
             .xalign(0.0)
             .build();
         row.append(&label);
@@ -4015,6 +4703,8 @@ fn attachment_control(
     }
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
+        .width_request(360)
+        .propagate_natural_width(true)
         .max_content_height(320)
         .propagate_natural_height(true)
         .child(&list)
@@ -4092,6 +4782,46 @@ fn save_attachment(
     });
 }
 
+fn message_reply_actions(widgets: &Widgets, email: &str, message: &Message) -> gtk::Box {
+    let actions = gtk::Box::new(Orientation::Horizontal, 6);
+    for (icon, title, reply_all) in [
+        ("postbird-reply-symbolic", "Reply", Some(false)),
+        ("postbird-reply-all-symbolic", "Reply All", Some(true)),
+        ("postbird-forward-symbolic", "Forward", None),
+    ] {
+        let image = gtk::Image::from_icon_name(icon);
+        image.set_pixel_size(16);
+        let button = gtk::Button::builder()
+            .child(&image)
+            .tooltip_text(title)
+            .valign(Align::Center)
+            .css_classes(["flat", "postbird-message-action"])
+            .build();
+        button.update_property(&[gtk::accessible::Property::Label(title)]);
+        let widgets = widgets.clone();
+        let email = email.to_owned();
+        // Capture this message and its account, independently of the reader's
+        // selected/latest message and any later account selection changes.
+        let original = message.clone();
+        button.connect_clicked(move |button| {
+            if let Some(reply_all) = reply_all {
+                let reply = reply_message(&original, &email, reply_all);
+                present_compose(
+                    &widgets,
+                    email.clone(),
+                    Some(reply),
+                    Some(original.clone()),
+                    None,
+                );
+            } else {
+                present_forward(&widgets, email.clone(), original.clone(), button);
+            }
+        });
+        actions.append(&button);
+    }
+    actions
+}
+
 fn display_conversation(
     widgets: &Widgets,
     state: &Rc<RefCell<State>>,
@@ -4166,7 +4896,7 @@ fn display_conversation(
                 email,
                 message,
                 &inline_images,
-                "image-x-generic-symbolic",
+                "postbird-image-symbolic",
                 "Embedded images",
             ) {
                 heading_line.append(&control);
@@ -4176,11 +4906,12 @@ fn display_conversation(
                 email,
                 message,
                 &attachments,
-                "mail-attachment-symbolic",
+                "postbird-paperclip-symbolic",
                 "Attachments",
             ) {
                 heading_line.append(&control);
             }
+            heading_line.append(&message_reply_actions(widgets, email, message));
         }
         heading_line.append(&date);
         let preview = gtk::Label::builder()
@@ -4352,9 +5083,16 @@ fn populate_message_body(
         }
     });
     let fitting = Rc::new(std::cell::Cell::new(false));
+    let document_committed = Rc::new(Cell::new(false));
+    let committed_after_load = document_committed.clone();
     let weak_body = body.downgrade();
     let fitting_after_load = fitting.clone();
     view.connect_load_changed(move |view, event| {
+        if event == webkit6::LoadEvent::Started {
+            committed_after_load.set(false);
+        } else if event == webkit6::LoadEvent::Committed {
+            committed_after_load.set(true);
+        }
         if event == webkit6::LoadEvent::Finished
             && let Some(body) = weak_body.upgrade()
         {
@@ -4373,8 +5111,8 @@ fn populate_message_body(
         }
         let width = view.width();
         if width > 0
-            && width != last_width.get()
-            && !view.is_loading()
+            && document_committed.get()
+            && (width != last_width.get() || view.is_loading())
             && let Some(body) = weak_body.upgrade()
         {
             last_width.set(width);
@@ -4383,14 +5121,24 @@ fn populate_message_body(
         glib::ControlFlow::Continue
     });
     body.append(&view);
+    // Show the cached HTML immediately, including images already in the MIME
+    // payload. Older cache entries may still need their embedded images fetched.
+    let local_images = embedded_image_uris(message, None).unwrap_or_else(|error| {
+        eprintln!("could not decode embedded images: {error:#}");
+        HashMap::new()
+    });
+    view.load_html(
+        &message.rendered_body_with_images(&local_images, load_remote_images),
+        None,
+    );
     let has_cid = message
         .body_html()
         .is_some_and(|html| html.to_ascii_lowercase().contains("cid:"));
-    if !has_cid || message.inline_image_parts().is_empty() || account_email.is_none() {
-        view.load_html(
-            &message.rendered_body_with_images(&HashMap::new(), load_remote_images),
-            None,
-        );
+    let needs_images = message
+        .inline_image_parts()
+        .iter()
+        .any(|(part, _)| part.body.data.is_none() && part.body.attachment_id.is_some());
+    if !has_cid || !needs_images || account_email.is_none() {
         return;
     }
     let message = message.clone();
@@ -4399,7 +5147,8 @@ fn populate_message_body(
     glib::MainContext::default().spawn_local(async move {
         let message_for_fetch = message.clone();
         let result =
-            gio::spawn_blocking(move || embedded_image_uris(&message_for_fetch, &email)).await;
+            gio::spawn_blocking(move || embedded_image_uris(&message_for_fetch, Some(&email)))
+                .await;
         let Some(view) = weak_view.upgrade().filter(|view| view.parent().is_some()) else {
             return;
         };
@@ -4421,7 +5170,10 @@ fn populate_message_body(
     });
 }
 
-fn embedded_image_uris(message: &Message, email: &str) -> anyhow::Result<HashMap<String, String>> {
+fn embedded_image_uris(
+    message: &Message,
+    email: Option<&str>,
+) -> anyhow::Result<HashMap<String, String>> {
     let mut images = HashMap::new();
     let mut deferred = Vec::new();
     for (part, content_id) in message.inline_image_parts() {
@@ -4447,13 +5199,44 @@ fn embedded_image_uris(message: &Message, email: &str) -> anyhow::Result<HashMap
             ));
         }
     }
-    if !deferred.is_empty() {
+    if !deferred.is_empty()
+        && let Some(email) = email
+    {
+        let mut cache = MailCache::open()
+            .map_err(|error| {
+                eprintln!("could not open embedded image cache: {error:#}");
+                error
+            })
+            .ok();
+        let mut fetched = cache
+            .as_ref()
+            .and_then(|cache| {
+                cache
+                    .inline_images(email, &message.id)
+                    .map_err(|error| {
+                        eprintln!("could not read embedded image cache: {error:#}");
+                        error
+                    })
+                    .ok()
+            })
+            .unwrap_or_default();
         let paths = deferred
             .iter()
             .map(|(_, _, path)| path.clone())
+            .filter(|path| !fetched.contains_key(path))
             .collect::<Vec<_>>();
-        let fetched = MailClient::for_account(AccountStore::open()?, email)?
-            .inline_images(&message.id, &paths)?;
+        if !paths.is_empty() {
+            let downloaded = MailClient::for_account(AccountStore::open()?, email)?
+                .inline_images(&message.id, &paths)?;
+            // An account may have been removed while the download was running.
+            if AccountStore::open()?.account(email).is_ok()
+                && let Some(cache) = cache.as_mut()
+                && let Err(error) = cache.store_inline_images(email, &message.id, &downloaded)
+            {
+                eprintln!("could not cache embedded images: {error:#}");
+            }
+            fetched.extend(downloaded);
+        }
         for (id, mime_type, path) in deferred {
             if let Some(bytes) = fetched.get(&path) {
                 images.insert(
@@ -4481,7 +5264,7 @@ fn fit_webview_to_content(
     let fitting = fitting.clone();
     // Email script markup is disabled; this app-owned script only measures layout.
     view.evaluate_javascript(
-        "Math.ceil(document.body ? Math.max(document.body.scrollHeight, document.body.offsetHeight) + 16 : document.documentElement.scrollHeight)",
+        "document.readyState === 'loading' || !document.body ? null : Math.ceil(Math.max(document.body.scrollHeight, document.body.offsetHeight) + 16)",
         Some("postbird-sizing"),
         None,
         None::<&gio::Cancellable>,
@@ -4494,6 +5277,8 @@ fn fit_webview_to_content(
                 return;
             }
             match result {
+                // Wait for the DOM, but not for remote images to finish loading.
+                Ok(height) if height.is_null() => {}
                 Ok(height) if height.is_number() && height.to_double().is_finite()
                     && (20.0..=40_000.0).contains(&height.to_double()) => {
                     view.set_height_request((height.to_double().ceil() as i32).max(80));
@@ -4573,6 +5358,7 @@ fn show_error(widgets: &Widgets, error: impl std::fmt::Display) {
     if error.to_string() == "Request cancelled" {
         return;
     }
+    record_activity(widgets, &error.to_string());
     let dialog = adw::AlertDialog::builder()
         .heading("Postbird could not complete that action")
         .body(error.to_string())
@@ -4582,12 +5368,22 @@ fn show_error(widgets: &Widgets, error: impl std::fmt::Display) {
     dialog.present(Some(&widgets.window));
 }
 fn show_message(widgets: &Widgets, message: &str) {
+    record_activity(widgets, message);
     widgets.toast.add_toast(adw::Toast::new(message));
 }
 fn show_sidebar_message(widgets: &Widgets, message: &str) {
+    record_activity(widgets, message);
     let toast = adw::Toast::new(message);
     toast.set_priority(adw::ToastPriority::High);
     widgets.sidebar_toast.add_toast(toast);
+}
+fn record_activity(widgets: &Widgets, message: &str) {
+    let entry = format!("{} — {message}", Local::now().format("%H:%M:%S"));
+    widgets.activity.splice(0, 0, &[entry.as_str()]);
+    let count = widgets.activity.n_items();
+    if count > 100 {
+        widgets.activity.splice(100, count - 100, &[]);
+    }
 }
 fn detail_label(text: &str, css_class: &str) -> gtk::Label {
     gtk::Label::builder()
@@ -4612,6 +5408,13 @@ fn set_action_icon(button: &gtk::Button, icon: &str) {
     image.set_pixel_size(20);
     button.set_child(Some(&image));
 }
+fn set_labeled_icon(button: &gtk::Button, icon: &str, label: &str) {
+    let content = gtk::Box::new(Orientation::Horizontal, 6);
+    content.append(&gtk::Image::from_icon_name(icon));
+    content.append(&gtk::Label::new(Some(label)));
+    button.set_child(Some(&content));
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+}
 fn entry(placeholder: &str) -> gtk::Entry {
     gtk::Entry::builder().placeholder_text(placeholder).build()
 }
@@ -4619,6 +5422,13 @@ fn entry(placeholder: &str) -> gtk::Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_height_grows_for_accounts_then_caps_for_long_lists() {
+        assert_eq!(settings_height_for_accounts(0), 300);
+        assert_eq!(settings_height_for_accounts(3), 368);
+        assert_eq!(settings_height_for_accounts(20), 560);
+    }
 
     #[test]
     fn accounts_start_collapsed_only_when_favorites_exist() {
@@ -4660,6 +5470,26 @@ mod tests {
         assert!(search_clear_needs_reload(Some("from:friend"), ""));
         assert!(!search_clear_needs_reload(None, ""));
         assert!(!search_clear_needs_reload(Some("is:unread"), "new query"));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical session; tests the search clear control"]
+    fn search_clear_icon_cancels_the_unread_filter() {
+        gtk::init().expect("GTK display connection");
+        let search = mail_search_entry();
+        assert!(search.secondary_icon_name().is_none());
+        search.set_text("is:unread");
+        assert_eq!(
+            search.secondary_icon_name().as_deref(),
+            Some("postbird-circle-x-symbolic")
+        );
+        search.emit_by_name::<()>("icon-release", &[&gtk::EntryIconPosition::Secondary]);
+        assert!(search.text().is_empty());
+        assert!(search.secondary_icon_name().is_none());
+        assert!(search_clear_needs_reload(
+            Some("is:unread"),
+            search.text().as_str()
+        ));
     }
 
     #[test]
@@ -4972,18 +5802,527 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical session; uses only synthetic messages"]
+    fn cached_body_displays_while_remote_image_is_still_loading() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        gtk::init().expect("GTK display connection");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requested = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let server_requested = requested.clone();
+        let server_release = release.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline && !server_release.load(Ordering::Relaxed) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let _ = stream.read(&mut [0; 2048]);
+                    server_requested.store(true, Ordering::Relaxed);
+                    while !server_release.load(Ordering::Relaxed) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let html = format!(
+            "<div style='height:400px'>Cached message text</div><img src='http://{address}/slow.png'>"
+        );
+        let message: Message = serde_json::from_value(json!({
+            "id": "slow-image-test", "payload": {"mimeType": "text/html",
+                "body": {"data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(html)}}
+        }))
+        .unwrap();
+        let body = gtk::Box::new(Orientation::Vertical, 0);
+        let scroll = new_conversation_scroll(&body);
+        let window = gtk::Window::builder()
+            .default_width(600)
+            .default_height(600)
+            .child(&scroll)
+            .build();
+        populate_message_body(&body, &scroll, &message, None, true);
+        let view = body
+            .first_child()
+            .unwrap()
+            .downcast::<webkit6::WebView>()
+            .unwrap();
+        window.present();
+        let started = Instant::now();
+        let context = glib::MainContext::default();
+        let mut displayed = false;
+        while started.elapsed() < Duration::from_secs(10) {
+            while context.pending() {
+                context.iteration(false);
+            }
+            if requested.load(Ordering::Relaxed)
+                && view.is_loading()
+                && view.height_request() >= 400
+            {
+                displayed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        release.store(true, Ordering::Relaxed);
+        window.destroy();
+        server.join().unwrap();
+        assert!(
+            displayed,
+            "message body must be sized before the image server responds"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical session; uses only synthetic messages"]
+    fn compose_images_and_attachments_round_trip() {
+        adw::init().unwrap();
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        assert!(
+            gtk::gdk::Display::default()
+                .unwrap()
+                .type_()
+                .name()
+                .contains("Broadway"),
+            "Run this clipboard test on an isolated Broadway display"
+        );
+        install_visual_style();
+        let editor = crate::compose_history::editor();
+        let _toolbar = rich_text_toolbar(&editor);
+        let images = InlineImages::default();
+        let dialog = adw::Dialog::new();
+        let window = gtk::Window::builder()
+            .default_width(800)
+            .default_height(600)
+            .child(&editor)
+            .build();
+        window.add_css_class("postbird-compose");
+        window.present();
+        let buffer = editor.buffer();
+        buffer.set_text("Before REPLACE after");
+        images.connect_paste(&editor, &dialog);
+        buffer.select_range(&buffer.iter_at_offset(7), &buffer.iter_at_offset(14));
+        let pixbuf =
+            gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, true, 8, 1000, 600)
+                .unwrap();
+        pixbuf.fill(0x315c9eff);
+        let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+        editor.clipboard().set_texture(&texture);
+        editor.emit_by_name::<()>("paste-clipboard", &[]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while images.is_pending() && std::time::Instant::now() < deadline {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!images.is_pending());
+        let (plain, html) = rich_text_content(&editor, &images);
+        assert_eq!(plain, "Before [Image: Screenshot-1.png] after");
+        assert!(html.contains("<img src=\"cid:postbird-"));
+        let image = &images.attachments(&editor)[0];
+        let saved_texture =
+            gtk::gdk::Texture::from_bytes(&glib::Bytes::from(&*image.data)).unwrap();
+        assert_eq!((saved_texture.width(), saved_texture.height()), (1000, 600));
+        assert!(
+            buffer
+                .iter_at_offset(7)
+                .paintable()
+                .unwrap()
+                .intrinsic_width()
+                <= 520
+        );
+
+        buffer.begin_user_action();
+        buffer.delete(&mut buffer.iter_at_offset(7), &mut buffer.iter_at_offset(8));
+        buffer.end_user_action();
+        assert!(
+            images.attachments(&editor).is_empty(),
+            "deleted images must not be sent"
+        );
+        editor.activate_action("text.undo", None).unwrap();
+        assert_eq!(
+            images.attachments(&editor).len(),
+            1,
+            "undo restores the inline image"
+        );
+        editor.activate_action("text.undo", None).unwrap();
+        assert_eq!(
+            rich_text_content(&editor, &images).0,
+            "Before REPLACE after"
+        );
+        editor.activate_action("text.redo", None).unwrap();
+        assert_eq!(
+            images.attachments(&editor).len(),
+            1,
+            "redo restores a pasted image"
+        );
+        editor.activate_action("text.redo", None).unwrap();
+        assert!(images.attachments(&editor).is_empty());
+        editor.activate_action("text.undo", None).unwrap();
+        assert_eq!(images.attachments(&editor).len(), 1);
+
+        buffer.place_cursor(&buffer.end_iter());
+        editor.clipboard().set_text(" pasted text");
+        editor.emit_by_name::<()>("paste-clipboard", &[]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !rich_text_content(&editor, &images)
+            .0
+            .ends_with(" pasted text")
+            && std::time::Instant::now() < deadline
+        {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            rich_text_content(&editor, &images)
+                .0
+                .ends_with(" pasted text")
+        );
+        assert_eq!(images.attachments(&editor).len(), 1);
+        buffer.select_range(&buffer.start_iter(), &buffer.iter_at_offset(6));
+        toggle_selected_tag(&buffer, RICH_TAGS[0].0);
+        assert!(
+            rich_text_content(&editor, &images)
+                .1
+                .contains("<strong>Before</strong>")
+        );
+        editor.activate_action("text.undo", None).unwrap();
+        assert!(!rich_text_content(&editor, &images).1.contains("<strong>"));
+        editor.activate_action("text.undo", None).unwrap();
+        assert_eq!(rich_text_content(&editor, &images).0, plain);
+        assert_eq!(images.attachments(&editor).len(), 1);
+
+        let message = ComposeMessage {
+            to: "reader@example.com".into(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Screenshot".into(),
+            body: plain.clone(),
+            html_body: Some(html.clone()),
+            in_reply_to: None,
+            thread_id: None,
+            attachments: Vec::new(),
+            forwarded_attachments: images.attachments(&editor),
+        };
+        let reopened = gtk::TextView::new();
+        let _toolbar = rich_text_toolbar(&reopened);
+        let restored = InlineImages::default();
+        let restored_ids = restored.restore(&reopened, &message);
+        assert_eq!(restored_ids.len(), 1);
+        assert_eq!(rich_text_content(&reopened, &restored).0, plain);
+        assert_eq!(
+            restored.attachments(&reopened)[0].data,
+            message.forwarded_attachments[0].data
+        );
+        let original = rich_text_content(&reopened, &restored);
+        assert_eq!(
+            compose_body_content(&reopened, &original, Some(&html), &restored).1,
+            html
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("postbird-compose-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        std::fs::write(&first, "first attachment").unwrap();
+        std::fs::write(&second, "second attachment").unwrap();
+        let files = gio::ListStore::new::<gio::File>();
+        files.append(&gio::File::for_path(&first));
+        files.append(&gio::File::for_path(&second));
+        let attachments = AttachmentList::new(Some(&message), &restored_ids);
+        attachments.add_files(files.upcast_ref()).unwrap();
+        attachments.add_files(files.upcast_ref()).unwrap();
+        assert_eq!(
+            attachments.contents().0,
+            vec![first.clone(), second.clone()]
+        );
+        assert!(
+            attachments.contents().1.is_empty(),
+            "inline images aren't listed again as file attachments"
+        );
+        let rows = attachments
+            .widget
+            .child()
+            .unwrap()
+            .downcast::<gtk::Viewport>()
+            .unwrap()
+            .child()
+            .unwrap()
+            .downcast::<gtk::Box>()
+            .unwrap();
+        rows.first_child()
+            .unwrap()
+            .last_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap()
+            .emit_clicked();
+        assert_eq!(attachments.contents().0, vec![second]);
+        assert!(
+            editor.color().red() < 0.2,
+            "the editor stays dark text on its light surface"
+        );
+        window.destroy();
+
+        // Exercise the real compose dialog under a forced dark application theme.
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+        let window = adw::ApplicationWindow::builder()
+            .default_width(1050)
+            .default_height(820)
+            .build();
+        let widgets = Widgets {
+            window: window.clone(),
+            toast: adw::ToastOverlay::new(),
+            sidebar_toast: adw::ToastOverlay::new(),
+            activity: gtk::StringList::new(&[]),
+            accounts: gtk::StringList::new(&[]),
+            account_picker: gtk::DropDown::from_strings(&[]),
+            messages: gtk::ListBox::new(),
+            sidebar_navigation: gtk::Box::new(Orientation::Vertical, 0),
+            mailbox_spinner: gtk::Spinner::new(),
+            message_title: gtk::Label::new(None),
+            message_sender: gtk::Label::new(None),
+            conversation_scroll: gtk::ScrolledWindow::new(),
+            conversation_body: gtk::Box::new(Orientation::Vertical, 0),
+            message_content: gtk::Box::new(Orientation::Vertical, 0),
+            detail_stack: gtk::Stack::new(),
+            archive: gtk::Button::new(),
+            star: gtk::Button::new(),
+            trash: gtk::Button::new(),
+            unread: gtk::Button::new(),
+            reply: gtk::Button::new(),
+            reply_all: gtk::Button::new(),
+            forward: gtk::Button::new(),
+            search: mail_search_entry(),
+            preferences: Rc::new(RefCell::new(UiPreferences::default())),
+        };
+        let mut preview_message = message;
+        preview_message.attachments = attachments.contents().0;
+        window.present();
+        present_compose_with_title(
+            &widgets,
+            "sender@example.com".into(),
+            Some(preview_message),
+            None,
+            None,
+            Some("New message"),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            while glib::MainContext::default().pending() {
+                glib::MainContext::default().iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let dialog = window.visible_dialog().unwrap();
+        // AdwDialog covers the whole parent window. Its background must stay
+        // transparent; --dialog-bg-color paints only the actual compose sheet.
+        #[allow(deprecated)]
+        let background = {
+            let snapshot = gtk::Snapshot::new();
+            snapshot.render_background(&dialog.style_context(), 0.0, 0.0, 100.0, 100.0);
+            snapshot.to_node()
+        };
+        assert!(
+            background.is_none(),
+            "compose must not paint over the mailbox"
+        );
+        fn check_editor_colors(widget: &gtk::Widget) -> usize {
+            let mut checked = 0;
+            if widget.is::<gtk::TextView>() || widget.is::<gtk::Entry>() {
+                assert!(
+                    widget.color().red() < 0.2,
+                    "compose fields use dark text even in dark mode"
+                );
+                checked += 1;
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                checked += check_editor_colors(&widget);
+                child = widget.next_sibling();
+            }
+            checked
+        }
+        assert_eq!(check_editor_colors(&dialog.child().unwrap()), 6);
+        dialog.close();
+        check_message_reply_actions(&widgets);
+        window.destroy();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn check_message_reply_actions(widgets: &Widgets) {
+        fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut result = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                result.extend(descendants(&widget));
+                child = widget.next_sibling();
+            }
+            result
+        }
+        fn wait_until(condition: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !condition() && std::time::Instant::now() < deadline {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(condition(), "compose dialog did not finish opening/closing");
+        }
+        wait_until(|| widgets.window.visible_dialog().is_none());
+        let older: Message = serde_json::from_value(json!({
+            "id": "older", "threadId": "conversation", "payload": {
+                "mimeType": "multipart/mixed", "headers": [
+                    {"name": "Subject", "value": "Earlier subject"},
+                    {"name": "From", "value": "alice@example.com"},
+                    {"name": "Reply-To", "value": "team@example.com"},
+                    {"name": "To", "value": "sender@example.com, bob@example.com"},
+                    {"name": "Cc", "value": "carol@example.com"},
+                    {"name": "Message-ID", "value": "<older@example.com>"}
+                ], "parts": [
+                    {"mimeType": "text/plain", "body": {"data": "T2xkIGJvZHk"}},
+                    {"mimeType": "text/plain", "filename": "older-only.txt", "body": {"data": "b2xkIGZpbGU"}}
+                ]
+            }
+        })).unwrap();
+        let newer: Message = serde_json::from_value(json!({
+            "id": "newer", "threadId": "conversation", "payload": {
+                "mimeType": "text/plain", "body": {"data": "TmV3IGJvZHk"},
+                "headers": [
+                    {"name": "Subject", "value": "Latest subject"},
+                    {"name": "From", "value": "different@example.com"},
+                    {"name": "Message-ID", "value": "<newer@example.com>"}
+                ]
+            }
+        }))
+        .unwrap();
+        let state = Rc::new(RefCell::new(State {
+            account_emails: vec!["sender@example.com".into(), "other@example.com".into()],
+            selected: Some(newer.clone()),
+            ..State::default()
+        }));
+        widgets
+            .account_picker
+            .set_model(Some(&gtk::StringList::new(&["Sender", "Other"])));
+        widgets.account_picker.set_selected(0);
+        display_conversation(widgets, &state, &[newer, older], false);
+        let older_row = widgets.conversation_body.first_child().unwrap();
+        let buttons = descendants(&older_row)
+            .into_iter()
+            .filter(|widget| widget.has_css_class("postbird-message-action"))
+            .map(|widget| widget.downcast::<gtk::Button>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(buttons.len(), 3);
+        // Changing the reader's account cannot change a message action's sender.
+        widgets.account_picker.set_selected(1);
+        for (index, button) in buttons.iter().enumerate() {
+            assert_eq!(
+                button
+                    .child()
+                    .unwrap()
+                    .downcast::<gtk::Image>()
+                    .unwrap()
+                    .pixel_size(),
+                16
+            );
+            button.emit_clicked();
+            wait_until(|| widgets.window.visible_dialog().is_some());
+            let dialog = widgets.window.visible_dialog().unwrap();
+            let content = descendants(&dialog.child().unwrap());
+            let entries = content
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Entry>())
+                .collect::<Vec<_>>();
+            let field = |placeholder: &str| {
+                entries
+                    .iter()
+                    .find(|entry| entry.placeholder_text().as_deref() == Some(placeholder))
+                    .unwrap()
+                    .text()
+                    .to_string()
+            };
+            assert_eq!(
+                entries
+                    .iter()
+                    .find(|entry| !entry.is_editable())
+                    .unwrap()
+                    .text(),
+                "sender@example.com"
+            );
+            assert_eq!(
+                field("Subject"),
+                if index == 2 {
+                    "Fwd: Earlier subject"
+                } else {
+                    "Re: Earlier subject"
+                }
+            );
+            assert_eq!(
+                field("To"),
+                match index {
+                    0 => "team@example.com",
+                    1 => "team@example.com, bob@example.com",
+                    _ => "",
+                }
+            );
+            assert_eq!(
+                field("Cc"),
+                if index == 1 { "carol@example.com" } else { "" }
+            );
+            let bodies = content
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::TextView>())
+                .map(|view| {
+                    let buffer = view.buffer();
+                    buffer
+                        .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(bodies.contains("Old body"));
+            assert!(!bodies.contains("New body"));
+            if index == 2 {
+                assert!(
+                    content
+                        .iter()
+                        .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+                        .any(|label| label.text() == "older-only.txt")
+                );
+            }
+            dialog.close();
+            wait_until(|| widgets.window.visible_dialog().is_none());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphical session; uses only synthetic messages"]
     fn message_body_lifecycle() {
         gtk::init().expect("GTK display connection");
         let editor = gtk::TextView::new();
         let _toolbar = rich_text_toolbar(&editor);
         editor.buffer().set_text("Hello");
-        let original = rich_text_content(&editor);
+        let images = InlineImages::default();
+        let original = rich_text_content(&editor, &images);
         let html = "<p><b>Hello</b><img src='cid:image-1'></p>";
-        assert_eq!(compose_body_content(&editor, &original, Some(html)).1, html);
+        assert_eq!(
+            compose_body_content(&editor, &original, Some(html), &images).1,
+            html
+        );
         editor
             .buffer()
             .insert(&mut editor.buffer().end_iter(), " edited");
-        let changed = compose_body_content(&editor, &original, Some(html));
+        let changed = compose_body_content(&editor, &original, Some(html), &images);
         assert_eq!(changed.0, "Hello edited");
         assert!(changed.1.contains("Hello edited"));
         assert_ne!(changed.1, html);
@@ -5066,7 +6405,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let images = embedded_image_uris(&message, "unused@example.com").unwrap();
+        let images = embedded_image_uris(&message, None).unwrap();
         assert_eq!(
             images.get("logo").map(String::as_str),
             Some("data:image/png;base64,AQID")
@@ -5255,5 +6594,25 @@ mod tests {
         let (to, cc) = reply_all_recipients(&original, "kent@example.com");
         assert_eq!(to, "Alice <alice@example.com>, Bob <bob@example.com>");
         assert_eq!(cc, "Carol <carol@example.com>");
+    }
+
+    #[test]
+    fn reply_reference_belongs_to_the_requested_message() {
+        let original: Message = serde_json::from_value(json!({
+            "id": "older-message", "threadId": "conversation", "payload": { "headers": [
+                { "name": "From", "value": "alice@example.com" },
+                { "name": "Reply-To", "value": "team@example.com" },
+                { "name": "Subject", "value": "Earlier subject" },
+                { "name": "Message-ID", "value": "<older@example.com>" }
+            ]}
+        }))
+        .unwrap();
+        for reply_all in [false, true] {
+            let reply = reply_message(&original, "sender@example.com", reply_all);
+            assert_eq!(reply.in_reply_to.as_deref(), Some("<older@example.com>"));
+            assert_eq!(reply.thread_id.as_deref(), Some("conversation"));
+            assert_eq!(reply.to, "team@example.com");
+            assert_eq!(reply.subject, "Re: Earlier subject");
+        }
     }
 }
