@@ -3460,6 +3460,7 @@ fn present_compose_with_title(
     form.append(&editor_frame);
     toolbar.set_content(Some(&form));
     dialog.set_child(Some(&toolbar));
+    dialog.set_focus(Some(&to));
 
     let editing_for_send = editing.clone();
     let busy_controls: Vec<gtk::Widget> = vec![
