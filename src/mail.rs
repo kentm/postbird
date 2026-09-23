@@ -323,17 +323,19 @@ impl ImapClient {
     }
 
     pub fn send(&mut self, message: &ComposeMessage) -> Result<()> {
-        self.call(
-            "send",
-            json!({"raw": encode_message(&self.email, message)?}),
-        )
+        self.call("send", self.outgoing_fields(message)?)
     }
 
     pub fn create_draft(&mut self, message: &ComposeMessage) -> Result<()> {
-        self.call(
-            "create_draft",
-            json!({"raw": encode_message(&self.email, message)?}),
-        )
+        self.call("create_draft", self.outgoing_fields(message)?)
+    }
+
+    fn outgoing_fields(&self, message: &ComposeMessage) -> Result<Value> {
+        let account = self.store.account(&self.email)?;
+        let sender = account.sender_address(message.from.as_deref())?;
+        let mut message = message.clone();
+        message.from = Some(sender.clone());
+        Ok(json!({"raw": encode_message(&self.email, &message)?, "sender": sender}))
     }
 
     pub fn draft_for_message(&mut self, message_id: &str) -> Result<Draft> {
@@ -347,15 +349,11 @@ impl ImapClient {
         message: &ComposeMessage,
         send: bool,
     ) -> Result<()> {
-        self.call(
-            "write_existing_draft",
-            json!({
-                "id": id,
-                "expected_message_id": expected_message_id,
-                "raw": encode_message(&self.email, message)?,
-                "send": send,
-            }),
-        )
+        let mut fields = self.outgoing_fields(message)?;
+        fields["id"] = json!(id);
+        fields["expected_message_id"] = json!(expected_message_id);
+        fields["send"] = json!(send);
+        self.call("write_existing_draft", fields)
     }
 }
 

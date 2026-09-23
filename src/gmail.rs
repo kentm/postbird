@@ -86,6 +86,7 @@ pub struct Draft {
 
 #[derive(Clone, Debug)]
 pub struct ComposeMessage {
+    pub from: Option<String>,
     pub to: String,
     pub cc: String,
     pub bcc: String,
@@ -122,7 +123,14 @@ impl ForwardedAttachment {
 pub(crate) fn encode_message(email: &str, message: &ComposeMessage) -> Result<String> {
     let mut builder = MimeMessage::builder()
         .keep_bcc()
-        .from(email.parse::<Mailbox>().context("invalid sender address")?)
+        .from(
+            message
+                .from
+                .as_deref()
+                .unwrap_or(email)
+                .parse::<Mailbox>()
+                .context("invalid sender address")?,
+        )
         .subject(&message.subject);
     if !message.to.trim().is_empty() {
         for recipient in message
@@ -289,6 +297,19 @@ impl Message {
         find_body(&self.payload, "text/html")
     }
 
+    pub fn needs_body_refresh(&self) -> bool {
+        fn deferred_body(part: &Payload) -> bool {
+            if is_attachment(part) {
+                return false;
+            }
+            // Older caches misclassified body parts with Content-ID headers
+            // as downloadable attachments, leaving their content out entirely.
+            (is_body_part(part) && part.body.data.is_none() && part.body.attachment_id.is_some())
+                || part.parts.iter().any(deferred_body)
+        }
+        deferred_body(&self.payload)
+    }
+
     pub fn rendered_body_with_images(
         &self,
         inline_images: &HashMap<String, String>,
@@ -404,13 +425,25 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn is_body_part(payload: &Payload) -> bool {
+    let mime_type = payload
+        .mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(mime_type.as_str(), "text/plain" | "text/html") || mime_type.starts_with("multipart/")
+}
+
 fn is_attachment(payload: &Payload) -> bool {
     !payload.filename.is_empty()
         || is_inline_image(payload)
-        || payload
-            .headers
-            .iter()
-            .any(|header| header.name.eq_ignore_ascii_case("Content-ID"))
+        || (!is_body_part(payload)
+            && payload
+                .headers
+                .iter()
+                .any(|header| header.name.eq_ignore_ascii_case("Content-ID")))
         || payload.headers.iter().any(|header| {
             header.name.eq_ignore_ascii_case("Content-Disposition")
                 && header
@@ -479,6 +512,7 @@ mod tests {
     #[test]
     fn drafts_allow_no_recipients_and_preserve_bcc_and_inline_images() {
         let mut message = ComposeMessage {
+            from: None,
             to: String::new(),
             cc: String::new(),
             bcc: String::new(),
@@ -504,8 +538,12 @@ mod tests {
         };
         let raw = mime(&message);
         assert!(!raw.contains("To:"));
+        assert!(raw.contains("From: sender@example.com"));
+        message.from = Some("alias@example.com".into());
         message.bcc = "hidden@example.com".to_owned();
         let raw = mime(&message);
+        assert!(raw.contains("From: alias@example.com"));
+        assert!(!raw.contains("From: sender@example.com"));
         assert!(raw.contains("Bcc: hidden@example.com"));
         assert!(raw.contains("Content-ID: <image-1>"));
         assert!(raw.contains("inline"));
@@ -521,6 +559,7 @@ mod tests {
             std::env::temp_dir().join(format!("postbird-attachment-{}.txt", std::process::id()));
         std::fs::write(&path, b"selected file bytes").unwrap();
         let message = ComposeMessage {
+            from: None,
             to: "reader@example.com".into(),
             cc: String::new(),
             bcc: String::new(),
@@ -581,6 +620,7 @@ print(json.dumps({
     #[test]
     fn forwards_multiple_attachments_in_the_encoded_message() {
         let message = ComposeMessage {
+            from: None,
             to: "recipient@example.com".to_owned(),
             cc: String::new(),
             bcc: String::new(),
@@ -613,6 +653,49 @@ print(json.dumps({
         assert!(mime.contains("%PDF-test"));
         assert!(mime.contains("%PDF-other"));
         assert!(!mime.contains("In-Reply-To:"));
+    }
+
+    #[test]
+    fn content_id_on_body_parts_does_not_hide_formatted_mail() {
+        let html = "<html><body><h1>Sale</h1><img src=\"cid:logo\"></body></html>";
+        let mut message: Message = serde_json::from_value(json!({
+            "id": "marketing", "threadId": "sale", "payload": {
+                "mimeType": "multipart/alternative", "parts": [
+                    {"mimeType": "text/plain", "headers": [{"name": "Content-ID", "value": "<plain>"}], "body": {"data": URL_SAFE_NO_PAD.encode("Long tracking URLs")}},
+                    {"mimeType": "multipart/related", "headers": [{"name": "Content-ID", "value": "<container>"}], "parts": [
+                        {"mimeType": "text/html", "headers": [{"name": "Content-ID", "value": "<body>"}], "body": {"data": URL_SAFE_NO_PAD.encode(html)}},
+                        {"mimeType": "image/png", "headers": [{"name": "Content-ID", "value": "<logo>"}], "body": {"data": "aW1hZ2U"}}
+                    ]},
+                    {"mimeType": "text/html", "headers": [{"name": "Content-Disposition", "value": "attachment"}, {"name": "Content-ID", "value": "<file>"}], "body": {"attachmentId": "2"}},
+                    {"mimeType": "application/pdf", "headers": [{"name": "Content-ID", "value": "<pdf>"}], "body": {"attachmentId": "3"}}
+                ]
+            }
+        })).unwrap();
+        assert_eq!(message.body_html().as_deref(), Some(html));
+        assert_eq!(message.body_text(), "Long tracking URLs");
+        let (files, images) = message.attachment_groups();
+        assert_eq!(files.len(), 2);
+        assert_eq!(images.len(), 1);
+        let rendered = message.rendered_body_with_images(&HashMap::new(), false);
+        assert!(rendered.contains("<h1>Sale</h1>"));
+        assert!(!rendered.contains("Long tracking URLs"));
+        assert!(!message.needs_body_refresh());
+
+        let body = &mut message.payload.parts[1].parts[0].body;
+        body.data = None;
+        body.attachment_id = Some("1.0".into());
+        assert!(
+            message.needs_body_refresh(),
+            "repair previously misclassified cached HTML"
+        );
+        message.payload.parts[1].parts[0].body.data = Some(URL_SAFE_NO_PAD.encode(html));
+        assert!(!message.needs_body_refresh());
+        message.payload.parts[1].parts.clear();
+        message.payload.parts[1].body.attachment_id = Some("1".into());
+        assert!(
+            message.needs_body_refresh(),
+            "also repair collapsed multipart containers"
+        );
     }
 
     #[test]

@@ -290,6 +290,42 @@ class GmailImapBackendTests(unittest.TestCase):
         draft = backend.message_from_row((meta, raw), inline_attachments=True)
         self.assertEqual(backend.decoded(draft["payload"]["parts"][1]["body"]["data"]), b"\x01\x02\x03")
 
+    @patch("gmail_imap_backend.mailbox_name", side_effect=lambda _connection, label: label)
+    def test_phone_draft_without_flags_or_labels_is_identified_by_its_mailbox(self, _mailbox_name):
+        connection = MagicMock()
+        connection.select.return_value = ("OK", [b"1"])
+        selected = []
+        connection.select.side_effect = lambda name, **_kwargs: (selected.append(name) or ("OK", [b"1"]))
+        # The same draft appears in All Mail and Drafts, alongside a sent
+        # message in its thread. Match the metadata observed from Gmail.
+        raw = b"From: Kent <kent@otron.com>\r\nTo: reader@example.com\r\n\r\nPhone draft"
+        draft_meta = b"1 (X-GM-THRID 456 X-GM-MSGID 123 X-GM-LABELS () UID 7 FLAGS (\\Seen))"
+        sent_meta = b"2 (X-GM-THRID 456 X-GM-MSGID 124 X-GM-LABELS (\\Sent) UID 8 FLAGS (\\Seen))"
+        def uid(command, *args):
+            if command == "SEARCH":
+                return "OK", [{"ALL": b"7 8", "DRAFT": b"7", "TRASH": b""}[selected[-1]]]
+            self.assertEqual(command, "FETCH")
+            rows = [(draft_meta, raw)]
+            if selected[-1] == "ALL":
+                rows.append((sent_meta, b"From: reader@example.com\r\n\r\nSent message"))
+            return "OK", rows
+        connection.uid.side_effect = uid
+        messages = backend.threads(connection, ["456"])[0]["messages"]
+        by_id = {message["id"]: message for message in messages}
+        self.assertEqual(by_id["123"]["labelIds"], ["DRAFT"])
+        self.assertEqual(by_id["124"]["labelIds"], ["SENT"])
+        self.assertEqual(len(messages), 2)
+        with patch("gmail_imap_backend.connect_imap", return_value=connection):
+            draft = backend.dispatch({"operation": "draft_for_message", "id": "123"})
+        self.assertEqual(draft["message"]["labelIds"], ["DRAFT"])
+        self.assertEqual(backend.decoded(draft["message"]["payload"]["body"]["data"]), b"Phone draft")
+
+    @patch("gmail_imap_backend.fetch_rows")
+    def test_draft_flag_and_mailbox_do_not_duplicate_the_label(self, fetch_rows):
+        fetch_rows.return_value = [(b"1 (X-GM-MSGID 123 X-GM-THRID 456 FLAGS (\\Seen \\Draft) X-GM-LABELS (\\Drafts))", b"\r\nDraft")]
+        message = backend.fetch_messages(MagicMock(), [b"7"], mailbox_label="DRAFT")[0]
+        self.assertEqual(message["labelIds"], ["DRAFT"])
+
     def test_inline_image_without_filename_stays_downloadable(self):
         part = email.message_from_string(
             "Content-Type: image/png\nContent-Disposition: inline\n\nimage"
@@ -299,8 +335,8 @@ class GmailImapBackendTests(unittest.TestCase):
 
     def test_new_mail_retains_embedded_images_with_the_cached_body(self):
         raw = (
-            b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=part\r\n\r\n"
-            b"--part\r\nContent-Type: text/html\r\n\r\n<p>Hello</p><img src=\"cid:logo\">\r\n"
+            b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=part\r\nContent-ID: <container>\r\n\r\n"
+            b"--part\r\nContent-Type: text/html\r\nContent-ID: <html-body>\r\n\r\n<p>Hello</p><img src=\"cid:logo\">\r\n"
             b"--part\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\n"
             b"Content-Disposition: inline; filename=logo.png\r\n"
             b"Content-Transfer-Encoding: base64\r\n\r\nAQID\r\n--part--\r\n"
@@ -311,6 +347,25 @@ class GmailImapBackendTests(unittest.TestCase):
         self.assertIn(b"<p>Hello</p>", backend.decoded(html["body"]["data"]))
         self.assertEqual(backend.decoded(image["body"]["data"]), b"\x01\x02\x03")
         self.assertIsNone(image["body"]["attachmentId"])
+
+    def test_marketing_html_with_content_id_is_cached_as_body(self):
+        raw = (
+            b"MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=part\r\n\r\n"
+            b"--part\r\nContent-Type: text/plain\r\n\r\nLong tracking URLs\r\n"
+            b"--part\r\nContent-Type: text/html; charset=iso-8859-1\r\n"
+            b"Content-Id: <html-body@example.com>\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n"
+            b"<html><body><h1>Caf=E9 sale</h1></body></html>\r\n--part--\r\n"
+        )
+        message = backend.message_from_row((b"1 (X-GM-MSGID 123 X-GM-THRID 456 FLAGS (\\Seen))", raw))
+        html = message["payload"]["parts"][1]
+        self.assertEqual(backend.decoded(html["body"]["data"]).decode(), "<html><body><h1>Café sale</h1></body></html>")
+        self.assertIsNone(html["body"]["attachmentId"])
+        for mime_type in ("text/plain", "text/html"):
+            for disposition in ("attachment", 'inline; filename="saved.html"'):
+                with self.subTest(mime_type=mime_type, disposition=disposition):
+                    part = email.message_from_string(f"Content-Type: {mime_type}\nContent-ID: <file>\nContent-Disposition: {disposition}\n\nFile")
+                    self.assertTrue(backend.is_attachment(part))
+                    self.assertIsNone(backend.payload(part)["body"]["data"])
 
     @patch("gmail_imap_backend.locate", return_value=b"7")
     @patch("gmail_imap_backend.fetch_rows")
@@ -413,7 +468,7 @@ class GmailImapBackendTests(unittest.TestCase):
         search_ids.side_effect = lambda _connection, _criterion, thread_id: {
             "one": [b"1"], "two": [b"2"]
         }[thread_id]
-        fetch_messages.side_effect = lambda _connection, _uids: [
+        fetch_messages.side_effect = lambda _connection, _uids, **_kwargs: [
             {"id": "a", "threadId": "one", "internalDate": "1"},
             {"id": "b", "threadId": "two", "internalDate": "2"},
         ]
@@ -476,6 +531,31 @@ class GmailImapBackendTests(unittest.TestCase):
                 )
             send.assert_not_called()
             connection.append.assert_not_called()
+
+    @patch("gmail_imap_backend.ssl.create_default_context")
+    @patch("gmail_imap_backend.smtplib.SMTP_SSL")
+    def test_alias_sender_uses_primary_account_credentials(self, smtp_ssl, _context):
+        connection = smtp_ssl.return_value.__enter__.return_value
+        raw = b"From: kent@otron.com\r\nTo: reader@example.com\r\n\r\nHello"
+        request = {
+            "email": "kent@otron.net", "sender": "kent@otron.com",
+            "password": "secret", "raw": backend.encoded(raw),
+        }
+        backend.send(request)
+        connection.login.assert_called_once_with("kent@otron.net", "secret")
+        sender, recipients, transmitted = connection.sendmail.call_args.args
+        self.assertEqual(sender, "kent@otron.com")
+        self.assertEqual(recipients, ["reader@example.com"])
+        self.assertEqual(email.message_from_bytes(transmitted)["From"], "kent@otron.com")
+        connection.reset_mock()
+        connection.docmd.return_value = (235, b"OK")
+        request.update(goa_id="goa-123", _goa_token="short-lived")
+        backend.send(request)
+        connection.login.assert_not_called()
+        import base64
+        auth = base64.b64decode(connection.docmd.call_args.args[1]).decode()
+        self.assertIn("user=kent@otron.net\x01", auth)
+        self.assertEqual(connection.sendmail.call_args.args[0], "kent@otron.com")
 
     @patch("gmail_imap_backend.ssl.create_default_context")
     @patch("gmail_imap_backend.smtplib.SMTP_SSL")

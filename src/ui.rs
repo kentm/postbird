@@ -35,6 +35,7 @@ struct Widgets {
     sidebar_toast: adw::ToastOverlay,
     activity: gtk::StringList,
     accounts: gtk::StringList,
+    sending_aliases: Rc<RefCell<HashMap<String, Vec<String>>>>,
     account_picker: gtk::DropDown,
     messages: gtk::ListBox,
     sidebar_navigation: gtk::Box,
@@ -232,6 +233,7 @@ pub fn build(app: &adw::Application) {
         sidebar_toast,
         activity: gtk::StringList::new(&[]),
         accounts,
+        sending_aliases: Rc::new(RefCell::new(HashMap::new())),
         account_picker,
         messages,
         sidebar_navigation,
@@ -422,6 +424,7 @@ fn install_visual_style() {
              background: #ffffff; color: #181b20; caret-color: #181b20;
          }
          .postbird-compose entry { background: #f2f4f7; color: #181b20; caret-color: #181b20; }
+         .postbird-compose dropdown > button { background: #f2f4f7; color: #181b20; }
          .postbird-compose textview text selection, .postbird-compose entry selection {
              background: #315c9e; color: #ffffff;
          }
@@ -1839,6 +1842,19 @@ fn refresh_settings_accounts(
             .title(&account.email)
             .subtitle(method)
             .build();
+        let aliases = gtk::Button::builder()
+            .label("Aliases")
+            .valign(Align::Center)
+            .build();
+        let alias_widgets = widgets.clone();
+        let alias_parent = settings.downgrade();
+        let alias_email = account.email.clone();
+        aliases.connect_clicked(move |_| {
+            if let Some(parent) = alias_parent.upgrade() {
+                present_alias_settings(&alias_widgets, &parent, &alias_email);
+            }
+        });
+        row.add_suffix(&aliases);
         let remove = gtk::Button::builder()
             .label("Remove")
             .tooltip_text(format!("Remove {} from Postbird", account.email))
@@ -1876,6 +1892,77 @@ fn refresh_settings_accounts(
         group.add(&row);
         rows.borrow_mut().push(row);
     }
+}
+
+fn present_alias_settings(widgets: &Widgets, parent: &adw::PreferencesDialog, email: &str) {
+    let account = match AccountStore::open().and_then(|store| store.account(email)) {
+        Ok(account) => account,
+        Err(error) => return show_settings_error(parent, error),
+    };
+    let dialog = adw::PreferencesDialog::builder()
+        .title("Sending aliases")
+        .search_enabled(false)
+        .content_width(500)
+        .content_height(400)
+        .build();
+    let page = adw::PreferencesPage::new();
+    let group = adw::PreferencesGroup::builder()
+        .title(&account.email)
+        .description("Enter one alias per line. Remove a line to remove an alias. These addresses must already be enabled in this account’s Gmail Send mail as settings.")
+        .build();
+    let save = gtk::Button::builder()
+        .label("Save")
+        .valign(Align::Center)
+        .css_classes(["suggested-action"])
+        .build();
+    group.set_header_suffix(Some(&save));
+    let editor = gtk::TextView::builder()
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .css_classes(["card"])
+        .build();
+    editor.update_property(&[gtk::accessible::Property::Label(
+        "Sending aliases, one email address per line",
+    )]);
+    editor.buffer().set_text(&account.aliases.join("\n"));
+    group.add(
+        &gtk::ScrolledWindow::builder()
+            .min_content_height(160)
+            .child(&editor)
+            .build(),
+    );
+    group.add(&gtk::LinkButton::with_label(
+        "https://support.google.com/mail/answer/22370",
+        "Gmail alias setup instructions",
+    ));
+    page.add(&group);
+    dialog.add(&page);
+    let aliases = widgets.sending_aliases.clone();
+    let weak_dialog = dialog.downgrade();
+    save.connect_clicked(move |_| {
+        let Some(dialog) = weak_dialog.upgrade() else {
+            return;
+        };
+        let buffer = editor.buffer();
+        let addresses = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), true)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        match AccountStore::open().and_then(|store| store.set_aliases(&account.email, &addresses)) {
+            Ok(saved) => {
+                aliases.borrow_mut().insert(account.email.clone(), saved);
+                dialog.close();
+            }
+            Err(error) => show_settings_error(&dialog, error),
+        }
+    });
+    dialog.present(Some(parent));
 }
 
 fn settings_height_for_accounts(count: usize) -> i32 {
@@ -1942,6 +2029,7 @@ async fn add_app_password_account(
         ImapClient::probe_credentials(&email, &secret)?;
         let store = AccountStore::open()?;
         let account = Account {
+            aliases: Vec::new(),
             display_name: email.clone(),
             email,
             kind: AccountKind::GmailAppPassword,
@@ -2011,6 +2099,7 @@ async fn add_goa_account(
     let result = gio::spawn_blocking(move || -> anyhow::Result<Account> {
         ImapClient::probe_goa(&selected.email, &selected.id)?;
         let account = Account {
+            aliases: Vec::new(),
             display_name: format!("{} (GOA)", selected.email),
             email: selected.email,
             kind: AccountKind::GnomeOnlineAccounts,
@@ -2599,19 +2688,31 @@ fn connect_reply_button(
         let Some(original) = state.borrow().selected.clone() else {
             return;
         };
-        let reply = reply_message(&original, &email, reply_all);
+        let aliases = widgets
+            .sending_aliases
+            .borrow()
+            .get(&email)
+            .cloned()
+            .unwrap_or_default();
+        let reply = reply_message(&original, &email, &aliases, reply_all);
         present_compose(&widgets, email, Some(reply), Some(original), None);
     });
 }
 
-fn reply_message(original: &Message, email: &str, reply_all: bool) -> ComposeMessage {
+fn reply_message(
+    original: &Message,
+    email: &str,
+    aliases: &[String],
+    reply_all: bool,
+) -> ComposeMessage {
     let subject = original.header("Subject");
     let (to, cc) = if reply_all {
-        reply_all_recipients(original, email)
+        reply_all_recipients(original, email, aliases)
     } else {
         (reply_target(original), String::new())
     };
     ComposeMessage {
+        from: None,
         to,
         cc,
         bcc: String::new(),
@@ -2632,6 +2733,7 @@ fn reply_message(original: &Message, email: &str, reply_all: bool) -> ComposeMes
 fn forward_message(original: &Message) -> ComposeMessage {
     let subject = original.header("Subject");
     ComposeMessage {
+        from: None,
         to: String::new(),
         cc: String::new(),
         bcc: String::new(),
@@ -2784,10 +2886,15 @@ fn reply_target(message: &Message) -> String {
     }
 }
 
-fn reply_all_recipients(message: &Message, account_email: &str) -> (String, String) {
+fn reply_all_recipients(
+    message: &Message,
+    account_email: &str,
+    aliases: &[String],
+) -> (String, String) {
     let own_address = account_email.to_ascii_lowercase();
     let mut seen = HashSet::new();
     seen.insert(own_address);
+    seen.extend(aliases.iter().map(|alias| alias.to_ascii_lowercase()));
     let mut to = Vec::new();
     let mut cc = Vec::new();
 
@@ -2849,6 +2956,11 @@ fn draft_compose_message(message: &Message) -> anyhow::Result<ComposeMessage> {
         });
     }
     Ok(ComposeMessage {
+        from: message
+            .header("From")
+            .parse::<Mailbox>()
+            .ok()
+            .map(|mailbox| mailbox.email.to_string()),
         to: message.header("To").to_owned(),
         cc: message.header("Cc").to_owned(),
         bcc: message.header("Bcc").to_owned(),
@@ -2939,6 +3051,38 @@ fn present_compose(
     present_compose_with_title(widgets, account_email, initial, replying_to, editing, None);
 }
 
+fn compose_sender_picker(email: &str, aliases: &[String], initial: Option<&str>) -> gtk::DropDown {
+    let mut choices = vec![email.to_owned()];
+    for alias in aliases.iter().map(String::as_str).chain(initial) {
+        if !choices.iter().any(|item| item.eq_ignore_ascii_case(alias)) {
+            choices.push(alias.to_owned());
+        }
+    }
+    let selected = initial
+        .and_then(|sender| {
+            choices
+                .iter()
+                .position(|item| item.eq_ignore_ascii_case(sender))
+        })
+        .unwrap_or(0);
+    let model = gtk::StringList::new(&choices.iter().map(String::as_str).collect::<Vec<_>>());
+    let picker = gtk::DropDown::builder()
+        .model(&model)
+        .selected(selected as u32)
+        .hexpand(true)
+        .tooltip_text(format!("Sending through {email}"))
+        .build();
+    picker.update_property(&[gtk::accessible::Property::Label("From")]);
+    picker
+}
+
+fn compose_sender(picker: &gtk::DropDown) -> Option<String> {
+    picker
+        .selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .map(|item| item.string().to_string())
+}
+
 fn present_compose_with_title(
     widgets: &Widgets,
     account_email: String,
@@ -2992,13 +3136,17 @@ fn present_compose_with_title(
     let from_row = gtk::Box::new(Orientation::Horizontal, 8);
     let from_label = gtk::Label::new(Some("From"));
     from_label.set_margin_start(8);
-    let from = gtk::Entry::builder()
-        .text(&account_email)
-        .editable(false)
-        .hexpand(true)
-        .tooltip_text("Sending account")
-        .build();
-    from.update_property(&[gtk::accessible::Property::Label("From")]);
+    let aliases = widgets
+        .sending_aliases
+        .borrow()
+        .get(&account_email)
+        .cloned()
+        .unwrap_or_default();
+    let from = compose_sender_picker(
+        &account_email,
+        &aliases,
+        initial.as_ref().and_then(|message| message.from.as_deref()),
+    );
     from_row.append(&from_label);
     from_row.append(&from);
     form.append(&from_row);
@@ -3144,6 +3292,7 @@ fn present_compose_with_title(
     let cc_send = cc.clone();
     let bcc_send = bcc.clone();
     let subject_send = subject.clone();
+    let from_send = from.clone();
     let body_send = body.clone();
     let attachments_send = attachments.clone();
     let images_for_send = inline_images.clone();
@@ -3167,6 +3316,7 @@ fn present_compose_with_title(
         let (paths, mut files) = attachments_send.contents();
         files.extend(images_for_send.attachments(&body_send));
         let message = ComposeMessage {
+            from: compose_sender(&from_send),
             to: to_send.text().to_string(),
             cc: cc_send.text().to_string(),
             bcc: bcc_send.text().to_string(),
@@ -3274,6 +3424,7 @@ fn present_compose_with_title(
         let (paths, mut files) = attachments_draft.contents();
         files.extend(inline_images.attachments(&body));
         let message = ComposeMessage {
+            from: compose_sender(&from),
             to: to.text().to_string(),
             cc: cc.text().to_string(),
             bcc: bcc.text().to_string(),
@@ -3549,6 +3700,10 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         Err(error) => return show_error(widgets, error),
     };
     widgets.accounts.splice(0, widgets.accounts.n_items(), &[]);
+    *widgets.sending_aliases.borrow_mut() = accounts
+        .iter()
+        .map(|account| (account.email.clone(), account.aliases.clone()))
+        .collect();
     {
         let mut state = state.borrow_mut();
         state.account_emails.clear();
@@ -3789,11 +3944,18 @@ fn references_to_refresh(
         .iter()
         .map(|message| message.thread_id.as_str())
         .collect::<HashSet<_>>();
+    let incomplete_threads = cached
+        .iter()
+        .filter(|message| message.needs_body_refresh())
+        .map(|message| message.thread_id.as_str())
+        .collect::<HashSet<_>>();
     references
         .iter()
         .enumerate()
         .filter(|(index, reference)| {
-            *index < recent_count || !cached_threads.contains(reference.id.as_str())
+            *index < recent_count
+                || !cached_threads.contains(reference.id.as_str())
+                || incomplete_threads.contains(reference.id.as_str())
         })
         .map(|(_, reference)| reference.clone())
         .collect()
@@ -4805,7 +4967,13 @@ fn message_reply_actions(widgets: &Widgets, email: &str, message: &Message) -> g
         let original = message.clone();
         button.connect_clicked(move |button| {
             if let Some(reply_all) = reply_all {
-                let reply = reply_message(&original, &email, reply_all);
+                let aliases = widgets
+                    .sending_aliases
+                    .borrow()
+                    .get(&email)
+                    .cloned()
+                    .unwrap_or_default();
+                let reply = reply_message(&original, &email, &aliases, reply_all);
                 present_compose(
                     &widgets,
                     email.clone(),
@@ -5051,10 +5219,17 @@ fn populate_message_body(
     }
     let view = new_message_webview();
     view.set_height_request(80);
+    let scroll_inside = Rc::new(Cell::new(false));
+    let scroll_inside_wheel = scroll_inside.clone();
     let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
     let adjustment = outer_scroll.vadjustment();
     wheel.connect_scroll(move |controller, _, delta_y| {
+        if scroll_inside_wheel.get() {
+            // Long messages use WebKit's own scrolling and viewport-sized
+            // rendering surface. Do not redirect their wheel events outside.
+            return glib::Propagation::Proceed;
+        }
         let maximum = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
         let distance = match controller.unit() {
             gtk::gdk::ScrollUnit::Wheel => delta_y * 72.0,
@@ -5087,6 +5262,8 @@ fn populate_message_body(
     let committed_after_load = document_committed.clone();
     let weak_body = body.downgrade();
     let fitting_after_load = fitting.clone();
+    let outer_after_load = outer_scroll.downgrade();
+    let scroll_inside_after_load = scroll_inside.clone();
     view.connect_load_changed(move |view, event| {
         if event == webkit6::LoadEvent::Started {
             committed_after_load.set(false);
@@ -5095,13 +5272,23 @@ fn populate_message_body(
         }
         if event == webkit6::LoadEvent::Finished
             && let Some(body) = weak_body.upgrade()
+            && let Some(outer) = outer_after_load.upgrade()
         {
-            fit_webview_to_content(view, &body, &text_for_fit, &fitting_after_load);
+            fit_webview_to_content(
+                view,
+                &body,
+                &outer,
+                &text_for_fit,
+                &fitting_after_load,
+                &scroll_inside_after_load,
+            );
         }
     });
     let weak_body = body.downgrade();
     let weak_view = view.downgrade();
+    let weak_outer = outer_scroll.downgrade();
     let last_width = Rc::new(std::cell::Cell::new(0));
+    let last_outer_height = Rc::new(Cell::new(0));
     glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
         let Some(view) = weak_view.upgrade() else {
             return glib::ControlFlow::Break;
@@ -5109,14 +5296,27 @@ fn populate_message_body(
         if view.parent().is_none() {
             return glib::ControlFlow::Break;
         }
+        let Some(outer) = weak_outer.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
         let width = view.width();
         if width > 0
             && document_committed.get()
-            && (width != last_width.get() || view.is_loading())
+            && (width != last_width.get()
+                || outer.height() != last_outer_height.get()
+                || view.is_loading())
             && let Some(body) = weak_body.upgrade()
         {
             last_width.set(width);
-            fit_webview_to_content(&view, &body, &text_for_tick, &fitting);
+            last_outer_height.set(outer.height());
+            fit_webview_to_content(
+                &view,
+                &body,
+                &outer,
+                &text_for_tick,
+                &fitting,
+                &scroll_inside,
+            );
         }
         glib::ControlFlow::Continue
     });
@@ -5249,11 +5449,25 @@ fn embedded_image_uris(
     Ok(images)
 }
 
+// Expanding WebKit to an entire newsletter can exceed the compositor's texture
+// size (especially on scaled displays), making an otherwise loaded email blank.
+const MAX_EXPANDED_MESSAGE_HEIGHT: i32 = 2048;
+
+fn message_view_height(content_height: f64, available_height: i32) -> (i32, bool) {
+    if content_height > f64::from(MAX_EXPANDED_MESSAGE_HEIGHT) {
+        (available_height.clamp(320, 900), true)
+    } else {
+        ((content_height.ceil() as i32).max(80), false)
+    }
+}
+
 fn fit_webview_to_content(
     view: &webkit6::WebView,
     body: &gtk::Box,
+    outer_scroll: &gtk::ScrolledWindow,
     text: &str,
     fitting: &Rc<std::cell::Cell<bool>>,
+    scroll_inside: &Rc<Cell<bool>>,
 ) {
     if fitting.replace(true) {
         return;
@@ -5262,6 +5476,8 @@ fn fit_webview_to_content(
     let body = body.downgrade();
     let text = text.to_owned();
     let fitting = fitting.clone();
+    let available_height = outer_scroll.height();
+    let scroll_inside = scroll_inside.clone();
     // Email script markup is disabled; this app-owned script only measures layout.
     view.evaluate_javascript(
         "document.readyState === 'loading' || !document.body ? null : Math.ceil(Math.max(document.body.scrollHeight, document.body.offsetHeight) + 16)",
@@ -5280,8 +5496,10 @@ fn fit_webview_to_content(
                 // Wait for the DOM, but not for remote images to finish loading.
                 Ok(height) if height.is_null() => {}
                 Ok(height) if height.is_number() && height.to_double().is_finite()
-                    && (20.0..=40_000.0).contains(&height.to_double()) => {
-                    view.set_height_request((height.to_double().ceil() as i32).max(80));
+                    && height.to_double() >= 20.0 => {
+                    let (height, internal) = message_view_height(height.to_double(), available_height);
+                    scroll_inside.set(internal);
+                    view.set_height_request(height);
                 }
                 _ => {
                     body.remove(&view);
@@ -5681,6 +5899,35 @@ mod tests {
     }
 
     #[test]
+    fn incremental_refresh_repairs_older_incomplete_bodies() {
+        let references = ["recent", "broken", "complete"]
+            .into_iter()
+            .map(|id| ThreadRef { id: id.into() })
+            .collect::<Vec<_>>();
+        let incomplete: Message = serde_json::from_value(json!({
+            "id": "cached-html", "threadId": "broken", "payload": {
+                "mimeType": "text/html", "headers": [{"name": "Content-ID", "value": "<body>"}],
+                "body": {"attachmentId": "1"}
+            }
+        }))
+        .unwrap();
+        let cached = vec![
+            message("new", "recent", 30),
+            incomplete,
+            message("same-thread", "broken", 20),
+            message("old", "complete", 10),
+        ];
+        let needed = references_to_refresh(&references, &cached, 1);
+        assert_eq!(
+            needed
+                .iter()
+                .map(|reference| reference.id.as_str())
+                .collect::<Vec<_>>(),
+            ["recent", "broken"]
+        );
+    }
+
+    #[test]
     fn incremental_refresh_fetches_recent_and_missing_threads_only() {
         let references = ["recent", "cached", "new"]
             .into_iter()
@@ -5770,6 +6017,7 @@ mod tests {
         let message: Message = serde_json::from_value(json!({
             "id": "draft-message", "threadId": "conversation", "labelIds": ["DRAFT"],
             "payload": {"mimeType": "multipart/mixed", "headers": [
+                {"name": "From", "value": "Kent <kent@otron.com>"},
                 {"name": "To", "value": "Alice <alice@example.com>"},
                 {"name": "Cc", "value": "cc@example.com"},
                 {"name": "Bcc", "value": "private@example.com"},
@@ -5782,6 +6030,7 @@ mod tests {
             ]}
         })).unwrap();
         let compose = draft_compose_message(&message).unwrap();
+        assert_eq!(compose.from.as_deref(), Some("kent@otron.com"));
         assert_eq!(compose.to, "Alice <alice@example.com>");
         assert_eq!(compose.cc, "cc@example.com");
         assert_eq!(compose.bcc, "private@example.com");
@@ -5798,6 +6047,94 @@ mod tests {
             Some("image-1")
         );
         assert_eq!(&*compose.forwarded_attachments[1].data, b"notes");
+    }
+
+    #[test]
+    #[ignore = "requires a graphical session; uses only synthetic messages"]
+    fn long_html_message_remains_rendered_and_scrolls_to_the_end() {
+        gtk::init().expect("GTK display connection");
+        let html = r#"<html><body style="margin:0"><div style="height:1000px;background:#ff0000">Start</div><div style="height:48000px">Middle</div><div style="height:1000px;background:#0000ff">End</div></body></html>"#;
+        let message: Message = serde_json::from_value(json!({
+            "id": "long", "threadId": "long", "payload": {
+                "mimeType": "text/html", "body": {"data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(html)}
+            }
+        }))
+        .unwrap();
+        let body = gtk::Box::new(Orientation::Vertical, 0);
+        let scroll = gtk::ScrolledWindow::builder().child(&body).build();
+        let window = gtk::Window::builder()
+            .default_width(900)
+            .default_height(700)
+            .child(&scroll)
+            .build();
+        populate_message_body(&body, &scroll, &message, None, false);
+        let view = body
+            .first_child()
+            .unwrap()
+            .downcast::<webkit6::WebView>()
+            .unwrap();
+        window.present();
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            if !view.is_loading()
+                && view.height_request() >= 320
+                && view.height() == view.height_request()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            view.parent().is_some(),
+            "long HTML must not fall back to plain text"
+        );
+        assert!(
+            (320..=900).contains(&view.height()),
+            "keep the rendering surface bounded"
+        );
+        let metrics = context
+            .block_on(view.evaluate_javascript_future(
+                "JSON.stringify({height:document.body.scrollHeight, viewport:innerHeight})",
+                Some("postbird-sizing"),
+                None,
+            ))
+            .unwrap()
+            .to_string();
+        let metrics: serde_json::Value = serde_json::from_str(&metrics).unwrap();
+        assert!(metrics["height"].as_i64().unwrap() >= 50_000);
+        assert!(metrics["viewport"].as_i64().unwrap() <= 900);
+        let pixel = |view: &webkit6::WebView| {
+            let texture = context
+                .block_on(view.snapshot_future(
+                    webkit6::SnapshotRegion::Visible,
+                    webkit6::SnapshotOptions::NONE,
+                ))
+                .unwrap();
+            let mut downloader = gtk::gdk::TextureDownloader::new(&texture);
+            downloader.set_format(gtk::gdk::MemoryFormat::R8g8b8a8);
+            let (bytes, stride) = downloader.download_bytes();
+            bytes[100 * stride + 100 * 4..100 * stride + 100 * 4 + 3].to_vec()
+        };
+        assert_eq!(
+            pixel(&view),
+            [255, 0, 0],
+            "the top of the message remains visible after sizing"
+        );
+        let offset = context
+            .block_on(view.evaluate_javascript_future(
+                "window.scrollTo(0,document.body.scrollHeight); window.scrollY",
+                Some("postbird-sizing"),
+                None,
+            ))
+            .unwrap()
+            .to_double();
+        assert!(offset > 49_000.0, "the full message remains reachable");
+        assert_eq!(pixel(&view), [0, 0, 255], "the end also paints correctly");
+        window.destroy();
     }
 
     #[test]
@@ -6003,6 +6340,7 @@ mod tests {
         assert_eq!(images.attachments(&editor).len(), 1);
 
         let message = ComposeMessage {
+            from: None,
             to: "reader@example.com".into(),
             cc: String::new(),
             bcc: String::new(),
@@ -6087,6 +6425,7 @@ mod tests {
             sidebar_toast: adw::ToastOverlay::new(),
             activity: gtk::StringList::new(&[]),
             accounts: gtk::StringList::new(&[]),
+            sending_aliases: Rc::new(RefCell::new(HashMap::new())),
             account_picker: gtk::DropDown::from_strings(&[]),
             messages: gtk::ListBox::new(),
             sidebar_navigation: gtk::Box::new(Orientation::Vertical, 0),
@@ -6140,7 +6479,10 @@ mod tests {
         );
         fn check_editor_colors(widget: &gtk::Widget) -> usize {
             let mut checked = 0;
-            if widget.is::<gtk::TextView>() || widget.is::<gtk::Entry>() {
+            if widget.is::<gtk::TextView>()
+                || widget.is::<gtk::Entry>()
+                || widget.is::<gtk::DropDown>()
+            {
                 assert!(
                     widget.color().red() < 0.2,
                     "compose fields use dark text even in dark mode"
@@ -6155,6 +6497,22 @@ mod tests {
             checked
         }
         assert_eq!(check_editor_colors(&dialog.child().unwrap()), 6);
+        let picker = compose_sender_picker("kent@otron.net", &["kent@otron.com".into()], None);
+        assert_eq!(compose_sender(&picker).as_deref(), Some("kent@otron.net"));
+        picker.set_selected(1);
+        assert_eq!(compose_sender(&picker).as_deref(), Some("kent@otron.com"));
+        let restored = compose_sender_picker(
+            "kent@otron.net",
+            &["kent@otron.com".into()],
+            Some("kent@otron.com"),
+        );
+        assert_eq!(compose_sender(&restored).as_deref(), Some("kent@otron.com"));
+        let removed = compose_sender_picker("kent@otron.net", &[], Some("kent@otron.com"));
+        assert_eq!(
+            compose_sender(&removed).as_deref(),
+            Some("kent@otron.com"),
+            "do not silently change an existing draft's sender"
+        );
         dialog.close();
         check_message_reply_actions(&widgets);
         window.destroy();
@@ -6252,12 +6610,14 @@ mod tests {
                     .to_string()
             };
             assert_eq!(
-                entries
-                    .iter()
-                    .find(|entry| !entry.is_editable())
-                    .unwrap()
-                    .text(),
-                "sender@example.com"
+                compose_sender(
+                    content
+                        .iter()
+                        .find_map(|widget| widget.downcast_ref::<gtk::DropDown>())
+                        .unwrap()
+                )
+                .as_deref(),
+                Some("sender@example.com")
             );
             assert_eq!(
                 field("Subject"),
@@ -6303,6 +6663,20 @@ mod tests {
             dialog.close();
             wait_until(|| widgets.window.visible_dialog().is_none());
         }
+        let mut draft = message("phone-draft", "conversation", 20);
+        draft.label_ids.push("DRAFT".into());
+        let sent = message("sent-message", "conversation", 30);
+        display_conversation(widgets, &state, &[sent, draft], false);
+        let draft_row = widgets.conversation_body.first_child().unwrap();
+        let has_edit_button = |row: &gtk::Widget| {
+            descendants(row).iter().any(|widget| {
+                widget
+                    .downcast_ref::<gtk::Button>()
+                    .is_some_and(|button| button.label().as_deref() == Some("Edit Draft"))
+            })
+        };
+        assert!(has_edit_button(&draft_row));
+        assert!(!has_edit_button(&draft_row.next_sibling().unwrap()));
     }
 
     #[test]
@@ -6585,13 +6959,14 @@ mod tests {
             "threadId": "thread",
             "payload": { "headers": [
                 { "name": "From", "value": "Alice <alice@example.com>" },
-                { "name": "To", "value": "Kent <kent@example.com>, Bob <bob@example.com>" },
+                { "name": "To", "value": "Kent <kent@example.com>, Bob <bob@example.com>, KENT@OTRON.COM" },
                 { "name": "Cc", "value": "Carol <carol@example.com>, Bob <bob@example.com>" }
             ]}
         }))
         .unwrap();
 
-        let (to, cc) = reply_all_recipients(&original, "kent@example.com");
+        let (to, cc) =
+            reply_all_recipients(&original, "kent@example.com", &["kent@otron.com".into()]);
         assert_eq!(to, "Alice <alice@example.com>, Bob <bob@example.com>");
         assert_eq!(cc, "Carol <carol@example.com>");
     }
@@ -6608,7 +6983,7 @@ mod tests {
         }))
         .unwrap();
         for reply_all in [false, true] {
-            let reply = reply_message(&original, "sender@example.com", reply_all);
+            let reply = reply_message(&original, "sender@example.com", &[], reply_all);
             assert_eq!(reply.in_reply_to.as_deref(), Some("<older@example.com>"));
             assert_eq!(reply.thread_id.as_deref(), Some("conversation"));
             assert_eq!(reply.to, "team@example.com");

@@ -16,6 +16,7 @@ on your computer apart from requests to Google.
 - Gmail search and offline mailbox cache
 - Read, archive, star, mark unread, and trash messages
 - Compose, reply, save drafts, and send messages
+- Per-account sending aliases, selectable in the compose From field
 - Always-light message editor with formatting, file attachments, and pasted inline images
 
 ## Gmail app-password setup
@@ -49,6 +50,18 @@ at runtime. It is a technical integration test, not an established exemption
 from Google's restricted-scope verification or CASA requirements. GNOME asks
 third-party apps to coordinate with its maintainers before shipping use of
 its account profiles.
+
+## Sending aliases
+
+In **Settings → Accounts**, select **Aliases** beside an account. Enter one
+email address per line and save. Choose the address in the compose dialog's
+**From** dropdown; drafts retain that selection. Sending uses the original
+account's sign-in credentials.
+
+Enable each address in Gmail's **Send mail as** settings first; see
+[Google's alias setup instructions](https://support.google.com/mail/answer/22370).
+For example, add `kent@otron.com` as an alias of `kent@otron.net`, then select
+`kent@otron.com` when composing. Delete its line in Aliases to remove it.
 
 ## Build and run
 

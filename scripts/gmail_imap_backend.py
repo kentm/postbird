@@ -251,9 +251,12 @@ def plain_text(part):
 
 def is_attachment(part):
     disposition = part.get_content_disposition()
+    body_type = part.get_content_type() in ("text/plain", "text/html") or part.get_content_maintype() == "multipart"
     return bool(
         part.get_filename()
-        or part.get("Content-ID")
+        # A Content-ID can identify the HTML body or a multipart container,
+        # not just an embedded file (for example in marketing emails).
+        or (part.get("Content-ID") and not body_type)
         or disposition == "attachment"
         or (disposition == "inline" and part.get_content_maintype() == "image")
     )
@@ -336,7 +339,7 @@ def message_from_row(row, inline_attachments=False):
     }
 
 
-def fetch_messages(connection, uid_set, inline_attachments=False):
+def fetch_messages(connection, uid_set, inline_attachments=False, mailbox_label=None):
     results = []
     for offset in range(0, len(uid_set), 20):
         rows = fetch_rows(
@@ -344,7 +347,14 @@ def fetch_messages(connection, uid_set, inline_attachments=False):
             uid_set[offset : offset + 20],
             "(X-GM-MSGID X-GM-THRID FLAGS X-GM-LABELS INTERNALDATE BODY.PEEK[])",
         )
-        results.extend(message_from_row(row, inline_attachments) for row in rows)
+        for row in rows:
+            message = message_from_row(row, inline_attachments)
+            # Gmail can omit the selected mailbox from X-GM-LABELS. Drafts
+            # saved by other clients may also lack the IMAP \\Draft flag.
+            # Membership in the actual Drafts mailbox is authoritative.
+            if mailbox_label == "DRAFT" and "DRAFT" not in message["labelIds"]:
+                message["labelIds"].append("DRAFT")
+            results.append(message)
     return sorted(results, key=lambda item: int(item["internalDate"]))
 
 
@@ -411,7 +421,7 @@ def threads(connection, thread_ids):
         found = set()
         for thread_id in thread_ids:
             found.update(ids(connection, "X-GM-THRID", thread_id))
-        for message in fetch_messages(connection, sorted(found, key=int)):
+        for message in fetch_messages(connection, sorted(found, key=int), mailbox_label=label):
             if message["threadId"] in messages:
                 messages[message["threadId"]][message["id"]] = message
     return [
@@ -591,7 +601,7 @@ def send(request):
     ) as connection:
         connection.ehlo()
         authenticate_smtp(connection, request)
-        connection.sendmail(request["email"], recipients, parsed.as_bytes())
+        connection.sendmail(request.get("sender", request["email"]), recipients, parsed.as_bytes())
     return None
 
 
@@ -681,7 +691,7 @@ def dispatch_once(request):
             found = ids(connection, "X-GM-MSGID", request["id"])
             if not found:
                 raise RuntimeError("This draft changed elsewhere; refresh the mailbox")
-            messages = fetch_messages(connection, found, inline_attachments=True)
+            messages = fetch_messages(connection, found, inline_attachments=True, mailbox_label="DRAFT")
             return {"id": request["id"], "message": messages[0]}
         if operation == "create_draft":
             return create_draft(connection, request)
