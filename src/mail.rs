@@ -1,11 +1,13 @@
 use std::{
     collections::HashMap,
-    io::Write,
-    process::{Command, Stdio},
+    io::{BufRead, BufReader, Write},
+    process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -28,6 +30,149 @@ pub struct ImapClient {
 }
 
 pub type MailClient = ImapClient;
+
+pub enum WatchEvent {
+    Changed,
+    Disconnected(String),
+}
+
+struct WatchProcess {
+    stopped: AtomicBool,
+    child: Mutex<Option<Child>>,
+}
+
+impl WatchProcess {
+    fn reap(&self) {
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Owns a cancellable helper and its reconnect worker. No credentials enter the UI.
+pub struct InboxWatch {
+    process: Arc<WatchProcess>,
+    events: mpsc::Receiver<WatchEvent>,
+    worker: std::thread::Thread,
+}
+
+impl InboxWatch {
+    pub fn start(email: String) -> Self {
+        let process = Arc::new(WatchProcess {
+            stopped: AtomicBool::new(false),
+            child: Mutex::new(None),
+        });
+        // A full queue already contains a refresh hint. Bound memory during bursts.
+        let (sender, events) = mpsc::sync_channel(16);
+        let background = process.clone();
+        let worker = std::thread::spawn(move || {
+            let mut retry = 30;
+            while !background.stopped.load(Ordering::Relaxed) {
+                let started = Instant::now();
+                let result = Self::session(&email, &background, &sender);
+                background.reap();
+                if background.stopped.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(error) = result {
+                    let _ = sender.try_send(WatchEvent::Disconnected(error.to_string()));
+                }
+                if started.elapsed() >= Duration::from_secs(60) {
+                    retry = 30;
+                }
+                // Respect the shared Gmail quota cooldown even when it was set
+                // by an unrelated operation while the listener was connected.
+                let now = chrono::Utc::now().timestamp();
+                let cooldown = MailCache::open()
+                    .and_then(|cache| cache.imap_retry_at(&email, now))
+                    .ok()
+                    .flatten()
+                    .map(|until| (until - now).max(0) as u64)
+                    .unwrap_or(0);
+                std::thread::park_timeout(Duration::from_secs(retry.max(cooldown)));
+                retry = (retry * 2).min(15 * 60);
+            }
+        });
+        Self {
+            process,
+            events,
+            worker: worker.thread().clone(),
+        }
+    }
+
+    pub fn events(&self) -> impl Iterator<Item = WatchEvent> + '_ {
+        self.events.try_iter()
+    }
+
+    fn session(
+        email: &str,
+        process: &WatchProcess,
+        sender: &mpsc::SyncSender<WatchEvent>,
+    ) -> Result<()> {
+        if let Some(until) =
+            MailCache::open()?.imap_retry_at(email, chrono::Utc::now().timestamp())?
+        {
+            bail!("{}", imap_pause_message(email, until));
+        }
+        let client = MailClient::for_account(AccountStore::open()?, email)?;
+        let mut request = client.credential()?;
+        request["email"] = json!(email);
+        request["operation"] = json!("watch_inbox");
+        let input = serde_json::to_vec(&request)?;
+        let (mut stdin, stdout) = {
+            let mut slot = process.child.lock().unwrap();
+            if process.stopped.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let mut child = Command::new("python3")
+                .arg("-u")
+                .arg("-c")
+                .arg(HELPER)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("Python 3 is required for live mail updates")?;
+            let pipes = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+            *slot = Some(child);
+            pipes
+        };
+        stdin.write_all(&input)?;
+        drop(stdin);
+        Self::receive(email, BufReader::new(stdout), process, sender)
+    }
+
+    fn receive(
+        email: &str,
+        reader: impl BufRead,
+        process: &WatchProcess,
+        sender: &mpsc::SyncSender<WatchEvent>,
+    ) -> Result<()> {
+        for line in reader.lines() {
+            if process.stopped.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let response = serde_json::from_str(&line?)
+                .context("Live mail helper returned an invalid response")?;
+            let result: Value = ImapClient::decode_response(email, response)?;
+            if matches!(result["event"].as_str(), Some("ready" | "changed")) {
+                // Reconcile after every reconnect as well as mailbox changes:
+                // notifications can have been missed while disconnected.
+                let _ = sender.try_send(WatchEvent::Changed);
+            }
+        }
+        bail!("Live mail connection ended")
+    }
+}
+
+impl Drop for InboxWatch {
+    fn drop(&mut self) {
+        self.process.stopped.store(true, Ordering::Relaxed);
+        self.process.reap();
+        self.worker.unpark();
+    }
+}
 
 enum ImapAuth {
     AppPassword,
@@ -112,13 +257,16 @@ impl ImapClient {
         {
             bail!("Mail request cancelled");
         }
-        let credential = match &self.auth {
+        Self::invoke(&self.email, self.credential()?, operation, fields)
+    }
+
+    fn credential(&self) -> Result<Value> {
+        Ok(match &self.auth {
             ImapAuth::AppPassword => {
                 json!({"password": self.store.app_password(&self.email)?})
             }
             ImapAuth::Goa(id) => json!({"goa_id": id}),
-        };
-        Self::invoke(&self.email, credential, operation, fields)
+        })
     }
 
     fn invoke<T: DeserializeOwned>(
@@ -167,7 +315,13 @@ impl ImapClient {
         }
         let response: HelperResponse = serde_json::from_slice(&output.stdout)
             .context("mail helper returned an invalid response")?;
-        let mut response = response;
+        Self::decode_response(email, response)
+    }
+
+    fn decode_response<T: DeserializeOwned>(
+        email: &str,
+        mut response: HelperResponse,
+    ) -> Result<T> {
         let partial_quota = response
             .result
             .as_ref()
@@ -176,9 +330,7 @@ impl ImapClient {
             == Some("rate_limited");
         if response.error_kind.as_deref() == Some("rate_limited") || partial_quota {
             let retry_at = chrono::Utc::now().timestamp() + 15 * 60;
-            if let Some(cache) = &cache {
-                cache.pause_imap(email, retry_at)?;
-            }
+            MailCache::open()?.pause_imap(email, retry_at)?;
             let message = imap_pause_message(email, retry_at);
             if partial_quota {
                 response.result.as_mut().unwrap()["error"] = json!(message);
@@ -252,16 +404,14 @@ impl ImapClient {
         )
     }
 
-    pub fn list_threads_with_limit(
+    pub fn folder_references(
         &mut self,
-        label: Option<&str>,
-        query: Option<&str>,
-        _page_token: Option<&str>,
-        max_results: usize,
-    ) -> Result<ThreadPage> {
+        label: &str,
+        include_unread: bool,
+    ) -> Result<(Vec<ThreadRef>, Vec<ThreadRef>)> {
         self.call(
-            "list_threads",
-            json!({"label": label, "query": query, "limit": max_results}),
+            "folder_references",
+            json!({"label": label, "include_unread": include_unread}),
         )
     }
 
@@ -360,6 +510,62 @@ impl ImapClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_stream_keeps_refresh_hints_bounded_and_reports_disconnects() {
+        let process = WatchProcess {
+            stopped: AtomicBool::new(false),
+            child: Mutex::new(None),
+        };
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let stream = concat!(
+            "{\"ok\":true,\"result\":{\"event\":\"ready\"}}\n",
+            "{\"ok\":true,\"result\":{\"event\":\"changed\"}}\n",
+            "{\"ok\":true,\"result\":{\"event\":\"changed\"}}\n",
+            "{\"ok\":false,\"error\":\"Mail network error\"}",
+        );
+        let error = InboxWatch::receive("test@example.com", stream.as_bytes(), &process, &sender)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Mail network error");
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, WatchEvent::Changed))
+        );
+        let error =
+            InboxWatch::receive("test@example.com", &b""[..], &process, &sender).unwrap_err();
+        assert_eq!(error.to_string(), "Live mail connection ended");
+    }
+
+    #[test]
+    fn dropping_idle_watch_kills_helper_and_wakes_reconnect_worker() {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        let process = Arc::new(WatchProcess {
+            stopped: AtomicBool::new(false),
+            child: Mutex::new(Some(child)),
+        });
+        let background = process.clone();
+        let (finished, completion) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while !background.stopped.load(Ordering::Relaxed) {
+                std::thread::park();
+            }
+            finished.send(()).unwrap();
+        });
+        let (_sender, events) = mpsc::channel();
+        drop(InboxWatch {
+            process: process.clone(),
+            events,
+            worker: worker.thread().clone(),
+        });
+        completion.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert!(process.child.lock().unwrap().is_none());
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
 
     #[test]
     #[ignore = "requires a mail-enabled Google account in GNOME Online Accounts and network access"]

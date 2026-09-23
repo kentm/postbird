@@ -34,6 +34,7 @@ RETRYABLE_READS = {
     "unread_counts": "checking unread counts",
     "poll_new_mail": "checking for new mail",
     "list_threads": "refreshing the mailbox",
+    "folder_references": "refreshing the mailbox",
     "thread": "loading a conversation",
     "threads": "loading conversations",
     "attachment": "downloading an attachment",
@@ -655,6 +656,8 @@ def dispatch_once(request):
         return send(request)
     connection = connect_imap(request)
     try:
+        if operation == "watch_inbox":
+            return watch_inbox(connection)
         if operation == "probe":
             capabilities = b" ".join(require_ok(connection.capability(), "CAPABILITY")).upper()
             if b"X-GM-EXT-1" not in capabilities:
@@ -678,6 +681,13 @@ def dispatch_once(request):
             return set_unread_many(connection, request)
         if operation == "list_threads":
             return list_threads(connection, request)
+        if operation == "folder_references":
+            recent = list_threads(connection, {"label": request["label"], "limit": 50})["threads"]
+            unread = (
+                list_threads(connection, {"label": request["label"], "query": "is:unread", "limit": 50})["threads"]
+                if request.get("include_unread") else []
+            )
+            return [recent, unread]
         if operation == "thread":
             return thread(connection, request)
         if operation == "threads":
@@ -728,6 +738,34 @@ def dispatch_once(request):
                 connection.logout()
             except (imaplib.IMAP4.error, OSError):
                 pass
+
+
+def watch_inbox(connection):
+    """Stream hints, not message bodies; the UI coalesces hints before syncing."""
+    if not hasattr(connection, "idle"):
+        raise RuntimeError("Live mail updates require Python 3.14 or newer; periodic checks remain available")
+    if "IDLE" not in connection.capabilities:
+        raise RuntimeError("The mail server does not support live updates; periodic checks remain available")
+    select(connection, "INBOX")
+    changes = ("EXISTS", "EXPUNGE", "FETCH")
+    # EXAMINE's initial snapshot is covered by the ready/reconnect refresh.
+    for kind in changes:
+        connection.response(kind)
+    ready = False
+    while True:
+        # Renew well inside the IMAP inactivity limit. This does not fetch mail.
+        with connection.idle(duration=20 * 60) as responses:
+            if not ready:
+                print(json.dumps({"ok": True, "result": {"event": "ready"}}), flush=True)
+                ready = True
+            for kind, _data in responses:
+                if kind in changes:
+                    print(json.dumps({"ok": True, "result": {"event": "changed"}}), flush=True)
+        # Responses received while DONE completes are no longer yielded by
+        # the iterator. Preserve those hints before renewing IDLE.
+        pending = [connection.response(kind)[1] for kind in changes]
+        if any(data and data != [None] for data in pending):
+            print(json.dumps({"ok": True, "result": {"event": "changed"}}), flush=True)
 
 
 def main():

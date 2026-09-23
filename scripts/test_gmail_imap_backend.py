@@ -3,6 +3,8 @@ import email.policy
 import imaplib
 import io
 import json
+import socket
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,6 +13,156 @@ import gmail_imap_backend as backend
 
 
 class GmailImapBackendTests(unittest.TestCase):
+    @patch("gmail_imap_backend.list_threads")
+    @patch("gmail_imap_backend.connect_imap")
+    def test_recent_and_unread_folder_lists_share_one_connection(self, connect, list_threads):
+        list_threads.side_effect = [{"threads": [{"id": "recent"}]}, {"threads": [{"id": "old-unread"}]}]
+        result = backend.dispatch({"operation": "folder_references", "label": "INBOX", "include_unread": True})
+        self.assertEqual(result, [[{"id": "recent"}], [{"id": "old-unread"}]])
+        connect.assert_called_once()
+        self.assertEqual(list_threads.call_args_list[0].args, (connect.return_value, {"label": "INBOX", "limit": 50}))
+        self.assertEqual(list_threads.call_args_list[1].args, (connect.return_value, {"label": "INBOX", "limit": 50, "query": "is:unread"}))
+        connect.return_value.logout.assert_called_once()
+
+    @patch("gmail_imap_backend.list_threads", return_value={"threads": []})
+    @patch("gmail_imap_backend.connect_imap")
+    def test_folder_without_unread_prefetch_omits_the_second_query(self, connect, list_threads):
+        self.assertEqual(backend.dispatch({"operation": "folder_references", "label": "TRASH", "include_unread": False}), [[], []])
+        list_threads.assert_called_once_with(connect.return_value, {"label": "TRASH", "limit": 50})
+
+    def test_idle_renews_without_fetching_or_repeating_ready(self):
+        connection = MagicMock()
+        connection.capabilities = ("IMAP4rev1", "IDLE")
+        connection.select.return_value = ("OK", [b"1"])
+        connection.response.return_value = (None, [None])
+        quiet, changes = MagicMock(), MagicMock()
+        quiet.__enter__.return_value = iter([])
+        changes.__enter__.return_value = iter([
+            ("OK", [b"still here"]), ("EXISTS", [b"2"]),
+            ("FETCH", [b"1 (FLAGS (\\Seen))"]), ("EXPUNGE", [b"1"]),
+        ])
+        connection.idle.side_effect = [quiet, changes, imaplib.IMAP4.abort("expired")]
+        output = io.StringIO()
+        with patch("sys.stdout", output), self.assertRaises(imaplib.IMAP4.abort):
+            backend.watch_inbox(connection)
+        events = [json.loads(line)["result"]["event"] for line in output.getvalue().splitlines()]
+        self.assertEqual(events, ["ready", "changed", "changed", "changed"])
+        self.assertEqual(connection.idle.call_count, 3)
+        connection.idle.assert_called_with(duration=1200)
+        connection.select.assert_called_once_with("INBOX", readonly=True)
+        connection.fetch.assert_not_called()
+        connection.status.assert_not_called()
+        connection.uid.assert_not_called()
+
+    def test_idle_preserves_changes_received_while_renewing(self):
+        connection = MagicMock()
+        connection.capabilities = ("IDLE",)
+        connection.select.return_value = ("OK", [b"1"])
+        quiet = MagicMock()
+        quiet.__enter__.return_value = iter([])
+        connection.idle.side_effect = [quiet, imaplib.IMAP4.abort("expired")]
+        connection.response.side_effect = [
+            ("EXISTS", [b"1"]), ("EXPUNGE", [None]), ("FETCH", [None]),
+            ("EXISTS", [b"2"]), ("EXPUNGE", [None]), ("FETCH", [b"1 (FLAGS (\\Seen))"]),
+        ]
+        output = io.StringIO()
+        with patch("sys.stdout", output), self.assertRaises(imaplib.IMAP4.abort):
+            backend.watch_inbox(connection)
+        self.assertEqual(
+            [json.loads(line)["result"]["event"] for line in output.getvalue().splitlines()],
+            ["ready", "changed"],
+        )
+        self.assertEqual(connection.response.call_count, 6)
+
+    def test_idle_unavailable_has_a_clear_fallback(self):
+        for connection in (
+            SimpleNamespace(capabilities=("IDLE",)),
+            SimpleNamespace(capabilities=("IMAP4rev1",), idle=lambda **_kwargs: None),
+        ):
+            with self.subTest(connection=connection), self.assertRaisesRegex(RuntimeError, "periodic checks"):
+                backend.watch_inbox(connection)
+
+    @patch("gmail_imap_backend.watch_inbox", side_effect=imaplib.IMAP4.abort("expired secret-token"))
+    @patch("gmail_imap_backend.connect_imap")
+    @patch("gmail_imap_backend.goa_token", side_effect=["first-token", "fresh-token"])
+    def test_idle_reconnect_uses_fresh_goa_token_and_closes_old_socket(self, token, connect, watch):
+        request = {"operation": "watch_inbox", "email": "test@example.com", "goa_id": "1"}
+        for expected in ("first-token", "fresh-token"):
+            with self.assertRaises(imaplib.IMAP4.abort):
+                backend.dispatch(request)
+            self.assertEqual(request["_goa_token"], expected)
+        self.assertEqual(token.call_count, 2)
+        self.assertEqual(connect.return_value.shutdown.call_count, 2)
+        connect.return_value.logout.assert_not_called()
+        self.assertEqual(watch.call_count, 2)
+
+    @patch("gmail_imap_backend.watch_inbox", side_effect=imaplib.IMAP4.abort("[OVERQUOTA] secret-token"))
+    @patch("gmail_imap_backend.connect_imap")
+    @patch("gmail_imap_backend.goa_token")
+    def test_idle_app_password_retains_quota_protection(self, token, connect, _watch):
+        output = io.StringIO()
+        request = {"operation": "watch_inbox", "email": "test@example.com", "password": "secret-token"}
+        with patch("sys.stdin", io.StringIO(json.dumps(request))), patch("sys.stdout", output):
+            backend.main()
+        token.assert_not_called()
+        connect.assert_called_once_with(request)
+        self.assertEqual(json.loads(output.getvalue())["error_kind"], "rate_limited")
+        self.assertNotIn("secret-token", output.getvalue())
+
+    @unittest.skipUnless(hasattr(imaplib.IMAP4, "idle"), "requires Python 3.14")
+    def test_idle_streams_real_protocol_events_including_before_acknowledgement(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(5)
+        commands, failures = [], []
+
+        def server():
+            try:
+                with listener.accept()[0] as peer:
+                    peer.settimeout(5)
+                    with peer.makefile("rwb", buffering=0) as stream:
+                        stream.write(b"* OK test server\r\n")
+                        while line := stream.readline():
+                            tag, command, *_args = line.split()
+                            commands.append(command)
+                            if command == b"CAPABILITY":
+                                stream.write(b"* CAPABILITY IMAP4rev1 IDLE\r\n" + tag + b" OK completed\r\n")
+                            elif command == b"LOGIN":
+                                stream.write(tag + b" OK completed\r\n")
+                            elif command == b"EXAMINE":
+                                stream.write(b"* 1 EXISTS\r\n" + tag + b" OK [READ-ONLY] completed\r\n")
+                            elif command == b"IDLE":
+                                stream.write(b"* 2 EXISTS\r\n+ idling\r\n* 1 FETCH (FLAGS (\\Seen))\r\n")
+                                # EOF simulates a network drop after the two hints.
+                                return
+                            else:
+                                raise AssertionError(line)
+            except Exception as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=server)
+        worker.start()
+        output = io.StringIO()
+        try:
+            connection = imaplib.IMAP4("127.0.0.1", listener.getsockname()[1], timeout=5)
+            connection.login("user", "password")
+            try:
+                with patch("sys.stdout", output), self.assertRaises((imaplib.IMAP4.abort, OSError)):
+                    backend.watch_inbox(connection)
+            finally:
+                connection.shutdown()
+        finally:
+            worker.join(timeout=6)
+            listener.close()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(commands, [b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"EXAMINE", b"IDLE"])
+        self.assertEqual(
+            [json.loads(line)["result"]["event"] for line in output.getvalue().splitlines()],
+            ["ready", "changed", "changed"],
+        )
+
     @patch("gmail_imap_backend.dispatch_once")
     def test_gmail_overquota_is_recognized_without_reconnecting(self, dispatch_once):
         dispatch_once.side_effect = imaplib.IMAP4.abort(

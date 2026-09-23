@@ -24,7 +24,8 @@ use crate::{
     cache::MailCache,
     compose::{AttachmentList, InlineImages},
     gmail::{ComposeMessage, ForwardedAttachment, Message, Payload, ThreadRef},
-    mail::{ImapClient, IncomingMail, MailClient, MailCursor},
+    mail::{ImapClient, InboxWatch, IncomingMail, MailClient, MailCursor, WatchEvent},
+    mailbox_sync::{MailboxSync, RECHECK_AFTER, Revision},
     preferences::{FavoriteFolder, UiPreferences},
 };
 
@@ -55,6 +56,7 @@ struct Widgets {
     forward: gtk::Button,
     search: gtk::Entry,
     preferences: Rc<RefCell<UiPreferences>>,
+    invalidate_mailboxes: Rc<dyn Fn(&str)>,
 }
 
 struct State {
@@ -67,12 +69,16 @@ struct State {
     favorite_refresh_pending: HashSet<String>,
     notification_cursors: HashMap<String, MailCursor>,
     notification_poll_inflight: HashSet<String>,
+    inbox_watches: HashMap<String, InboxWatch>,
+    mailbox_sync: MailboxSync,
+    notification_poll_pending: HashSet<String>,
     notification_generation: u64,
     last_notification_sound: Option<std::time::Instant>,
     pending_notification_thread: Option<(String, String)>,
     mark_read_inflight: HashMap<String, usize>,
     collapsed_accounts: HashSet<String>,
     accounts_loaded: bool,
+    loading_accounts: bool,
     conversations: Vec<Vec<Message>>,
     selected: Option<Message>,
     selected_conversation: Vec<Message>,
@@ -82,6 +88,7 @@ struct State {
     load_generation: u64,
     load_cancel: Arc<AtomicBool>,
     mailbox_loading: bool,
+    mailbox_network_loading: bool,
     inbox_sync_account: Option<String>,
     inbox_sync_cancel: Option<Arc<AtomicBool>>,
     pending_archives: HashSet<(String, String)>,
@@ -100,12 +107,16 @@ impl Default for State {
             favorite_refresh_pending: HashSet::new(),
             notification_cursors: HashMap::new(),
             notification_poll_inflight: HashSet::new(),
+            inbox_watches: HashMap::new(),
+            mailbox_sync: MailboxSync::default(),
+            notification_poll_pending: HashSet::new(),
             notification_generation: 0,
             last_notification_sound: None,
             pending_notification_thread: None,
             mark_read_inflight: HashMap::new(),
             collapsed_accounts: HashSet::new(),
             accounts_loaded: false,
+            loading_accounts: false,
             conversations: Vec::new(),
             selected: None,
             selected_conversation: Vec::new(),
@@ -115,6 +126,7 @@ impl Default for State {
             load_generation: 0,
             load_cancel: Arc::new(AtomicBool::new(false)),
             mailbox_loading: false,
+            mailbox_network_loading: false,
             inbox_sync_account: None,
             inbox_sync_cancel: None,
             pending_archives: HashSet::new(),
@@ -228,6 +240,14 @@ pub fn build(app: &adw::Application) {
     detail_stack.set_visible_child_name("status");
 
     let widgets = Widgets {
+        invalidate_mailboxes: Rc::new({
+            let state = Rc::downgrade(&state);
+            move |email| {
+                if let Some(state) = state.upgrade() {
+                    state.borrow_mut().mailbox_sync.invalidate_account(email);
+                }
+            }
+        }),
         window: window.clone(),
         toast: toast.clone(),
         sidebar_toast,
@@ -276,6 +296,7 @@ pub fn build(app: &adw::Application) {
     app.add_action(&open_action);
     let state_for_shutdown = state.clone();
     app.connect_shutdown(move |app| {
+        state_for_shutdown.borrow_mut().inbox_watches.clear();
         for email in &state_for_shutdown.borrow().account_emails {
             app.withdraw_notification(&new_mail_notification_id(email));
         }
@@ -438,9 +459,87 @@ fn install_visual_style() {
 }
 
 fn connect_background_sync(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    let live_widgets = widgets.clone();
+    let live_state = state.clone();
+    let mut pending = HashSet::new();
+    let mut last_sync = HashMap::<String, std::time::Instant>::new();
+    // This timer only drains local IPC; it does not poll Google.
+    glib::timeout_add_seconds_local(2, move || {
+        let emails = live_state.borrow().account_emails.clone();
+        {
+            let mut state = live_state.borrow_mut();
+            state
+                .inbox_watches
+                .retain(|email, _| emails.contains(email));
+            pending.retain(|email| emails.contains(email));
+            last_sync.retain(|email, _| emails.contains(email));
+            for email in &emails {
+                let watch = state
+                    .inbox_watches
+                    .entry(email.clone())
+                    .or_insert_with(|| InboxWatch::start(email.clone()));
+                let events = watch.events().collect::<Vec<_>>();
+                for event in events {
+                    match event {
+                        WatchEvent::Changed => {
+                            state.mailbox_sync.invalidate_account(email);
+                            pending.insert(email.clone());
+                        }
+                        WatchEvent::Disconnected(error) => {
+                            state.mailbox_sync.invalidate_account(email);
+                            record_activity(
+                                &live_widgets,
+                                &format!(
+                                    "Live updates for {email}: {error}; reconnecting automatically"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for email in emails {
+            if !pending.contains(&email)
+                || last_sync
+                    .get(&email)
+                    .is_some_and(|last| last.elapsed().as_secs() < 10)
+            {
+                continue;
+            }
+            let state = live_state.borrow();
+            // Keep the hint until current work finishes; dropping it can leave
+            // a newly arrived message invisible until the fallback check.
+            if state.mailbox_loading
+                || state.inbox_sync_account.is_some()
+                || state.favorite_refresh_inflight.contains(&email)
+                || state.mark_read_inflight.get(&email).copied().unwrap_or(0) > 0
+            {
+                continue;
+            }
+            let visible = state
+                .account_emails
+                .get(live_widgets.account_picker.selected() as usize)
+                == Some(&email);
+            drop(state);
+            pending.remove(&email);
+            last_sync.insert(email.clone(), std::time::Instant::now());
+            if visible {
+                sync_recent_inbox(&live_widgets, &live_state);
+            }
+            refresh_favorite_counts_for_account(&live_widgets, &live_state, &email);
+            let preferences = live_widgets.preferences.borrow();
+            let notify = preferences.notify_new_mail || preferences.play_new_mail_sound;
+            drop(preferences);
+            if notify {
+                poll_new_mail_account(&live_widgets, &live_state, email);
+            }
+        }
+        glib::ControlFlow::Continue
+    });
     let widgets = widgets.clone();
     let state = state.clone();
-    glib::timeout_add_seconds_local(60, move || {
+    // Reconcile other folders and recover from missed events or unavailable IDLE.
+    glib::timeout_add_seconds_local(RECHECK_AFTER.as_secs() as u32, move || {
         sync_recent_inbox(&widgets, &state);
         refresh_favorite_counts(&widgets, &state);
         poll_new_mail_all(&widgets, &state);
@@ -461,11 +560,18 @@ fn poll_new_mail_all(widgets: &Widgets, state: &Rc<RefCell<State>>) {
 }
 
 fn poll_new_mail_account(widgets: &Widgets, state: &Rc<RefCell<State>>, email: String) {
+    let preferences = widgets.preferences.borrow();
+    if !preferences.notify_new_mail && !preferences.play_new_mail_sound {
+        return;
+    }
+    drop(preferences);
     let (cursor, generation) = {
         let mut state = state.borrow_mut();
-        if !state.account_emails.contains(&email)
-            || !state.notification_poll_inflight.insert(email.clone())
-        {
+        if !state.account_emails.contains(&email) {
+            return;
+        }
+        if !state.notification_poll_inflight.insert(email.clone()) {
+            state.notification_poll_pending.insert(email);
             return;
         }
         (
@@ -512,6 +618,10 @@ fn poll_new_mail_account(widgets: &Widgets, state: &Rc<RefCell<State>>, email: S
                 );
             }
             Err(_) => eprintln!("New mail check stopped unexpectedly for {email}"),
+        }
+        let pending = state.borrow_mut().notification_poll_pending.remove(&email);
+        if pending {
+            poll_new_mail_account(&widgets, &state, email);
         }
     });
 }
@@ -1072,6 +1182,24 @@ fn refresh_favorite_counts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
 }
 
 fn refresh_favorite_counts_for_account(widgets: &Widgets, state: &Rc<RefCell<State>>, email: &str) {
+    // A foreground/background Inbox refresh already downloads these messages.
+    // Count reconciliation should not start a second overlapping body fetch.
+    let skip_prefetch = {
+        let state = state.borrow();
+        if state.mailbox_loading
+            && state
+                .account_emails
+                .get(widgets.account_picker.selected() as usize)
+                .map(String::as_str)
+                == Some(email)
+        {
+            Some(state.current_label.clone())
+        } else if state.inbox_sync_account.as_deref() == Some(email) {
+            Some("INBOX".to_owned())
+        } else {
+            None
+        }
+    };
     let labels = {
         let state = state.borrow();
         if !state.account_emails.iter().any(|account| account == email) {
@@ -1124,13 +1252,16 @@ fn refresh_favorite_counts_for_account(widgets: &Widgets, state: &Rc<RefCell<Sta
     glib::MainContext::default().spawn_local(async move {
         let request_email = email.clone();
         let request_labels = labels.clone();
+        let skip_for_request = skip_prefetch.clone();
         let result = gio::spawn_blocking(move || -> anyhow::Result<_> {
             let counts = MailClient::for_account(AccountStore::open()?, &request_email)?
                 .unread_counts(&request_labels)?;
             let mut prefetched = HashMap::new();
             let mut failed = HashSet::new();
             for (label, count) in request_labels.iter().zip(&counts) {
-                if *count <= previous_counts.get(label).copied().unwrap_or(0) {
+                if skip_for_request.as_ref() == Some(label)
+                    || *count <= previous_counts.get(label).copied().unwrap_or(0)
+                {
                     continue;
                 }
                 match prefetch_favorite_folder(&request_email, label, *count) {
@@ -1174,6 +1305,9 @@ fn refresh_favorite_counts_for_account(widgets: &Widgets, state: &Rc<RefCell<Sta
                         continue;
                     }
                     changed = true;
+                    if skip_prefetch.as_ref() != Some(label) {
+                        state.mailbox_sync.invalidate_mailbox(&email, label);
+                    }
                     if count > 0 {
                         state.unread_counts.insert(key, count);
                     } else {
@@ -1224,7 +1358,7 @@ fn select_mailbox(widgets: &Widgets, state: &Rc<RefCell<State>>, email: &str, la
     if widgets.account_picker.selected() != index as u32 {
         widgets.account_picker.set_selected(index as u32);
     } else {
-        load_inbox(widgets, state, email.to_owned(), None, true);
+        open_cached_mailbox(widgets, state, email.to_owned());
     }
     rebuild_sidebar(widgets, state);
 }
@@ -1450,23 +1584,32 @@ fn mark_read_in_background(
     glib::MainContext::default().spawn_local(async move {
         let refresh_email = email.clone();
         let attempted_ids = message_ids.clone();
-        let result =
-            gio::spawn_blocking(move || -> anyhow::Result<(Vec<String>, Option<String>)> {
+        let result = gio::spawn_blocking(
+            move || -> anyhow::Result<(Vec<String>, Option<String>, bool)> {
                 let mut client = MailClient::for_account(AccountStore::open()?, &email)?;
                 let result = client.set_unread_many(&message_ids, false)?;
                 let marked_ids = result.updated;
                 let failure = result.error;
+                let mut cache_updated = true;
                 if !marked_ids.is_empty()
                     && let Err(error) =
                         MailCache::open().and_then(|mut cache| cache.mark_read(&email, &marked_ids))
                 {
+                    cache_updated = false;
                     eprintln!("Could not update the read-state cache: {error}");
                 }
-                Ok((marked_ids, failure))
-            })
-            .await;
+                Ok((marked_ids, failure, cache_updated))
+            },
+        )
+        .await;
         let marked_ids = match result {
-            Ok(Ok((marked_ids, failure))) => {
+            Ok(Ok((marked_ids, failure, cache_updated))) => {
+                if !cache_updated {
+                    state
+                        .borrow_mut()
+                        .mailbox_sync
+                        .invalidate_account(&refresh_email);
+                }
                 restore_unmarked_messages(
                     &widgets,
                     &state,
@@ -1520,7 +1663,15 @@ fn mark_read_in_background(
         if counts_changed {
             rebuild_sidebar(&widgets, &state);
         }
-        refresh_favorite_counts_for_account(&widgets, &state, &refresh_email);
+        // Successful reads already update both local counts and cached flags.
+        // Only retry a count check if one was deferred while the write ran.
+        let pending = state
+            .borrow()
+            .favorite_refresh_pending
+            .contains(&refresh_email);
+        if pending || !failed_messages.is_empty() {
+            refresh_favorite_counts_for_account(&widgets, &state, &refresh_email);
+        }
     });
 }
 
@@ -1576,13 +1727,16 @@ fn connect_account_picker(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         .account_picker
         .clone()
         .connect_selected_notify(move |picker| {
+            if state.borrow().loading_accounts {
+                return;
+            }
             let index = picker.selected() as usize;
             let email = { state.borrow().account_emails.get(index).cloned() };
             if let Some(email) = email {
                 state.borrow_mut().active_query = None;
                 state.borrow_mut().pending_notification_thread = None;
                 widgets.search.set_text("");
-                load_inbox(&widgets, &state, email, None, true);
+                open_cached_mailbox(&widgets, &state, email);
                 rebuild_sidebar(&widgets, &state);
             }
         });
@@ -2340,6 +2494,9 @@ async fn remove_account_from_settings(
                     .entry(email.clone())
                     .or_default() += 1;
                 state.favorite_refresh_pending.remove(&email);
+                state.inbox_watches.remove(&email);
+                state.mailbox_sync.invalidate_account(&email);
+                state.notification_poll_pending.remove(&email);
                 state.current_label = "INBOX".to_owned();
             }
             reset_reader(widgets, state);
@@ -2397,6 +2554,7 @@ fn connect_archive(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             return;
         }
         cancel_active_refresh(&widgets, &state);
+        state.borrow_mut().mailbox_sync.invalidate_account(&email);
         let query = widgets.search.text().to_string();
         remove_conversation(&widgets, &state, &thread_id);
         update_mailbox_spinner(&widgets, &state);
@@ -2427,6 +2585,7 @@ fn connect_archive(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             .await;
             state.borrow_mut().pending_archives.remove(&key);
             let succeeded = matches!(result, Ok(Ok(())));
+            state.borrow_mut().mailbox_sync.invalidate_account(&email);
             if succeeded {
                 state
                     .borrow_mut()
@@ -2543,6 +2702,7 @@ fn connect_message_actions(widgets: &Widgets, state: &Rc<RefCell<State>>) {
             let label = state.borrow().current_label.clone();
             let query = widgets.search.text().to_string();
             cancel_active_refresh(&widgets, &state);
+            state.borrow_mut().mailbox_sync.invalidate_account(&email);
             let widgets_async = widgets.clone();
             let state_async = state.clone();
             glib::MainContext::default().spawn_local(async move {
@@ -2585,6 +2745,10 @@ fn connect_message_actions(widgets: &Widgets, state: &Rc<RefCell<State>>) {
                     Ok(())
                 })
                 .await;
+                state_async
+                    .borrow_mut()
+                    .mailbox_sync
+                    .invalidate_account(&email);
                 match result {
                     Ok(Ok(())) => {
                         refresh_favorite_counts_for_account(&widgets_async, &state_async, &email);
@@ -3022,6 +3186,11 @@ fn edit_draft(
 
 fn refresh_after_draft(widgets: &Widgets, editing: &Option<EditingDraft>) {
     if let Some(editing) = editing {
+        editing
+            .state
+            .borrow_mut()
+            .mailbox_sync
+            .invalidate_account(&editing.account_email);
         let selected_email = editing
             .state
             .borrow()
@@ -3331,6 +3500,7 @@ fn present_compose_with_title(
         let widgets = widgets_for_send.clone();
         let dialog = dialog_for_send.clone();
         let account_email = account_for_send.clone();
+        (widgets.invalidate_mailboxes)(&account_email);
         let reply_context = reply_context_for_send.clone();
         let compose_title = title_for_send.clone();
         let sending_toast = adw::Toast::new("Sending…");
@@ -3355,6 +3525,7 @@ fn present_compose_with_title(
                 Ok(())
             })
             .await;
+            (widgets.invalidate_mailboxes)(&account_email);
             sending_toast.dismiss();
             match result {
                 Ok(Ok(())) => {
@@ -3439,13 +3610,15 @@ fn present_compose_with_title(
         let widgets = widgets_for_draft.clone();
         let dialog = dialog_for_draft.clone();
         let account_email = account_for_draft.clone();
+        (widgets.invalidate_mailboxes)(&account_email);
         let set_busy = set_busy.clone();
         glib::MainContext::default().spawn_local(async move {
             let target = editing
                 .as_ref()
                 .map(|draft| (draft.id.clone(), draft.message_id.clone()));
+            let draft_account = account_email.clone();
             let result = gio::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut client = MailClient::for_account(AccountStore::open()?, &account_email)?;
+                let mut client = MailClient::for_account(AccountStore::open()?, &draft_account)?;
                 client.set_cancellation(Some(cancelled));
                 if let Some(target) = target {
                     client.write_existing_draft(&target.0, &target.1, &message, false)?;
@@ -3455,6 +3628,7 @@ fn present_compose_with_title(
                 Ok(())
             })
             .await;
+            (widgets.invalidate_mailboxes)(&account_email);
             set_busy(false);
             match result {
                 Ok(Ok(())) => {
@@ -3699,6 +3873,7 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         Ok(accounts) => accounts,
         Err(error) => return show_error(widgets, error),
     };
+    state.borrow_mut().loading_accounts = true;
     widgets.accounts.splice(0, widgets.accounts.n_items(), &[]);
     *widgets.sending_aliases.borrow_mut() = accounts
         .iter()
@@ -3732,17 +3907,21 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         state
             .unread_counts
             .retain(|(email, _), _| accounts.contains(email));
+        let emails = state.account_emails.clone();
+        state.mailbox_sync.retain_accounts(&emails);
     }
     let has_accounts = !state.borrow().account_emails.is_empty();
     widgets.account_picker.set_sensitive(has_accounts);
     if has_accounts {
         widgets.account_picker.set_selected(0);
+        state.borrow_mut().loading_accounts = false;
         let email = state.borrow().account_emails[0].clone();
         load_inbox(widgets, state, email, None, false);
         for email in state.borrow().account_emails.clone() {
             load_labels(widgets, state, email);
         }
     } else {
+        state.borrow_mut().loading_accounts = false;
         clear_list(&widgets.messages);
         add_status_row(
             &widgets.messages,
@@ -3827,7 +4006,7 @@ fn update_mailbox_spinner(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         .pending_archives
         .iter()
         .any(|(email, _)| Some(email) == active_account);
-    let busy = state.mailbox_loading || archiving;
+    let busy = (state.mailbox_loading && state.mailbox_network_loading) || archiving;
     widgets.mailbox_spinner.set_tooltip_text(Some(if archiving {
         "Archiving conversations…"
     } else {
@@ -3864,7 +4043,11 @@ fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let Some(email) = state.account_emails.get(index).cloned() else {
             return;
         };
-        if state.favorite_refresh_inflight.contains(&email) {
+        if state.favorite_refresh_inflight.contains(&email)
+            || state
+                .mailbox_sync
+                .is_fresh(&email, "INBOX", std::time::Instant::now())
+        {
             return;
         }
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -3873,6 +4056,7 @@ fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let include_unread = widgets.preferences.borrow().is_favorite(&email, "INBOX");
         (email, cancelled, include_unread)
     };
+    let revision = state.borrow().mailbox_sync.revision(&email, "INBOX");
     update_mailbox_spinner(widgets, state);
     let widgets = widgets.clone();
     let state = state.clone();
@@ -3902,11 +4086,14 @@ fn sync_recent_inbox(widgets: &Widgets, state: &Rc<RefCell<State>>) {
         let inbox_is_visible = state.borrow().current_label == "INBOX"
             && widgets.search.text().trim().is_empty()
             && state.borrow().account_emails.get(index) == Some(&email);
-        if inbox_is_visible
-            && let Ok(Ok(messages)) = result
-            && mailbox_changed(&state, &messages)
-        {
-            display_messages(&widgets, &state, messages);
+        if let Ok(Ok(messages)) = result {
+            complete_mailbox_sync(&state, &email, "INBOX", revision, &messages);
+            if inbox_is_visible
+                && !state.borrow().mailbox_loading
+                && mailbox_changed(&state, &messages)
+            {
+                display_messages(&widgets, &state, messages);
+            }
         }
     });
 }
@@ -3975,16 +4162,7 @@ fn list_folder_references(
     label: &str,
     include_unread: bool,
 ) -> anyhow::Result<(Vec<ThreadRef>, Vec<ThreadRef>)> {
-    let recent = client
-        .list_threads_with_limit(Some(label), None, None, 50)?
-        .threads;
-    let unread = if include_unread {
-        client
-            .list_threads_with_limit(Some(label), Some("is:unread"), None, 50)?
-            .threads
-    } else {
-        Vec::new()
-    };
+    let (recent, unread) = client.folder_references(label, include_unread)?;
     let references = combine_thread_references(recent, unread.clone());
     Ok((references, unread))
 }
@@ -4068,13 +4246,45 @@ fn load_inbox(
     query: Option<String>,
     select_first: bool,
 ) {
+    load_mailbox(widgets, state, email, query, select_first, true);
+}
+
+fn open_cached_mailbox(widgets: &Widgets, state: &Rc<RefCell<State>>, email: String) {
+    load_mailbox(widgets, state, email, None, false, false);
+}
+
+fn complete_mailbox_sync(
+    state: &Rc<RefCell<State>>,
+    email: &str,
+    label: &str,
+    revision: Revision,
+    messages: &[Message],
+) {
+    let mut state = state.borrow_mut();
+    if state.account_emails.iter().any(|account| account == email)
+        && !messages.iter().any(Message::needs_body_refresh)
+    {
+        state.mailbox_sync.complete(
+            email,
+            label,
+            revision,
+            std::time::Instant::now(),
+            messages.len(),
+        );
+    }
+}
+
+fn load_mailbox(
+    widgets: &Widgets,
+    state: &Rc<RefCell<State>>,
+    email: String,
+    query: Option<String>,
+    select_first: bool,
+    refresh: bool,
+) {
     reset_reader(widgets, state);
     clear_list(&widgets.messages);
-    add_status_row(
-        &widgets.messages,
-        "Loading…",
-        "Fetching messages from Gmail…",
-    );
+    add_status_row(&widgets.messages, "Loading…", "Opening this folder…");
     let widgets = widgets.clone();
     let state = state.clone();
     let (label, generation, cancelled) = {
@@ -4083,6 +4293,7 @@ fn load_inbox(
         state.load_cancel.store(true, Ordering::Relaxed);
         state.load_cancel = Arc::new(AtomicBool::new(false));
         state.mailbox_loading = true;
+        state.mailbox_network_loading = false;
         state.active_query = query.clone();
         (
             state.current_label.clone(),
@@ -4105,20 +4316,42 @@ fn load_inbox(
             if state.borrow().load_generation != generation {
                 return;
             }
-            if let Ok(Ok(messages)) = cached
-                && !messages.is_empty()
-            {
-                cached_messages = messages.clone();
-                display_messages(&widgets, &state, messages);
-                if select_first {
-                    select_first_conversation(&widgets);
-                } else {
-                    clear_reader_view(&widgets, &state);
+            if let Ok(Ok(messages)) = cached {
+                let use_cache = !refresh
+                    && state
+                        .borrow()
+                        .mailbox_sync
+                        .matches_cache(&email, &label, messages.len())
+                    && state.borrow().mailbox_sync.is_fresh(
+                        &email,
+                        &label,
+                        std::time::Instant::now(),
+                    )
+                    && !messages.iter().any(Message::needs_body_refresh);
+                if use_cache {
+                    display_messages(&widgets, &state, messages);
+                    select_pending_notification(&widgets, &state);
+                    state.borrow_mut().mailbox_loading = false;
+                    update_mailbox_spinner(&widgets, &state);
+                    return;
                 }
-                showing_cached_messages = true;
+                if !messages.is_empty() {
+                    cached_messages = messages.clone();
+                    display_messages(&widgets, &state, messages);
+                    if select_first {
+                        select_first_conversation(&widgets);
+                    } else {
+                        clear_reader_view(&widgets, &state);
+                    }
+                    showing_cached_messages = true;
+                }
             }
         }
 
+        state.borrow_mut().mailbox_network_loading = true;
+        update_mailbox_spinner(&widgets, &state);
+        let revision = state.borrow().mailbox_sync.revision(&email, &label);
+        let sync_label = cached_mailbox.clone();
         let online_email = email.clone();
         let cache_email = email.clone();
         let mailbox_to_cache = cached_mailbox.clone();
@@ -4176,6 +4409,11 @@ fn load_inbox(
                 return;
             }
         };
+        if remaining.is_empty()
+            && let Some(label) = &sync_label
+        {
+            complete_mailbox_sync(&state, &email, label, revision, &messages);
+        }
         show_loaded_mailbox(
             &widgets,
             &state,
@@ -4190,7 +4428,7 @@ fn load_inbox(
         }
 
         let more_email = email.clone();
-        let more_cache_email = email;
+        let more_cache_email = email.clone();
         let more_mailbox_to_cache = cached_mailbox;
         let more_cancelled = state.borrow().load_cancel.clone();
         let more = gio::spawn_blocking(move || -> anyhow::Result<Vec<Message>> {
@@ -4216,7 +4454,12 @@ fn load_inbox(
         state.borrow_mut().mailbox_loading = false;
         update_mailbox_spinner(&widgets, &state);
         match more {
-            Ok(Ok(messages)) => show_loaded_mailbox(&widgets, &state, messages, select_first, true),
+            Ok(Ok(messages)) => {
+                if let Some(label) = &sync_label {
+                    complete_mailbox_sync(&state, &email, label, revision, &messages);
+                }
+                show_loaded_mailbox(&widgets, &state, messages, select_first, true);
+            }
             Ok(Err(error)) => show_message(
                 &widgets,
                 &format!("More conversations could not be loaded: {error}"),
@@ -4477,7 +4720,8 @@ fn fetch_threads_parallel(
     if references.is_empty() {
         return Ok(Vec::new());
     }
-    let worker_count = references.len().min(4);
+    // Small refreshes share one login/session instead of one per conversation.
+    let worker_count = references.len().div_ceil(10).min(4);
     let chunk_size = references.len().div_ceil(worker_count);
     let indexed = references.into_iter().enumerate().collect::<Vec<_>>();
     let batches = indexed
@@ -6419,33 +6663,7 @@ mod tests {
             .default_width(1050)
             .default_height(820)
             .build();
-        let widgets = Widgets {
-            window: window.clone(),
-            toast: adw::ToastOverlay::new(),
-            sidebar_toast: adw::ToastOverlay::new(),
-            activity: gtk::StringList::new(&[]),
-            accounts: gtk::StringList::new(&[]),
-            sending_aliases: Rc::new(RefCell::new(HashMap::new())),
-            account_picker: gtk::DropDown::from_strings(&[]),
-            messages: gtk::ListBox::new(),
-            sidebar_navigation: gtk::Box::new(Orientation::Vertical, 0),
-            mailbox_spinner: gtk::Spinner::new(),
-            message_title: gtk::Label::new(None),
-            message_sender: gtk::Label::new(None),
-            conversation_scroll: gtk::ScrolledWindow::new(),
-            conversation_body: gtk::Box::new(Orientation::Vertical, 0),
-            message_content: gtk::Box::new(Orientation::Vertical, 0),
-            detail_stack: gtk::Stack::new(),
-            archive: gtk::Button::new(),
-            star: gtk::Button::new(),
-            trash: gtk::Button::new(),
-            unread: gtk::Button::new(),
-            reply: gtk::Button::new(),
-            reply_all: gtk::Button::new(),
-            forward: gtk::Button::new(),
-            search: mail_search_entry(),
-            preferences: Rc::new(RefCell::new(UiPreferences::default())),
-        };
+        let widgets = test_widgets(&window);
         let mut preview_message = message;
         preview_message.attachments = attachments.contents().0;
         window.present();
@@ -6890,6 +7108,118 @@ mod tests {
         assert!(should_display_loaded_messages(false, false));
         assert!(!should_display_loaded_messages(true, false));
         assert!(should_display_loaded_messages(true, true));
+    }
+
+    fn test_widgets(window: &adw::ApplicationWindow) -> Widgets {
+        Widgets {
+            invalidate_mailboxes: Rc::new(|_| {}),
+            window: window.clone(),
+            toast: adw::ToastOverlay::new(),
+            sidebar_toast: adw::ToastOverlay::new(),
+            activity: gtk::StringList::new(&[]),
+            accounts: gtk::StringList::new(&[]),
+            sending_aliases: Rc::new(RefCell::new(HashMap::new())),
+            account_picker: gtk::DropDown::from_strings(&[]),
+            messages: gtk::ListBox::new(),
+            sidebar_navigation: gtk::Box::new(Orientation::Vertical, 0),
+            mailbox_spinner: gtk::Spinner::new(),
+            message_title: gtk::Label::new(None),
+            message_sender: gtk::Label::new(None),
+            conversation_scroll: gtk::ScrolledWindow::new(),
+            conversation_body: gtk::Box::new(Orientation::Vertical, 0),
+            message_content: gtk::Box::new(Orientation::Vertical, 0),
+            detail_stack: gtk::Stack::new(),
+            archive: gtk::Button::new(),
+            star: gtk::Button::new(),
+            trash: gtk::Button::new(),
+            unread: gtk::Button::new(),
+            reply: gtk::Button::new(),
+            reply_all: gtk::Button::new(),
+            forward: gtk::Button::new(),
+            search: mail_search_entry(),
+            preferences: Rc::new(RefCell::new(UiPreferences::default())),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphical session and isolated POSTBIRD_TEST_CACHE/XDG_DATA_HOME"]
+    fn cached_account_switching_does_not_start_network_or_mark_messages_read() {
+        let root = std::env::var("POSTBIRD_TEST_CACHE").expect("isolated test cache");
+        assert!(root.starts_with("/tmp/postbird-cache-test."));
+        assert_eq!(std::env::var("XDG_DATA_HOME").unwrap(), root);
+        gtk::init().expect("GTK display connection");
+        let window = adw::ApplicationWindow::builder().build();
+        let mut widgets = test_widgets(&window);
+        widgets
+            .detail_stack
+            .add_named(&gtk::Label::new(None), Some("status"));
+        widgets.account_picker = gtk::DropDown::from_strings(&["work", "personal"]);
+        let state = Rc::new(RefCell::new(State {
+            account_emails: vec!["work@example.test".into(), "personal@example.test".into()],
+            ..State::default()
+        }));
+        for email in &state.borrow().account_emails {
+            let mut unread = message("one", "thread", 1);
+            unread.label_ids = vec!["INBOX".into(), "UNREAD".into()];
+            MailCache::open()
+                .unwrap()
+                .replace_mailbox(email, "INBOX", &[unread])
+                .unwrap();
+            MailCache::open()
+                .unwrap()
+                .replace_mailbox(email, "TRASH", &[])
+                .unwrap();
+        }
+        let emails = state.borrow().account_emails.clone();
+        for email in emails {
+            for (label, count) in [("INBOX", 1), ("TRASH", 0)] {
+                let mut state = state.borrow_mut();
+                let revision = state.mailbox_sync.revision(&email, label);
+                state.mailbox_sync.complete(
+                    &email,
+                    label,
+                    revision,
+                    std::time::Instant::now(),
+                    count,
+                );
+            }
+        }
+        connect_account_picker(&widgets, &state);
+        connect_selection(&widgets, &state, &widgets.detail_stack);
+        for (email, label, count) in [
+            ("work@example.test", "INBOX", 1),
+            ("personal@example.test", "INBOX", 1),
+            ("work@example.test", "INBOX", 1),
+            ("work@example.test", "TRASH", 0),
+            ("personal@example.test", "INBOX", 1),
+        ] {
+            select_mailbox(&widgets, &state, email, label);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while state.borrow().mailbox_loading {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "cached folder did not load"
+                );
+                glib::MainContext::default().iteration(false);
+                assert!(
+                    !state.borrow().mailbox_network_loading,
+                    "navigation started a Google request"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(state.borrow().conversations.len(), count);
+            assert!(state.borrow().selected.is_none());
+            assert!(!widgets.mailbox_spinner.is_spinning());
+            assert!(
+                state
+                    .borrow()
+                    .conversations
+                    .iter()
+                    .flatten()
+                    .all(|message| message.label_ids.contains(&"UNREAD".to_owned()))
+            );
+        }
+        window.destroy();
     }
 
     fn message(id: &str, thread: &str, timestamp: i64) -> Message {

@@ -4,6 +4,7 @@ mod compose;
 mod compose_history;
 mod gmail;
 mod mail;
+mod mailbox_sync;
 mod preferences;
 mod theme;
 mod ui;

@@ -14,6 +14,7 @@ on your computer apart from requests to Google.
 - Inbox, Starred, Sent, Drafts, and Trash views
 - Favourite folders across accounts, with custom names and drag-to-reorder
 - Gmail search and offline mailbox cache
+- Live Inbox updates through IMAP IDLE with either sign-in method
 - Read, archive, star, mark unread, and trash messages
 - Compose, reply, save drafts, and send messages
 - Per-account sending aliases, selectable in the compose From field
@@ -29,8 +30,9 @@ saving the account. Do not enter your normal Google Account password.
 App-password accounts use `imap.gmail.com:993` for mail and `smtp.gmail.com:465`
 for sending, both with TLS. Postbird uses Gmail's IMAP extensions for thread IDs,
 labels, and search. The IMAP/SMTP transport uses Python 3's standard library,
-so Python 3 must be installed at runtime. Some managed Workspace, Advanced
-Protection, and security-key-only accounts cannot create app passwords.
+so Python 3 must be installed at runtime (3.14+ for live updates). Some managed
+Workspace, Advanced Protection, and security-key-only accounts cannot create
+app passwords.
 
 ## GNOME Online Accounts setup (experimental)
 
@@ -50,6 +52,32 @@ at runtime. It is a technical integration test, not an established exemption
 from Google's restricted-scope verification or CASA requirements. GNOME asks
 third-party apps to coordinate with its maintainers before shipping use of
 its account profiles.
+
+## Mail updates
+
+Postbird keeps one IMAP IDLE connection open per account while running. Inbox
+changes trigger a refresh; bursts are combined, with at most one IDLE-triggered
+refresh per account every ten seconds. The listener reconnects after network
+interruptions and obtains a fresh GOA token when reconnecting.
+
+The former one-minute background checks now run every 15 minutes as a fallback
+for missed events and favourite folders outside the Inbox. Manual refresh still
+works immediately. Python versions older than 3.14, or servers without IDLE,
+use these periodic checks. The IDLE connection is renewed every 20 minutes
+without fetching messages. New message bodies and read-status changes still
+require normal IMAP requests.
+
+Switching accounts or folders reuses a complete cache checked within the last
+15 minutes when no changes are pending. Empty folders are cached too. IDLE
+events, disconnects, and local mail actions invalidate the relevant snapshots;
+an inactive account catches up when opened. Each application session performs
+an initial reconciliation, and Refresh always checks Gmail.
+
+Folder navigation no longer automatically opens or marks the first message
+read. Small conversation refreshes share one connection, and recent/unread
+folder listings share a connection. Unread-count checks avoid downloading the
+visible folder again while it is already syncing, and successful mark-as-read
+operations use their local count adjustments without an immediate extra check.
 
 ## Sending aliases
 
