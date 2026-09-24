@@ -297,6 +297,27 @@ impl Message {
         find_body(&self.payload, "text/html")
     }
 
+    pub fn preview(&self) -> String {
+        let snippet = preview_text(&self.snippet);
+        // IMAP snippets may be the first 160 characters of raw HTML, cut off
+        // inside a tag or stylesheet. Use the complete cached body in that case.
+        let contains_markup = self.snippet.split('<').skip(1).any(|tail| {
+            tail.starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '!' | '/' | '?'))
+        });
+        if readable_preview(&snippet) && !contains_markup {
+            return snippet;
+        }
+        if let Some(html) = self.body_html()
+            && let Some(preview) = html_body_preview(&html)
+        {
+            return preview;
+        }
+        find_body(&self.payload, "text/plain")
+            .map(|plain| normalize_preview(&plain))
+            .filter(|plain| readable_preview(plain))
+            .unwrap_or_default()
+    }
+
     pub fn needs_body_refresh(&self) -> bool {
         fn deferred_body(part: &Payload) -> bool {
             if is_attachment(part) {
@@ -326,6 +347,96 @@ impl Message {
             escape_html(&self.body_text())
         )
     }
+}
+
+fn normalize_preview(text: &str) -> String {
+    text.replace(['\u{200b}', '\u{feff}', '\u{ad}'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn readable_preview(text: &str) -> bool {
+    text.chars().any(char::is_alphanumeric)
+}
+
+fn preview_text(html: &str) -> String {
+    normalize_preview(
+        &html2text::config::with_decorator(html2text::render::TrivialDecorator::new())
+            .string_from_read(html.as_bytes(), html.len().max(200))
+            .unwrap_or_else(|_| html.to_owned()),
+    )
+}
+
+fn html_body_preview(html: &str) -> Option<String> {
+    let config = html2text::config::with_decorator(html2text::render::TrivialDecorator::new());
+    let dom = config.parse_html(html.as_bytes()).ok()?;
+    let mut pending = vec![dom.document.clone()];
+    let mut blocks = Vec::new();
+    while let Some(node) = pending.pop() {
+        if let html2text::Element { name, attrs, .. } = &node.data {
+            if matches!(
+                name.local.as_ref(),
+                "head" | "script" | "style" | "template"
+            ) {
+                node.children.borrow_mut().clear();
+                continue;
+            }
+            let hidden = attrs.borrow().iter().any(|attr| {
+                let value = attr.value.to_ascii_lowercase();
+                attr.name.local.as_ref() == "hidden"
+                    || (attr.name.local.as_ref() == "aria-hidden" && value == "true")
+                    || (attr.name.local.as_ref() == "style"
+                        && value.split(';').any(|declaration| {
+                            let Some((property, value)) = declaration.split_once(':') else {
+                                return false;
+                            };
+                            matches!(
+                                (
+                                    property.trim(),
+                                    value.trim().trim_end_matches("!important").trim()
+                                ),
+                                ("display", "none") | ("visibility", "hidden")
+                            )
+                        }))
+            });
+            if hidden {
+                // Also remove hidden preheaders from the whole-body fallback.
+                node.children.borrow_mut().clear();
+                continue;
+            }
+            if matches!(
+                name.local.as_ref(),
+                "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            ) {
+                blocks.push(node.clone());
+            }
+        }
+        pending.extend(node.children.borrow().iter().rev().cloned());
+    }
+    for node in blocks {
+        let block = html2text::RcDom {
+            document: node,
+            ..Default::default()
+        };
+        let text = config
+            .dom_to_render_tree(&block)
+            .ok()
+            .and_then(|tree| config.render_to_string(tree, html.len().max(200)).ok())
+            .map(|text| normalize_preview(&text));
+        if let Some(text) = text.filter(|text| readable_preview(text)) {
+            return Some(text);
+        }
+    }
+    config
+        .dom_to_render_tree(&dom)
+        .ok()
+        .and_then(|tree| config.render_to_string(tree, html.len().max(200)).ok())
+        .map(|text| normalize_preview(&text))
+        .filter(|text| readable_preview(text))
 }
 
 const RENDERER_STYLE: &str = r#"<style id="postbird-renderer">
@@ -508,6 +619,74 @@ pub fn decode_attachment_data(data: &str) -> Result<Vec<u8>, base64::DecodeError
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn previews_recover_from_truncated_html_using_readable_blocks() {
+        for (snippet, html, expected) in [
+            (
+                "<",
+                "<p>Hello <b>world</b> &amp; friends</p>",
+                "Hello world & friends",
+            ),
+            (
+                "<!doctype html><html><head><style>body {",
+                "<head><title>Ignore me</title></head><h2>September round-up</h2><p>More news</p>",
+                "September round-up",
+            ),
+            (
+                "",
+                "<p>&nbsp;&#8203;</p><p>&lt;</p><h6>First heading</h6>",
+                "First heading",
+            ),
+            (
+                "<",
+                "<p>First paragraph</p><h1>Later heading</h1>",
+                "First paragraph",
+            ),
+            (
+                "<",
+                "<div hidden><h1>Hidden</h1></div><p style='display: none !important'>Hidden too</p><p><span style='visibility:hidden'>Secret</span>Visible</p>",
+                "Visible",
+            ),
+            (
+                "<",
+                "<style>p {color:red}</style><script>ignored()</script><div>Text without a paragraph</div>",
+                "Text without a paragraph",
+            ),
+            (
+                "<",
+                "<p>Read <a href='https://example.com'>the news</a></p>",
+                "Read the news",
+            ),
+            (
+                "Hello &amp; welcome\nagain",
+                "<h1>Other text</h1>",
+                "Hello & welcome again",
+            ),
+            ("<", "<p>你好世界</p>", "你好世界"),
+            ("<", "<img src='banner.png'>", ""),
+        ] {
+            let message: Message = serde_json::from_value(json!({
+                "id": "preview",
+                "snippet": snippet,
+                "payload": {"mimeType": "text/html", "body": {"data": URL_SAFE_NO_PAD.encode(html)}}
+            }))
+            .unwrap();
+            assert_eq!(message.preview(), expected, "HTML: {html}");
+        }
+    }
+
+    #[test]
+    fn previews_fall_back_to_plain_text_and_bound_unicode_length() {
+        let message: Message = serde_json::from_value(json!({
+            "id": "plain",
+            "snippet": "",
+            "payload": {"mimeType": "text/plain", "body": {"data": URL_SAFE_NO_PAD.encode("A < B & C\nNext line")}}
+        })).unwrap();
+        assert_eq!(message.preview(), "A < B & C Next line");
+        let html = format!("<p>{}</p>", "界".repeat(200));
+        assert_eq!(html_body_preview(&html).unwrap(), "界".repeat(160));
+    }
 
     #[test]
     fn drafts_allow_no_recipients_and_preserve_bcc_and_inline_images() {

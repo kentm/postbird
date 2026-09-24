@@ -3997,7 +3997,7 @@ fn message_snapshot(message: &Message) -> (String, String, String, Vec<String>, 
         message.thread_id.clone(),
         message.internal_date.clone(),
         message.label_ids.clone(),
-        format!("{}{:?}", message.snippet, message.attachments()),
+        format!("{}{:?}", message.preview(), message.attachments()),
     )
 }
 
@@ -4779,7 +4779,7 @@ fn conversation_row_content(
         .css_classes(["postbird-row-subject"])
         .build();
     let preview = gtk::Label::builder()
-        .label(message_preview(&message.snippet))
+        .label(message.preview())
         .halign(Align::Start)
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -4836,14 +4836,6 @@ fn relative_message_date(message: &Message) -> String {
     } else {
         date.format("%-d %b %Y at %-I:%M %P").to_string()
     }
-}
-
-fn message_preview(snippet: &str) -> String {
-    html2text::from_read(snippet.as_bytes(), 200)
-        .unwrap_or_else(|_| snippet.to_owned())
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn message_visible_in_mailbox(message: &Message, mailbox: &str) -> bool {
@@ -5387,7 +5379,7 @@ fn display_conversation(
         }
         heading_line.append(&date);
         let preview = gtk::Label::builder()
-            .label(message_preview(&message.snippet))
+            .label(message.preview())
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label"])
@@ -7301,14 +7293,10 @@ mod tests {
     }
 
     #[test]
-    fn formats_sender_preview_and_relative_dates() {
+    fn formats_sender_and_relative_dates() {
         assert_eq!(
             sender_name("\"Jane Example\" <jane@example.com>"),
             "Jane Example"
-        );
-        assert_eq!(
-            message_preview("Hello &amp; welcome\nagain"),
-            "Hello & welcome again"
         );
 
         let today = message("today", "one", Local::now().timestamp_millis());
