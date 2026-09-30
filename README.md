@@ -101,6 +101,11 @@ email address per line and save. Choose the address in the compose dialog's
 **From** dropdown; drafts retain that selection. Sending uses the original
 account's sign-in credentials.
 
+Reply and Reply All automatically select the account address or configured alias
+that the original message was sent to, checking To before Cc. Delivery headers
+are used when no visible recipient matches; otherwise the main account address
+is used. You can still change the From dropdown before sending.
+
 Enable each address in Gmail's **Send mail as** settings first; see
 [Google's alias setup instructions](https://support.google.com/mail/answer/22370).
 For example, add `kent@otron.com` as an alias of `kent@otron.net`, then select

@@ -2887,7 +2887,7 @@ fn reply_message(
         (reply_target(original), String::new())
     };
     ComposeMessage {
-        from: None,
+        from: Some(reply_sender(original, email, aliases)),
         to,
         cc,
         bcc: String::new(),
@@ -3119,6 +3119,26 @@ fn add_reading_settings(
             display_conversation(&widgets, &state, &conversation, enabled);
         }
     });
+}
+
+fn reply_sender(message: &Message, account_email: &str, aliases: &[String]) -> String {
+    // Prefer the visible recipients over the final delivery address, which can
+    // be the primary mailbox even when the message was addressed to an alias.
+    for header in ["To", "Cc", "Bcc", "Delivered-To", "X-Original-To"] {
+        let Ok(mailboxes) = message.header(header).parse::<Mailboxes>() else {
+            continue;
+        };
+        for mailbox in mailboxes {
+            let address = mailbox.email.to_string();
+            if let Some(sender) = std::iter::once(account_email)
+                .chain(aliases.iter().map(String::as_str))
+                .find(|sender| sender.eq_ignore_ascii_case(&address))
+            {
+                return sender.to_owned();
+            }
+        }
+    }
+    account_email.to_owned()
 }
 
 fn reply_target(message: &Message) -> String {
@@ -7323,6 +7343,106 @@ mod tests {
         let mut changed = second;
         changed.label_ids.push("STARRED".to_owned());
         assert!(mailbox_changed(&state, &[first, changed]));
+    }
+
+    #[test]
+    fn replies_select_the_address_the_message_was_sent_to() {
+        let aliases = vec!["sales@otron.com".into(), "support@otron.com".into()];
+        let cases = [
+            (
+                "Customer <customer@example.com>, Sales <SALES@OTRON.COM>",
+                "",
+                "kent@otron.com",
+                "",
+                "",
+                "sales@otron.com",
+            ),
+            (
+                "customer@example.com",
+                "Sales <sales@otron.com>",
+                "kent@otron.com",
+                "",
+                "",
+                "sales@otron.com",
+            ),
+            (
+                "support@otron.com, sales@otron.com",
+                "",
+                "",
+                "",
+                "",
+                "support@otron.com",
+            ),
+            (
+                "kent@otron.com",
+                "sales@otron.com",
+                "",
+                "",
+                "",
+                "kent@otron.com",
+            ),
+            (
+                "customer@example.com",
+                "",
+                "sales@otron.com",
+                "",
+                "",
+                "sales@otron.com",
+            ),
+            (
+                "undisclosed-recipients:;",
+                "",
+                "",
+                "sales@otron.com",
+                "",
+                "sales@otron.com",
+            ),
+            ("", "", "", "", "sales@otron.com", "sales@otron.com"),
+            (
+                "sales@other.com",
+                "",
+                "unconfigured@otron.com",
+                "",
+                "",
+                "kent@otron.com",
+            ),
+            (
+                "malformed",
+                "sales@otron.com",
+                "",
+                "",
+                "",
+                "sales@otron.com",
+            ),
+            ("", "", "", "", "", "kent@otron.com"),
+        ];
+        for (to, cc, delivered_to, original_to, bcc, expected) in cases {
+            let original: Message = serde_json::from_value(json!({
+                "id": "message", "threadId": "thread",
+                "payload": { "headers": [
+                    { "name": "From", "value": "Customer <customer@example.com>" },
+                    { "name": "To", "value": to },
+                    { "name": "Cc", "value": cc },
+                    { "name": "Bcc", "value": bcc },
+                    { "name": "Delivered-To", "value": delivered_to },
+                    { "name": "X-Original-To", "value": original_to }
+                ]}
+            }))
+            .unwrap();
+            for all in [false, true] {
+                let reply = reply_message(&original, "kent@otron.com", &aliases, all);
+                assert_eq!(
+                    reply.from.as_deref(),
+                    Some(expected),
+                    "To: {to}, Cc: {cc}, reply all: {all}"
+                );
+                assert!(reply.to.starts_with("Customer <customer@example.com>"));
+                assert!(!reply.to.to_ascii_lowercase().contains("sales@otron.com"));
+                assert!(!reply.to.contains("support@otron.com"));
+                assert!(!reply.cc.contains("sales@otron.com"));
+                assert!(!reply.cc.contains("support@otron.com"));
+            }
+        }
     }
 
     #[test]
