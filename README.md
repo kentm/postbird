@@ -18,6 +18,7 @@ on your computer apart from requests to Google.
 - Read, archive, star, mark unread, and trash messages
 - Configurable conversation order: oldest first or newest first
 - Compose, reply, save drafts, and send messages
+- Open `mailto:` links with prefilled recipients, subject, and message body
 - Per-account sending aliases, selectable in the compose From field
 - Larger WYSIWYG message editor with HTML replies/forwards, formatting, file attachments, and pasted inline images
 - Local, per-account recipient suggestions matching names or email addresses
@@ -147,6 +148,30 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 This installs the release binary under `~/.local/bin` and registers Postbird in
 the desktop application menu. The installer uses `rsvg-convert` from `librsvg`
 to prepare the Lucide icons in GTK's symbolic PNG format at several sizes.
+
+## Mail links
+
+Postbird registers as an available `mailto:` handler when installed. To select
+it as your default email application, choose Postbird in your desktop's default
+application settings, or run:
+
+```sh
+xdg-mime default io.github.postbird.Mail.desktop x-scheme-handler/mailto
+```
+
+Check the selection with `xdg-mime query default x-scheme-handler/mailto`.
+Test desktop routing with:
+
+```sh
+xdg-open 'mailto:someone@example.com?subject=Hello&body=Hello%20there'
+```
+
+You can also run `postbird 'mailto:someone@example.com?subject=Hello'` directly.
+Restart Postbird after upgrading to enable link handling in a running instance.
+Links open a new composer using the selected account (the first account on a
+fresh launch), supporting To, Cc, Bcc, subject, and a plain-text body. Review and
+send the message normally. If no account is connected, the link is kept in memory
+until you add one. Mail links inside Postbird use its composer directly.
 
 ## Local data
 

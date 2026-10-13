@@ -75,6 +75,7 @@ struct State {
     notification_generation: u64,
     last_notification_sound: Option<std::time::Instant>,
     pending_notification_thread: Option<(String, String)>,
+    pending_mailto: Vec<ComposeMessage>,
     mark_read_inflight: HashMap<String, usize>,
     collapsed_accounts: HashSet<String>,
     accounts_loaded: bool,
@@ -113,6 +114,7 @@ impl Default for State {
             notification_generation: 0,
             last_notification_sound: None,
             pending_notification_thread: None,
+            pending_mailto: Vec::new(),
             mark_read_inflight: HashMap::new(),
             collapsed_accounts: HashSet::new(),
             accounts_loaded: false,
@@ -338,6 +340,7 @@ pub fn build(app: &adw::Application) {
     connect_reply(&widgets, &state);
     connect_forward(&widgets, &state);
     connect_compose(&widgets, &state, &compose);
+    connect_mailto(&widgets, &state);
     load_accounts(&widgets, &state);
     connect_background_sync(&widgets, &state);
     window.present();
@@ -2849,6 +2852,52 @@ fn connect_compose(widgets: &Widgets, state: &Rc<RefCell<State>>, button: &gtk::
     });
 }
 
+fn connect_mailto(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    let action = gio::SimpleAction::new("compose-mailto", Some(glib::VariantTy::STRING));
+    let action_widgets = widgets.clone();
+    let state = state.clone();
+    action.connect_activate(move |_, parameter| {
+        let Some(uri) = parameter.and_then(|value| value.str()) else {
+            return;
+        };
+        match crate::mailto::parse(uri) {
+            Ok(message) => {
+                state.borrow_mut().pending_mailto.push(message);
+                present_pending_mailto(&action_widgets, &state);
+            }
+            Err(error) => show_error(&action_widgets, error),
+        }
+    });
+    widgets.window.add_action(&action);
+}
+
+fn present_pending_mailto(widgets: &Widgets, state: &Rc<RefCell<State>>) {
+    if state.borrow().pending_mailto.is_empty() {
+        return;
+    }
+    let index = widgets.account_picker.selected() as usize;
+    let email = state.borrow().account_emails.get(index).cloned();
+    let Some(email) = email else {
+        show_message(
+            widgets,
+            "Connect a mail account in Settings to open this mail link",
+        );
+        return;
+    };
+    let messages = std::mem::take(&mut state.borrow_mut().pending_mailto);
+    for message in messages {
+        present_compose_with_title(
+            widgets,
+            email.clone(),
+            Some(message),
+            None,
+            None,
+            Some("New message"),
+        );
+    }
+    widgets.window.present();
+}
+
 fn connect_reply(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     connect_reply_button(widgets, state, &widgets.reply, false);
     connect_reply_button(widgets, state, &widgets.reply_all, true);
@@ -3877,6 +3926,7 @@ fn load_accounts(widgets: &Widgets, state: &Rc<RefCell<State>>) {
     rebuild_sidebar(widgets, state);
     refresh_favorite_counts(widgets, state);
     poll_new_mail_all(widgets, state);
+    present_pending_mailto(widgets, state);
 }
 
 fn initialize_account_collapse(state: &mut State, preferences: &UiPreferences) {
@@ -5960,7 +6010,7 @@ fn new_message_webview() -> webkit6::WebView {
         .vexpand(false)
         .build();
     view.set_background_color(&gtk::gdk::RGBA::WHITE);
-    view.connect_decide_policy(|_, decision, decision_type| {
+    view.connect_decide_policy(|view, decision, decision_type| {
         if !matches!(
             decision_type,
             webkit6::PolicyDecisionType::NavigationAction
@@ -5978,6 +6028,16 @@ fn new_message_webview() -> webkit6::WebView {
             return false;
         }
         if let Some(uri) = action.request().and_then(|request| request.uri()) {
+            // Mail links in the reader use our composer even when another app
+            // is the system default. Other links retain their default handler.
+            if crate::mailto::is_mailto(uri.as_str())
+                && view
+                    .activate_action("win.compose-mailto", Some(&uri.to_variant()))
+                    .is_ok()
+            {
+                decision.ignore();
+                return true;
+            }
             gio::AppInfo::launch_default_for_uri_async(
                 uri.as_str(),
                 None::<&gio::AppLaunchContext>,
@@ -7547,6 +7607,95 @@ mod tests {
         assert!(should_display_loaded_messages(false, false));
         assert!(!should_display_loaded_messages(true, false));
         assert!(should_display_loaded_messages(true, true));
+    }
+
+    #[test]
+    #[ignore = "requires an isolated graphical session; uses only synthetic accounts"]
+    fn mailto_action_queues_until_connected_then_prefills_composer() {
+        adw::init().unwrap();
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        let window = adw::ApplicationWindow::builder()
+            .default_width(1050)
+            .default_height(820)
+            .build();
+        let widgets = test_widgets(&window);
+        let state = Rc::new(RefCell::new(State::default()));
+        connect_mailto(&widgets, &state);
+        window.present();
+        gtk::prelude::WidgetExt::activate_action(
+            &window,
+            "win.compose-mailto",
+            Some(&"mailto:to+tag@example.com?cc=copy@example.com&bcc=hidden@example.com&subject=Mail%20link&body=Hello%0D%0Aworld".to_variant()),
+        ).unwrap();
+        assert_eq!(state.borrow().pending_mailto.len(), 1);
+        assert!(window.visible_dialog().is_none());
+
+        state.borrow_mut().account_emails =
+            vec!["first@example.com".into(), "selected@example.com".into()];
+        widgets
+            .account_picker
+            .set_model(Some(&gtk::StringList::new(&["First", "Selected"])));
+        widgets.account_picker.set_selected(1);
+        present_pending_mailto(&widgets, &state);
+        assert!(state.borrow().pending_mailto.is_empty());
+        let dialog = window.visible_dialog().unwrap();
+        assert_eq!(dialog.title(), "New message");
+        fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut result = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                result.extend(descendants(&widget));
+                child = widget.next_sibling();
+            }
+            result
+        }
+        let children = descendants(dialog.upcast_ref());
+        for (placeholder, value) in [
+            ("To", "to+tag@example.com"),
+            ("Cc", "copy@example.com"),
+            ("Bcc", "hidden@example.com"),
+            ("Subject", "Mail link"),
+        ] {
+            let field = children
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Entry>())
+                .find(|entry| entry.placeholder_text().as_deref() == Some(placeholder))
+                .unwrap();
+            assert_eq!(field.text(), value);
+        }
+        let sender = children
+            .iter()
+            .find_map(|widget| widget.downcast_ref::<gtk::DropDown>())
+            .unwrap();
+        assert_eq!(
+            compose_sender(sender).as_deref(),
+            Some("selected@example.com")
+        );
+        // A second request reaches the existing window and keeps its own fields.
+        gtk::prelude::WidgetExt::activate_action(
+            &window,
+            "win.compose-mailto",
+            Some(&"mailto:///hello@shipsite.co?subject=Report%20hosted%20site%3A%20elderly-plum-qgkb&body=Site%3A%20https%3A%2F%2Felderly-plum-qgkb.shipsite.co%0AReason%3A%20".to_variant()),
+        )
+        .unwrap();
+        let second = window.visible_dialog().unwrap();
+        assert_ne!(dialog, second);
+        let second_children = descendants(second.upcast_ref());
+        assert!(
+            second_children
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Entry>())
+                .any(|entry| entry.text() == "hello@shipsite.co")
+        );
+        assert!(
+            second_children
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Entry>())
+                .any(|entry| entry.text() == "Report hosted site: elderly-plum-qgkb")
+        );
+        window.destroy();
     }
 
     fn test_widgets(window: &adw::ApplicationWindow) -> Widgets {
