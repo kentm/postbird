@@ -344,6 +344,10 @@ pub fn build(app: &adw::Application) {
 }
 
 fn new_conversation_scroll(body: &gtk::Box) -> gtk::ScrolledWindow {
+    body.add_css_class("postbird-conversation-body");
+    // Keep spare viewport space below the conversation instead of distributing
+    // it into the expanded message after switching to shorter content.
+    body.set_valign(Align::Start);
     // A WebView takes focus on the first text selection. GTK's default
     // viewport then scrolls to the entire (potentially very tall) WebView,
     // moving the conversation underneath the drag gesture.
@@ -412,7 +416,9 @@ pub(crate) fn install_visual_style() {
              color: #8db6ff; font-size: 11px; }
          .postbird-list-panel row.accent .postbird-row-subject { font-weight: 700; }
          .postbird-list-panel row:selected .postbird-unread-dot { color: #ffffff; }
-         .postbird-reader, .postbird-reader scrolledwindow { background: #ffffff; color: #181b20; }
+         .postbird-reader, .postbird-reader scrolledwindow,
+         .postbird-reader viewport { background: #ffffff; color: #181b20; }
+         .postbird-conversation-body, .postbird-message-body { background: #ffffff; color: #181b20; }
          .postbird-reader label, .postbird-reader image { color: #181b20; }
          .postbird-reader .dim-label { color: #717984; }
          .postbird-reader .postbird-message-title { font-size: 18px; font-weight: 700; }
@@ -422,7 +428,8 @@ pub(crate) fn install_visual_style() {
          .postbird-reader .postbird-message-action { min-width: 20px; min-height: 0;
              padding: 0; border: 0; box-shadow: none; }
          .postbird-reader .message-section { background: #ffffff; color: #181b20;
-             border: 0; border-bottom: 1px solid #e3e7ed; border-radius: 0; box-shadow: none; }
+             border: 0; border-bottom: 1px solid #e3e7ed; border-radius: 0; box-shadow: none;
+             transition: none; }
          .postbird-reader .postbird-history-toggle { background: #f0f4fa; border-radius: 12px;
              margin: 3px 0; min-height: 32px; }
          .postbird-reader .postbird-history-toggle label { color: #315c9e; }
@@ -3083,6 +3090,49 @@ fn add_reading_settings(
         .title("Reading")
         .icon_name("mail-read-symbolic")
         .build();
+    let conversations = adw::PreferencesGroup::builder()
+        .title("Conversations")
+        .build();
+    let newest_first = adw::SwitchRow::builder()
+        .title("Newest Messages First")
+        .subtitle("Show the latest email at the top of each conversation")
+        .active(widgets.preferences.borrow().newest_messages_first)
+        .build();
+    conversations.add(&newest_first);
+    page.add(&conversations);
+
+    let order_widgets = widgets.clone();
+    let order_state = state.clone();
+    let order_dialog = dialog.downgrade();
+    newest_first.connect_active_notify(move |row| {
+        let enabled = row.is_active();
+        let mut preferences = order_widgets.preferences.borrow_mut();
+        let previous = preferences.newest_messages_first;
+        if previous == enabled {
+            return;
+        }
+        preferences.newest_messages_first = enabled;
+        if let Err(error) = preferences.save() {
+            preferences.newest_messages_first = previous;
+            drop(preferences);
+            row.set_active(previous);
+            if let Some(dialog) = order_dialog.upgrade() {
+                show_settings_error(&dialog, error);
+            }
+            return;
+        }
+        let load_images = preferences.load_remote_images;
+        drop(preferences);
+        let conversation = order_state.borrow().selected_conversation.clone();
+        if !conversation.is_empty() {
+            display_conversation(&order_widgets, &order_state, &conversation, load_images);
+            order_widgets
+                .conversation_scroll
+                .vadjustment()
+                .set_value(0.0);
+        }
+    });
+
     let group = adw::PreferencesGroup::builder().title("Images").build();
     let remote_images = adw::SwitchRow::builder()
         .title("Remote Images")
@@ -5314,6 +5364,7 @@ fn display_conversation(
         container.remove(&child);
     }
     let show_history = state.borrow().history_expanded;
+    let newest_first = widgets.preferences.borrow().newest_messages_first;
     let visible = visible_conversation_indices(conversation.len(), show_history);
     for (index, message) in conversation.iter().rev().enumerate() {
         if index == 1 && conversation.len() > 4 {
@@ -5341,7 +5392,11 @@ fn display_conversation(
                     );
                 }
             });
-            container.append(&history_button);
+            if newest_first {
+                container.prepend(&history_button);
+            } else {
+                container.append(&history_button);
+            }
         }
         if !visible.contains(&index) {
             continue;
@@ -5442,9 +5497,12 @@ fn display_conversation(
             account_email.clone(),
             load_remote_images,
         );
-        expander.add_css_class("card");
         expander.add_css_class("message-section");
-        container.append(&expander);
+        if newest_first {
+            container.prepend(&expander);
+        } else {
+            container.append(&expander);
+        }
     }
 }
 
@@ -5519,12 +5577,17 @@ fn populate_message_body(
     account_email: Option<&str>,
     load_remote_images: bool,
 ) {
+    body.add_css_class("postbird-message-body");
     if !needs_html_renderer(message) {
         append_text_body(body, &message.body_text());
         return;
     }
     let view = new_message_webview();
+    // Start small while hidden. A viewport-sized placeholder becomes WebKit's
+    // natural height and prevents short messages from shrinking to their content.
+    // Reveal the view only after GTK has allocated its measured message height.
     view.set_height_request(80);
+    view.set_opacity(0.0);
     let scroll_inside = Rc::new(Cell::new(false));
     let scroll_inside_wheel = scroll_inside.clone();
     let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
@@ -5564,6 +5627,47 @@ fn populate_message_body(
         }
     });
     let fitting = Rc::new(std::cell::Cell::new(false));
+    let manager = view
+        .user_content_manager()
+        .expect("WebView content manager");
+    let weak_view = view.downgrade();
+    let weak_body = body.downgrade();
+    let weak_outer = outer_scroll.downgrade();
+    let fitting_on_layout = fitting.clone();
+    let scroll_on_layout = scroll_inside.clone();
+    let text_on_layout = text_for_fit.clone();
+    manager.connect_script_message_received(Some("postbirdLayout"), move |_, _| {
+        if let (Some(view), Some(body), Some(outer)) = (
+            weak_view.upgrade(),
+            weak_body.upgrade(),
+            weak_outer.upgrade(),
+        ) {
+            fit_webview_to_content(
+                &view,
+                &body,
+                &outer,
+                &text_on_layout,
+                &fitting_on_layout,
+                &scroll_on_layout,
+            );
+        }
+    });
+    manager.register_script_message_handler("postbirdLayout", Some("postbird-sizing"));
+    // App-owned isolated-world script; email scripts remain disabled. The DOM
+    // can be ready long before a remote image finishes or the polling timer runs.
+    manager.add_script(&webkit6::UserScript::for_world(
+        "(() => {
+            const notify = () => window.webkit.messageHandlers.postbirdLayout.postMessage(null);
+            notify();
+            window.addEventListener('load', notify, true);
+            document.fonts.ready.then(notify);
+        })();",
+        webkit6::UserContentInjectedFrames::TopFrame,
+        webkit6::UserScriptInjectionTime::End,
+        "postbird-sizing",
+        &[],
+        &[],
+    ));
     let document_committed = Rc::new(Cell::new(false));
     let committed_after_load = document_committed.clone();
     let weak_body = body.downgrade();
@@ -5573,6 +5677,7 @@ fn populate_message_body(
     view.connect_load_changed(move |view, event| {
         if event == webkit6::LoadEvent::Started {
             committed_after_load.set(false);
+            view.set_opacity(0.0);
         } else if event == webkit6::LoadEvent::Committed {
             committed_after_load.set(true);
         }
@@ -5608,7 +5713,8 @@ fn populate_message_body(
         let width = view.width();
         if width > 0
             && document_committed.get()
-            && (width != last_width.get()
+            && (view.opacity() == 0.0
+                || width != last_width.get()
                 || outer.height() != last_outer_height.get()
                 || view.is_loading())
             && let Some(body) = weak_body.upgrade()
@@ -5775,7 +5881,7 @@ fn fit_webview_to_content(
     fitting: &Rc<std::cell::Cell<bool>>,
     scroll_inside: &Rc<Cell<bool>>,
 ) {
-    if fitting.replace(true) {
+    if view.width() <= 0 || view.parent().is_none() || fitting.replace(true) {
         return;
     }
     let weak_view = view.downgrade();
@@ -5805,7 +5911,24 @@ fn fit_webview_to_content(
                     && height.to_double() >= 20.0 => {
                     let (height, internal) = message_view_height(height.to_double(), available_height);
                     scroll_inside.set(internal);
-                    view.set_height_request(height);
+                    if view.height_request() != height {
+                        view.set_height_request(height);
+                    }
+                    if view.opacity() == 0.0 {
+                        let allocation_pending = Cell::new(true);
+                        view.add_tick_callback(move |view, _| {
+                            // Tick callbacks run before layout. Allow a full
+                            // frame to allocate even when the new body shrinks.
+                            if allocation_pending.replace(false) {
+                                return glib::ControlFlow::Continue;
+                            }
+                            if view.height() < view.height_request() {
+                                return glib::ControlFlow::Continue;
+                            }
+                            view.set_opacity(1.0);
+                            glib::ControlFlow::Break
+                        });
+                    }
                 }
                 _ => {
                     body.remove(&view);
@@ -5819,6 +5942,10 @@ fn fit_webview_to_content(
 
 fn new_message_webview() -> webkit6::WebView {
     let settings = webkit6::Settings::new();
+    // Replacing accelerated email surfaces can briefly paint black in GTK's
+    // Vulkan renderer, including around neighbouring collapsed rows. Static mail
+    // uses WebKit's shared-memory rendering path to avoid that GPU handoff.
+    settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Never);
     settings.set_enable_javascript(true);
     settings.set_enable_javascript_markup(false);
     settings.set_enable_html5_database(false);
@@ -5830,6 +5957,7 @@ fn new_message_webview() -> webkit6::WebView {
         .settings(&settings)
         .network_session(&webkit6::NetworkSession::new_ephemeral())
         .hexpand(true)
+        .vexpand(false)
         .build();
     view.set_background_color(&gtk::gdk::RGBA::WHITE);
     view.connect_decide_policy(|_, decision, decision_type| {
@@ -6186,6 +6314,88 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a graphical session; uses only synthetic messages"]
+    fn conversation_order_reverses_rows_and_preserves_latest_and_history() {
+        adw::init().unwrap();
+        let window = adw::ApplicationWindow::builder().build();
+        let widgets = test_widgets(&window);
+        for count in [0, 1, 4, 6] {
+            let messages: Vec<Message> = (0..count)
+                .rev()
+                .map(|index| {
+                    serde_json::from_value(json!({
+                        "id": index.to_string(), "threadId": "order-test",
+                        "payload": {"headers": [
+                            {"name": "From", "value": format!("sender{index}@example.com")}
+                        ]}
+                    }))
+                    .unwrap()
+                })
+                .collect();
+            let state = Rc::new(RefCell::new(State {
+                selected_conversation: messages.clone(),
+                ..State::default()
+            }));
+            for expanded in [false, true] {
+                state.borrow_mut().history_expanded = expanded;
+                for newest_first in [false, true] {
+                    widgets.preferences.borrow_mut().newest_messages_first = newest_first;
+                    display_conversation(&widgets, &state, &messages, false);
+                    let mut expected = visible_conversation_indices(count, expanded)
+                        .into_iter()
+                        .map(|index| (format!("sender{index}@example.com"), index + 1 == count))
+                        .collect::<Vec<_>>();
+                    if count > 4 {
+                        expected.insert(1, ("history".into(), false));
+                    }
+                    if newest_first {
+                        expected.reverse();
+                    }
+                    let mut actual = Vec::new();
+                    let mut child = widgets.conversation_body.first_child();
+                    while let Some(row) = child {
+                        if let Some(expander) = row.downcast_ref::<gtk::Expander>() {
+                            let sender = expander
+                                .label_widget()
+                                .unwrap()
+                                .first_child()
+                                .unwrap()
+                                .first_child()
+                                .unwrap()
+                                .first_child()
+                                .unwrap()
+                                .downcast::<gtk::Label>()
+                                .unwrap();
+                            actual.push((
+                                sender.tooltip_text().unwrap().to_string(),
+                                expander.is_expanded(),
+                            ));
+                        } else {
+                            assert!(row.has_css_class("postbird-history-toggle"));
+                            actual.push(("history".into(), false));
+                        }
+                        child = row.next_sibling();
+                    }
+                    assert_eq!(actual, expected);
+                    if count > 4 {
+                        let mut child = widgets.conversation_body.first_child();
+                        while let Some(row) = child {
+                            if let Some(button) = row.downcast_ref::<gtk::Button>() {
+                                button.emit_clicked();
+                                assert_eq!(state.borrow().history_expanded, !expanded);
+                                state.borrow_mut().history_expanded = expanded;
+                                break;
+                            }
+                            child = row.next_sibling();
+                        }
+                    }
+                }
+            }
+        }
+        window.destroy();
+    }
+
+    #[test]
     fn account_tree_keeps_custom_folders_with_their_own_account() {
         let mut state = State::default();
         state.account_labels.insert(
@@ -6357,6 +6567,199 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical session; uses only synthetic messages"]
+    fn conversation_switch_frames_do_not_flash_black() {
+        adw::init().unwrap();
+        install_visual_style();
+        let window = adw::ApplicationWindow::builder()
+            .default_width(700)
+            .default_height(800)
+            .resizable(false)
+            .build();
+        let widgets = test_widgets(&window);
+        let scroll = new_conversation_scroll(&widgets.conversation_body);
+        scroll.add_css_class("postbird-reader");
+        window.set_content(Some(&scroll));
+        let widgets = Widgets {
+            conversation_scroll: scroll,
+            ..widgets
+        };
+        window.present();
+        let context = glib::MainContext::default();
+        let state = Rc::new(RefCell::new(State::default()));
+        let mut captured = 0;
+        for newest_first in [false, true, false, true] {
+            widgets.preferences.borrow_mut().newest_messages_first = newest_first;
+            let messages = (0..6).map(|index| {
+                serde_json::from_value(json!({
+                    "id": index.to_string(), "threadId": "frames",
+                    "payload": {"mimeType": "text/html",
+                        "headers": [{"name": "From", "value": "Reader test <test@example.com>"}],
+                        "body": {"data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                            "<div style='height:450px;background:#e6f0fa;color:black'>Synthetic message</div>"
+                        )}}
+                })).unwrap()
+            }).collect::<Vec<Message>>();
+            display_conversation(&widgets, &state, &messages, false);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(900);
+            let mut last_frame = -1;
+            let mut painted_html = false;
+            while std::time::Instant::now() < deadline {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                let frame = window.frame_clock().unwrap().frame_counter();
+                if frame != last_frame && widgets.conversation_body.width() > 0 {
+                    last_frame = frame;
+                    let body = &widgets.conversation_body;
+                    let snapshot = gtk::Snapshot::new();
+                    gtk::WidgetPaintable::new(Some(body)).snapshot(
+                        &snapshot,
+                        f64::from(body.width()),
+                        f64::from(body.height()),
+                    );
+                    if let Some(node) = snapshot.to_node() {
+                        let texture = window.renderer().unwrap().render_texture(&node, None);
+                        let mut downloader = gtk::gdk::TextureDownloader::new(&texture);
+                        downloader.set_format(gtk::gdk::MemoryFormat::R8g8b8a8);
+                        let (bytes, stride) = downloader.download_bytes();
+                        // A column away from all text must stay light through
+                        // both the HTML body and the gaps around collapsed rows.
+                        let x = texture.width() as usize / 2;
+                        let mut dark_run = 0;
+                        let mut message_pixels = 0;
+                        for y in 0..texture.height().min(750) as usize {
+                            let pixel = &bytes[y * stride + x * 4..][..4];
+                            if pixel == [230, 240, 250, 255] {
+                                message_pixels += 1;
+                            }
+                            dark_run =
+                                if pixel[0..3].iter().all(|value| *value < 32) && pixel[3] > 240 {
+                                    dark_run + 1
+                                } else {
+                                    0
+                                };
+                            if dark_run > 40 {
+                                texture
+                                    .save_to_png("/tmp/postbird-black-frame.png")
+                                    .unwrap();
+                                panic!(
+                                    "black frame {frame}, renderer {}",
+                                    window.renderer().unwrap().type_().name()
+                                );
+                            }
+                        }
+                        painted_html |= message_pixels > 100;
+                        captured += 1;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                painted_html,
+                "the actual HTML must appear, not just its placeholder"
+            );
+        }
+        assert!(captured >= 12, "must sample initial and settled frames");
+        eprintln!(
+            "Checked {captured} conversation frames using {}",
+            window.renderer().unwrap().type_().name()
+        );
+        window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires a graphical session; uses only synthetic messages"]
+    fn html_body_is_revealed_only_after_its_first_full_size_allocation() {
+        adw::init().unwrap();
+        install_visual_style();
+        let window = adw::ApplicationWindow::builder()
+            .default_width(700)
+            .default_height(700)
+            .resizable(false)
+            .build();
+        let widgets = test_widgets(&window);
+        let scroll = new_conversation_scroll(&widgets.conversation_body);
+        scroll.add_css_class("postbird-reader");
+        window.set_content(Some(&scroll));
+        let widgets = Widgets {
+            conversation_scroll: scroll,
+            ..widgets
+        };
+        widgets.preferences.borrow_mut().newest_messages_first = true;
+        window.present();
+        let context = glib::MainContext::default();
+        let state = Rc::new(RefCell::new(State::default()));
+        for height in [1400, 440, 120, 600] {
+            let html = format!("<div style='height:{height}px'>Message body</div>");
+            let html_message: Message = serde_json::from_value(json!({
+                "id": format!("html-{height}"), "threadId": "test",
+                "payload": {"mimeType": "text/html", "body": {
+                    "data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(html)
+                }}
+            }))
+            .unwrap();
+            display_conversation(
+                &widgets,
+                &state,
+                &[html_message, message("old", "test", 0)],
+                false,
+            );
+            let latest = widgets
+                .conversation_body
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Expander>()
+                .unwrap();
+            let older = latest
+                .next_sibling()
+                .unwrap()
+                .downcast::<gtk::Expander>()
+                .unwrap();
+            assert!(!older.has_css_class("card"));
+            assert!(!older.is_expanded());
+            let view = latest
+                .child()
+                .unwrap()
+                .first_child()
+                .unwrap()
+                .first_child()
+                .unwrap()
+                .downcast::<webkit6::WebView>()
+                .unwrap();
+            assert_eq!(view.opacity(), 0.0, "do not expose the initial surface");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while view.opacity() == 0.0 && std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(
+                view.opacity(),
+                1.0,
+                "loaded body must become visible (content {height}, allocated {}, requested {})",
+                view.height(),
+                view.height_request()
+            );
+            assert!(view.height() >= view.height_request());
+            assert!(
+                (height..height + 80).contains(&view.height()),
+                "fit before revealing: actual {}, requested {}, measured {:?}, conversation {:?}",
+                view.height(),
+                view.height_request(),
+                view.measure(Orientation::Vertical, view.width()),
+                widgets
+                    .conversation_body
+                    .measure(Orientation::Vertical, widgets.conversation_body.width())
+            );
+            assert!(
+                latest.height() < view.height() + 100,
+                "collapsed replies must follow the message without an oversized section"
+            );
+        }
+        window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires a graphical session; uses only synthetic messages"]
     fn long_html_message_remains_rendered_and_scrolls_to_the_end() {
         gtk::init().expect("GTK display connection");
         let html = r#"<html><body style="margin:0"><div style="height:1000px;background:#ff0000">Start</div><div style="height:48000px">Middle</div><div style="height:1000px;background:#0000ff">End</div></body></html>"#;
@@ -6371,6 +6774,7 @@ mod tests {
         let window = gtk::Window::builder()
             .default_width(900)
             .default_height(700)
+            .resizable(false)
             .child(&scroll)
             .build();
         populate_message_body(&body, &scroll, &message, None, false);
@@ -6387,6 +6791,7 @@ mod tests {
                 context.iteration(false);
             }
             if !view.is_loading()
+                && view.opacity() == 1.0
                 && view.height_request() >= 320
                 && view.height() == view.height_request()
             {
@@ -6400,7 +6805,10 @@ mod tests {
         );
         assert!(
             (320..=900).contains(&view.height()),
-            "keep the rendering surface bounded"
+            "keep the rendering surface bounded: allocated {}, requested {}, opacity {}",
+            view.height(),
+            view.height_request(),
+            view.opacity()
         );
         let metrics = context
             .block_on(view.evaluate_javascript_future(
@@ -6509,6 +6917,7 @@ mod tests {
             }
             if requested.load(Ordering::Relaxed)
                 && view.is_loading()
+                && view.opacity() == 1.0
                 && view.height_request() >= 400
             {
                 displayed = true;

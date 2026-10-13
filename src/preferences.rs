@@ -10,6 +10,7 @@ pub struct UiPreferences {
     pub mailbox_split: i32,
     pub message_split: i32,
     pub load_remote_images: bool,
+    pub newest_messages_first: bool,
     pub notify_new_mail: bool,
     pub play_new_mail_sound: bool,
     pub favorite_folders: Vec<FavoriteFolder>,
@@ -37,6 +38,7 @@ impl Default for UiPreferences {
             mailbox_split: 220,
             message_split: 390,
             load_remote_images: false,
+            newest_messages_first: false,
             notify_new_mail: true,
             play_new_mail_sound: false,
             favorite_folders: Vec::new(),
@@ -197,10 +199,22 @@ mod tests {
         assert_eq!(preferences.mailbox_split, 300);
         assert_eq!(preferences.message_split, 390);
         assert!(!preferences.load_remote_images);
+        assert!(!preferences.newest_messages_first);
         assert!(preferences.notify_new_mail);
         assert!(!preferences.play_new_mail_sound);
         assert!(preferences.is_favorite("reader@example.com", "INBOX"));
         assert!(preferences.favorite_order.is_empty());
+    }
+
+    #[test]
+    fn conversation_order_survives_reload() {
+        let preferences = UiPreferences {
+            newest_messages_first: true,
+            ..UiPreferences::default()
+        };
+        let loaded: UiPreferences =
+            serde_json::from_str(&serde_json::to_string(&preferences).unwrap()).unwrap();
+        assert!(loaded.newest_messages_first);
     }
 
     #[test]

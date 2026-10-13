@@ -16,6 +16,7 @@ on your computer apart from requests to Google.
 - Gmail search and offline mailbox cache
 - Live Inbox updates through IMAP IDLE with either sign-in method
 - Read, archive, star, mark unread, and trash messages
+- Configurable conversation order: oldest first or newest first
 - Compose, reply, save drafts, and send messages
 - Per-account sending aliases, selectable in the compose From field
 - Larger WYSIWYG message editor with HTML replies/forwards, formatting, file attachments, and pasted inline images
@@ -79,6 +80,12 @@ read. Small conversation refreshes share one connection, and recent/unread
 folder listings share a connection. Unread-count checks avoid downloading the
 visible folder again while it is already syncing, and successful mark-as-read
 operations use their local count adjustments without an immediate extra check.
+
+## Reading conversations
+
+In **Settings → Reading**, enable **Newest Messages First** to read conversations
+from newest to oldest. The setting applies immediately and is remembered across
+restarts. The newest message stays expanded in either order.
 
 ## Composing messages
 
